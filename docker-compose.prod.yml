@@ -1,4 +1,18 @@
 # ============================================================
+# FreeFrame - Coolify-adapted production compose
+# Changes from upstream docker-compose.prod.yml:
+#   - removed the bundled `traefik` service (coolify-proxy already owns 80/443)
+#   - removed traefik labels from `api` and `web` (Coolify generates its own
+#     from the domain fields; upstream targeted entrypoints web/websecure,
+#     whereas Coolify's Traefik uses http/https)
+#   - removed the now-unused `letsencrypt` volume
+#   - env_file .env.prod -> .env on every service. Coolify writes its variables
+#     to .env; --env-file only feeds ${VAR} interpolation, not container env,
+#     so with .env.prod every container started with an empty environment
+# Set domains in Coolify:  web -> https://HOST (port 3000)
+#                          api -> https://HOST/api (port 8000)
+# ============================================================
+# ============================================================
 # FreeFrame — Production Docker Compose
 # ============================================================
 # Usage:
@@ -11,30 +25,10 @@
 # ============================================================
 
 services:
-  traefik:
-    image: traefik:v2.11
-    command:
-      - --api.dashboard=false
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-      # Let's Encrypt automatic certificates (requires DOMAIN and ACME_EMAIL)
-      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-}
-      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
-      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
-      - letsencrypt:/letsencrypt
-    restart: unless-stopped
-
   postgres:
     image: postgres:15-alpine
     env_file:
-      - .env.prod
+      - .env
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -53,7 +47,7 @@ services:
         redis-server --appendonly yes;
       fi"
     env_file:
-      - .env.prod
+      - .env
     volumes:
       - redisdata:/data
     healthcheck:
@@ -123,7 +117,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile.prod
     env_file:
-      - .env.prod
+      - .env
     environment:
       - DISABLE_DOCS=true
     depends_on:
@@ -145,21 +139,6 @@ services:
       timeout: 5s
       start_period: 30s
       retries: 3
-    labels:
-      - traefik.enable=true
-      # HTTP router (always active)
-      - traefik.http.routers.api.rule=PathPrefix(`/api`)
-      - traefik.http.routers.api.entrypoints=web
-      - traefik.http.routers.api.middlewares=strip-api-prefix
-      # HTTPS router (active when SSL is configured)
-      - traefik.http.routers.api-secure.rule=PathPrefix(`/api`)
-      - traefik.http.routers.api-secure.entrypoints=websecure
-      - traefik.http.routers.api-secure.tls.certresolver=letsencrypt
-      - traefik.http.routers.api-secure.middlewares=strip-api-prefix
-      - traefik.http.routers.api-secure.service=api
-      # Shared
-      - traefik.http.middlewares.strip-api-prefix.stripprefix.prefixes=/api
-      - traefik.http.services.api.loadbalancer.server.port=8000
     restart: unless-stopped
 
   worker:
@@ -167,7 +146,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile.prod
     env_file:
-      - .env.prod
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
@@ -181,7 +160,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile.prod
     env_file:
-      - .env.prod
+      - .env
     depends_on:
       redis:
         condition: service_healthy
@@ -197,7 +176,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile.prod
     env_file:
-      - .env.prod
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
@@ -211,7 +190,7 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile.prod
     env_file:
-      - .env.prod
+      - .env
     depends_on:
       redis:
         condition: service_healthy
@@ -226,7 +205,7 @@ services:
         NEXT_PUBLIC_API_URL: /api
         NEXT_PUBLIC_UPLOAD_CONCURRENCY: ${NEXT_PUBLIC_UPLOAD_CONCURRENCY:-5}
     env_file:
-      - .env.prod
+      - .env
     environment:
       # Server-to-server, for the branding Next renders into the first byte.
       # It cannot reuse NEXT_PUBLIC_API_URL here: that is `/api`, a path the
@@ -241,23 +220,9 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
-    labels:
-      - traefik.enable=true
-      # HTTP router (always active)
-      - traefik.http.routers.web.rule=PathPrefix(`/`)
-      - traefik.http.routers.web.entrypoints=web
-      - traefik.http.routers.web.priority=1
-      # HTTPS router (active when SSL is configured)
-      - traefik.http.routers.web-secure.rule=PathPrefix(`/`)
-      - traefik.http.routers.web-secure.entrypoints=websecure
-      - traefik.http.routers.web-secure.tls.certresolver=letsencrypt
-      - traefik.http.routers.web-secure.priority=1
-      - traefik.http.routers.web-secure.service=web
-      - traefik.http.services.web.loadbalancer.server.port=3000
     restart: unless-stopped
 
 volumes:
   pgdata:
   redisdata:
-  letsencrypt:
   # miniodata:      # uncomment if you enable the optional self-hosted MinIO service above
