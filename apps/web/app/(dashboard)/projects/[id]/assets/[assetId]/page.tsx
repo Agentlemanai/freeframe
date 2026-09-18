@@ -200,6 +200,26 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     onTranscodeFailed: (d) => refetchIfThisAsset(d.asset_id),
   })
 
+  // Transcode events are not the only thing that changes this list. Discarding
+  // an upload deletes its version and produces no event at all, so the switcher
+  // went on offering a version that was gone -- still labelled "Uploading",
+  // which was the one thing it certainly was not.
+  //
+  // The store says when it has changed versions behind the panel -- a discard,
+  // or a cancel, which is sent as one -- and says it after the server has
+  // answered, since refetching earlier would race the request that does the
+  // deleting and fetch the version back.
+  const versionsRevision = useUploadStore((s) => s.versionsRevision)
+  const lastVersionsRevision = useRef(versionsRevision)
+  // Not gated on `asset` having loaded. The ref moves either way, so a bump
+  // arriving while `GET /assets/{id}` was in flight used to be dropped for good,
+  // and `refetchVersions` needs only the route's `assetId`.
+  useEffect(() => {
+    if (lastVersionsRevision.current === versionsRevision) return
+    lastVersionsRevision.current = versionsRevision
+    refetchVersions()
+  }, [versionsRevision, refetchVersions])
+
   // Deep-link to a specific comment from notification (?commentId=...)
   // Runs once after comments are loaded — seeks to timecode, focuses comment, shows annotation
   useEffect(() => {
@@ -574,7 +594,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             onChange={async (e) => {
               const file = e.target.files?.[0]
               if (!file || !asset) return
-              startVersionUpload(file, asset.id, asset.name, asset.project_id)
+              startVersionUpload(file, asset.id, asset.name, asset.project_id, project?.name)
               e.target.value = ''
               // Surface the newly-created version (starts as "uploading") quickly;
               // SSE transcode events then drive it through processing → ready (#118).
