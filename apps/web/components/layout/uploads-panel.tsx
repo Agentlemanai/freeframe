@@ -300,7 +300,13 @@ function UploadItem({ upload }: { upload: UploadFile }) {
 
 // ─── Panel ────────────────────────────────────────────────────────────────────
 
-export function UploadsPanel() {
+export function UploadsPanel({
+  railCollapsed = true,
+}: {
+  /** Whether the sidebar is the 52px rail or expanded to 220px. The panel
+   *  opens against its right edge, so it has to know which. */
+  railCollapsed?: boolean
+} = {}) {
   const { files, panelOpen, setPanelOpen, clearCompleted, fetchHistory, fetchMoreHistory, historyHasMore, historyLoading } = useUploadStore()
   const [filter, setFilter] = React.useState<FilterTab>('active')
   const scrollRef = React.useRef<HTMLDivElement>(null)
@@ -371,7 +377,25 @@ export function UploadsPanel() {
       />
 
       {/* Panel */}
-      <div className="fixed left-safe [--ff-left:52px] top-0 z-50 h-dvh w-[380px] border-r border-border bg-bg-secondary shadow-2xl flex flex-col pb-safe animate-in slide-in-from-left-4 duration-150">
+      <div
+        // Anchored to the sidebar's right edge, which moves. A fixed 52px was
+        // the collapsed rail's width, so with the sidebar expanded the panel
+        // opened on top of it and cut every label back to its first letter --
+        // the very labels expanding the sidebar is for. Both widths are spelled
+        // out because Tailwind only generates classes it can find whole.
+        //
+        // The offset is gated at `md` because the panel is a hard 380px: on a
+        // phone, 220 + 380 is wider than the screen, and nothing can scroll to
+        // what falls off, so the close button and the tab bar would simply be
+        // unreachable. The rail only expands by hand and does not persist, so
+        // below `md` the panel stays where a collapsed rail puts it.
+        className={cn(
+          'fixed left-safe top-0 z-50 h-dvh w-[380px]',
+          '[--ff-left:52px]',
+          !railCollapsed && 'md:[--ff-left:220px]',
+          'border-r border-border bg-bg-secondary shadow-2xl flex flex-col pb-safe animate-in slide-in-from-left-4 duration-150',
+        )}
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-4 h-12 border-b border-border shrink-0">
           <h2 className="text-sm font-semibold text-text-primary">
