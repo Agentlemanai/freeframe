@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 from typing import Optional
-from sqlalchemy import String, Enum, DateTime, ForeignKey, Integer, BigInteger, Float, func, UniqueConstraint, Index
+from sqlalchemy import String, Text, Enum, DateTime, ForeignKey, Integer, BigInteger, Float, func, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 try:
@@ -62,7 +62,9 @@ class AssetVersion(Base):
     # NULL for rows created before this was recorded, and for versions whose
     # upload has been completed or aborted -- treat NULL as "unknown", never as
     # "no upload exists".
-    upload_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # The storage backend's multipart UploadId. Opaque and backend-defined in length:
+    # Cloudflare R2 issues 343-character IDs, so this must not be a bounded VARCHAR.
+    upload_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Last time a part was signed for this upload. The reaper ages uploads by
     # this rather than by created_at, so a transfer slower than the window is not
     # aborted while it is still making progress.
