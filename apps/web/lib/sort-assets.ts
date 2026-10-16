@@ -1,5 +1,6 @@
 import type { AssetStatus } from '@/types'
 import type { SortDirection, SortKey } from '@/stores/view-store'
+import { compareNames } from './utils'
 
 const statusOrder: Record<AssetStatus, number> = {
   in_review: 0,
@@ -34,7 +35,7 @@ export function sortAssets<T extends SortableAsset>(
     if (sortKey === 'date') {
       cmp = new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime()
     } else if (sortKey === 'name') {
-      cmp = a.name.localeCompare(b.name)
+      cmp = compareNames(a.name, b.name)
     } else if (sortKey === 'status') {
       cmp = statusOrder[a.status] - statusOrder[b.status]
     } else if (sortKey === 'type') {
