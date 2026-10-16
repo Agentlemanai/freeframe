@@ -24,7 +24,8 @@ import { useShareAppearance } from '@/hooks/use-share-appearance'
 import { withBasePath } from '@/lib/base-path'
 import { useReview, type CreateCommentPayload } from '@/components/review/review-provider'
 import { useReviewStore } from '@/stores/review-store'
-import { fetchDownloadUrl, handleDownload, triggerDownload } from './share-download'
+import { fetchDownloadUrl, fetchShareDownloadOptions, handleDownload, triggerDownload } from './share-download'
+import { DownloadMenu } from '@/components/shared/download-menu'
 import { ShareReviewScreen } from './share-review-screen'
 import { useBranding } from '@/components/shared/branding-provider'
 import { Avatar } from '@/components/shared/avatar'
@@ -155,10 +156,12 @@ async function handleDownloadAll(
 ) {
   // Recursively collect all assets (including those in subfolders),
   // pre-fetch presigned URLs in parallel, then trigger downloads
-  // sequentially with a delay so the browser doesn't block them.
+  // sequentially with a delay so the browser doesn't block them. Same rule as
+  // bulk download on the project page: originals when the instance allows them,
+  // transcodes otherwise.
   const allAssets = await collectAllAssetsRecursive(token, folderId, shareSession)
   const urls = await Promise.all(
-    allAssets.map((a) => fetchDownloadUrl(token, a.id, shareSession)),
+    allAssets.map((a) => fetchDownloadUrl(token, a.id, shareSession, undefined, true)),
   )
   for (const url of urls) {
     if (!url) continue
@@ -322,16 +325,18 @@ function AssetGridCard({ asset, allowDownload, token, shareSession, isSelected, 
 
         {/* Download button overlay */}
         {allowDownload && (
-          <button
-            className="absolute top-2 right-2 flex items-center justify-center h-6 w-6 rounded-md bg-bg-primary/70 [@media(hover:hover)]:hover:bg-bg-primary/90 text-text-primary backdrop-blur-sm opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 transition-opacity"
-            onClick={(e) => {
-              e.stopPropagation()
-              handleDownload(token, asset.id, shareSession)
-            }}
-            title="Download"
+          <DownloadMenu
+            load={() => fetchShareDownloadOptions(token, asset.id, shareSession)}
+            onPick={(rendition) => handleDownload(token, asset.id, shareSession, rendition)}
           >
-            <Download className="h-3 w-3" />
-          </button>
+            <button
+              className="absolute top-2 right-2 flex items-center justify-center h-6 w-6 rounded-md bg-bg-primary/70 [@media(hover:hover)]:hover:bg-bg-primary/90 text-text-primary backdrop-blur-sm opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 data-[state=open]:opacity-100 transition-opacity"
+              onClick={(e) => e.stopPropagation()}
+              title="Download"
+            >
+              <Download className="h-3 w-3" />
+            </button>
+          </DownloadMenu>
         )}
       </div>
 
@@ -1115,13 +1120,18 @@ export function FolderShareViewer({
                                   </span>
                                   {/* Download */}
                                   {allowDownload && (
-                                    <button
-                                      className="w-7 shrink-0 flex items-center justify-center h-7 rounded text-text-tertiary opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:hover:text-text-primary transition-all"
-                                      onClick={(e) => { e.stopPropagation(); handleDownload(token, asset.id, shareSession) }}
-                                      title="Download"
+                                    <DownloadMenu
+                                      load={() => fetchShareDownloadOptions(token, asset.id, shareSession)}
+                                      onPick={(rendition) => handleDownload(token, asset.id, shareSession, rendition)}
                                     >
-                                      <Download className="h-4 w-4" />
-                                    </button>
+                                      <button
+                                        className="w-7 shrink-0 flex items-center justify-center h-7 rounded text-text-tertiary opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:hover:text-text-primary data-[state=open]:opacity-100 transition-all"
+                                        onClick={(e) => e.stopPropagation()}
+                                        title="Download"
+                                      >
+                                        <Download className="h-4 w-4" />
+                                      </button>
+                                    </DownloadMenu>
                                   )}
                                 </div>
                               )

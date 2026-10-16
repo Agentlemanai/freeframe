@@ -63,6 +63,8 @@ export interface InstanceSettings {
   storage_used_bytes: number;
   /** Admins only. 0 sizes upload parts from each file; anything else is fixed. */
   upload_part_size_bytes?: number;
+  /** Admins only. Whether people outside a project may download originals. */
+  allow_original_downloads?: boolean;
 }
 
 export interface Team {
@@ -166,6 +168,15 @@ export interface MediaFile {
   fps: number | null;
   sequence_order: number | null;
   created_at: string;
+}
+
+/** One file a version can be downloaded as: the original, or a transcode. */
+export interface DownloadOption {
+  /** "original" or "transcode"; passed back as `rendition` when downloading. */
+  id: string;
+  label: string;
+  format: string;
+  size_bytes: number | null;
 }
 
 export interface CarouselItem {
@@ -325,6 +336,8 @@ export interface ShareLinkActivity {
   actor_name: string | null
   asset_id: string | null
   asset_name: string | null
+  /** For a download: "original" or "transcode". Null on older rows. */
+  rendition?: string | null
   created_at: string
 }
 
