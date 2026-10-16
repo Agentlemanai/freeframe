@@ -27,6 +27,7 @@ import { useReviewStore } from '@/stores/review-store'
 import { fetchDownloadUrl, handleDownload, triggerDownload } from './share-download'
 import { ShareReviewScreen } from './share-review-screen'
 import { useBranding } from '@/components/shared/branding-provider'
+import { Avatar } from '@/components/shared/avatar'
 import type {
   SharePermission,
   ShareLinkAppearance,
@@ -53,6 +54,8 @@ interface FolderShareViewerProps {
   description: string | null
   createdByName?: string | null
   viewerName?: string | null
+  viewerAvatarUrl?: string | null
+  viewerAvatarColor?: string | null
   permission: SharePermission
   allowDownload: boolean
   showVersions: boolean
@@ -383,13 +386,13 @@ interface RightPanelProps {
   onOpenAsset?: (asset: FolderShareAssetItem) => void
 }
 
-interface GuestComment {
+export interface GuestComment {
   id: string
   body: string
   guest_name: string
   guest_email: string
   author_name?: string
-  author?: { id: string; name: string; avatar_url?: string | null } | null
+  author?: { id: string; name: string; avatar_url?: string | null; avatar_color?: string | null } | null
   guest_author?: { id: string; name: string; email: string } | null
   created_at: string
   timecode_start?: number | null
@@ -470,7 +473,8 @@ interface ShareCommentListProps {
   onReply?: (commentId: string) => void
 }
 
-function ShareCommentList({ comments, loading, canComment, onReply }: ShareCommentListProps) {
+/** Exported for tests. */
+export function ShareCommentList({ comments, loading, canComment, onReply }: ShareCommentListProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -498,9 +502,12 @@ function ShareCommentList({ comments, loading, canComment, onReply }: ShareComme
           <div key={comment.id} className="py-3 border-b border-border last:border-0">
             {/* Comment header */}
             <div className="flex items-start gap-3">
-              <div className={cn('h-8 w-8 rounded-full flex items-center justify-center text-xs font-bold text-text-primary shrink-0', color)}>
-                {name.charAt(0).toUpperCase()}
-              </div>
+              <Avatar
+                src={comment.author?.avatar_url}
+                name={name}
+                color={comment.author?.avatar_color}
+                className={cn('font-bold', color)}
+              />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-text-primary">{name}</span>
@@ -529,9 +536,13 @@ function ShareCommentList({ comments, loading, canComment, onReply }: ShareComme
                   const rColor = getAvatarColor(rName)
                   return (
                     <div key={r.id} className="flex items-start gap-2.5 py-1">
-                      <div className={cn('h-6 w-6 rounded-full flex items-center justify-center text-[10px] font-bold text-text-primary shrink-0', rColor)}>
-                        {rName.charAt(0).toUpperCase()}
-                      </div>
+                      <Avatar
+                        src={r.author?.avatar_url}
+                        name={rName}
+                        color={r.author?.avatar_color}
+                        size="sm"
+                        className={cn('text-[10px] font-bold', rColor)}
+                      />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-xs font-medium text-text-primary">{rName}</span>
@@ -625,6 +636,8 @@ export function FolderShareViewer({
   description,
   createdByName,
   viewerName,
+  viewerAvatarUrl,
+  viewerAvatarColor,
   permission,
   allowDownload,
   showVersions,
@@ -835,8 +848,14 @@ export function FolderShareViewer({
           {viewerName ? (
             <DropdownMenu.Root>
               <DropdownMenu.Trigger asChild>
-                <button className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-bold text-text-primary bg-green-600 [@media(hover:hover)]:hover:ring-2 [@media(hover:hover)]:hover:ring-green-400/50 transition-all outline-none">
-                  {viewerName.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase()}
+                <button className="shrink-0 rounded-full [@media(hover:hover)]:hover:ring-2 [@media(hover:hover)]:hover:ring-green-400/50 transition-all outline-none">
+                  {/* Their picture, else initials on their own circle colour */}
+                  <Avatar
+                    src={viewerAvatarUrl}
+                    name={viewerName}
+                    color={viewerAvatarColor}
+                    className="h-7 w-7 text-[10px] font-bold bg-green-600"
+                  />
                 </button>
               </DropdownMenu.Trigger>
               <DropdownMenu.Portal>
