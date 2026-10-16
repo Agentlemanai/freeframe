@@ -24,7 +24,7 @@ import {
   LayoutGrid,
 } from 'lucide-react'
 import * as Switch from '@radix-ui/react-switch'
-import { cn, copyToClipboard, endOfDayISO } from '@/lib/utils'
+import { cn, copyToClipboard, dateInputValue, endOfDayISO } from '@/lib/utils'
 import { withBasePath } from '@/lib/base-path'
 import { Button } from '@/components/ui/button'
 import { api } from '@/lib/api'
@@ -607,7 +607,7 @@ function LinkCreatedPhase({ result, allResults, onSelectResult, onDone, onAdvanc
       setAllowDownloads(data.allow_download)
       setPassphrase(data.has_password ?? false)
       setWatermark(data.show_watermark)
-      setExpiresAt(data.expires_at ? new Date(data.expires_at).toISOString().split('T')[0] : '')
+      setExpiresAt(dateInputValue(data.expires_at))
       setLayout((data.appearance as ShareLinkAppearance | null)?.layout || 'grid')
       setVisibility(data.visibility === 'secure' ? 'secure' : 'public')
     }).catch(() => {})
@@ -912,7 +912,7 @@ function LinkCreatedPhase({ result, allResults, onSelectResult, onDone, onAdvanc
                   <input
                     type="date"
                     value={expiresAt}
-                    onChange={(e) => { setExpiresAt(e.target.value); patchLink({ expires_at: e.target.value ? new Date(e.target.value).toISOString() : null }) }}
+                    onChange={(e) => { setExpiresAt(e.target.value); patchLink({ expires_at: e.target.value ? endOfDayISO(e.target.value) : null }) }}
                     className="w-[120px] rounded border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-primary outline-none focus:border-accent [color-scheme:dark]"
                   />
                   {expiresAt && (
@@ -1080,19 +1080,26 @@ export function ShareCreateDialog({
       // Check if a specific item is selected (single asset or single folder)
       const items = Array.from(selectedItems.values())
 
+      // Every create endpoint takes the link's settings, so they go in the
+      // create request itself. A follow-up PATCH could fail after the link
+      // was live, leaving it public without its passphrase or expiry.
+      const settings: Record<string, unknown> = {
+        title: config.title,
+        permission: config.allowComments ? 'comment' : 'view',
+        visibility: config.visibility,
+        allow_download: config.allowDownloads,
+        show_watermark: config.watermark,
+      }
+      if (config.passphrase) settings.password = config.passphrase
+      if (config.expiresAt) settings.expires_at = endOfDayISO(config.expiresAt)
+
       // Multi-item share — use the /share/multi endpoint
       if (items.length >= 2) {
         const body: Record<string, unknown> = {
+          ...settings,
           asset_ids: items.filter(i => i.type === 'asset').map(i => i.id),
           folder_ids: items.filter(i => i.type === 'folder').map(i => i.id),
-          title: config.title,
-          permission: config.allowComments ? 'comment' : 'view',
-          visibility: config.visibility,
-          allow_download: config.allowDownloads,
-          show_watermark: config.watermark,
         }
-        if (config.passphrase) body.password = config.passphrase
-        if (config.expiresAt) body.expires_at = endOfDayISO(config.expiresAt)
 
         const link = await api.post<ShareLink>(`/projects/${projectId}/share/multi`, body)
         shareLink = link
@@ -1100,35 +1107,16 @@ export function ShareCreateDialog({
         const singleItem = items.length === 1 ? items[0] : null
 
         if (singleItem?.type === 'asset') {
-          shareLink = await api.post<ShareLink>(`/assets/${singleItem.id}/share`, {
-            title: config.title,
-          })
+          shareLink = await api.post<ShareLink>(`/assets/${singleItem.id}/share`, settings)
           itemType = 'asset'
           thumbUrl = singleItem.thumbnailUrl
         } else if (singleItem?.type === 'folder') {
-          shareLink = await api.post<ShareLink>(`/folders/${singleItem.id}/share`, {
-            title: config.title,
-          })
+          shareLink = await api.post<ShareLink>(`/folders/${singleItem.id}/share`, settings)
         } else if (currentFolderId) {
-          shareLink = await api.post<ShareLink>(`/folders/${currentFolderId}/share`, {
-            title: config.title,
-          })
+          shareLink = await api.post<ShareLink>(`/folders/${currentFolderId}/share`, settings)
         } else {
-          shareLink = await api.post<ShareLink>(`/projects/${projectId}/share`, {
-            title: config.title,
-          })
+          shareLink = await api.post<ShareLink>(`/projects/${projectId}/share`, settings)
         }
-
-        // Apply configured settings
-        const patches: Record<string, unknown> = {
-          visibility: config.visibility,
-          permission: config.allowComments ? 'comment' : 'view',
-          allow_download: config.allowDownloads,
-          show_watermark: config.watermark,
-        }
-        if (config.passphrase) patches.password = config.passphrase
-        if (config.expiresAt) patches.expires_at = new Date(config.expiresAt).toISOString()
-        await api.patch(`/share/${shareLink.token}`, patches)
       }
 
       onShareCreated()
