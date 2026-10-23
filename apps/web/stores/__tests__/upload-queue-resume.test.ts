@@ -21,7 +21,7 @@ vi.mock('@/lib/api', async (orig) => ({
 vi.mock('swr', () => ({ mutate: vi.fn() }))
 
 import { api, ApiError } from '@/lib/api'
-import { useUploadStore, currentTabId, __uploadQueueTesting as testing } from '../upload-store'
+import { useUploadStore, currentTabId, resumeClaimKey, __uploadQueueTesting as testing } from '../upload-store'
 import { signInAs, row } from '@/test/upload-session'
 import { installXhrFake } from '@/test/xhr-fake'
 import {
@@ -46,9 +46,15 @@ function heldParts() {
 beforeEach(() => {
   vi.clearAllMocks()
   testing.reset()
+  // A resume's claim waits for another tab's write still on its way from another process
+  // (RESUME_CLAIM_PREFIX). Here every store shares one storage object and sees each write at
+  // once, and these cases are about other things: no waiting it out on every resume.
+  testing.setClaimSettleMs(0)
   window.localStorage.clear()
   useUploadStore.setState({ files: [], versionsRevision: 0, panelOpen: false })
   signInAs('user-1')
+  // A first sign-in fetches the account's upload history; no case here is about that.
+  vi.mocked(api.get).mockClear()
 })
 
 afterEach(() => {
@@ -74,7 +80,7 @@ describe('a queued resume', () => {
     server.initiates[0].reject(new ApiError(400, 'No'))
     await settle()
 
-    expect(api.get).toHaveBeenCalledWith('/upload/rv/parts')
+    expect(api.get).toHaveBeenCalledWith('/upload/rv/parts', { pinSubject: 'user-1' })
     expect(rowOf('r')).toMatchObject({ status: 'starting', resuming: true })
     expect(server.names()).toEqual(['a.mov'])
   })
@@ -209,7 +215,7 @@ describe('a resume at its turn', () => {
 
     useUploadStore.getState().resumeUpload('r', small('clip.mp4'))
     await settle()
-    expect(api.get).toHaveBeenCalledWith('/upload/rv/parts')
+    expect(api.get).toHaveBeenCalledWith('/upload/rv/parts', { pinSubject: 'user-1' })
 
     // A file that starts meanwhile takes every part slot and keeps them.
     drop([fileOf('b.mov', 80 * MB)])
@@ -331,7 +337,7 @@ describe('a resume that waits its turn', () => {
     await flush()
     await vi.advanceTimersByTimeAsync(opts.partsMs ?? 0)
     await flush()
-    expect(api.get).toHaveBeenCalledWith('/upload/rv/parts')
+    expect(api.get).toHaveBeenCalledWith('/upload/rv/parts', { pinSubject: 'user-1' })
     return server
   }
 
@@ -460,7 +466,7 @@ describe('a resume and a discard', () => {
     useUploadStore.getState().resumeUpload('r', small('clip.mp4'))
     await settle()
     expect(api.get).toHaveBeenCalledTimes(2)
-    expect(api.get).toHaveBeenLastCalledWith('/upload/rv/parts')
+    expect(api.get).toHaveBeenLastCalledWith('/upload/rv/parts', { pinSubject: 'user-1' })
   })
 })
 
@@ -479,6 +485,8 @@ describe('two tabs of one browser', () => {
     vi.resetModules()
     const { api: tabApi } = await import('@/lib/api')
     const tab = await import('@/stores/upload-store')
+    // One storage object: each tab sees the other's claim at once (see the top of this file).
+    tab.__uploadQueueTesting.setClaimSettleMs(0)
     // The server has not seen the upload move: only this browser's storage knows.
     vi.mocked(tabApi.get).mockImplementation(() => Promise.resolve(resumable()) as never)
     vi.mocked(tabApi.post).mockImplementation(((path: string, body?: { upload_id?: string; part_number?: number }) => {
@@ -490,10 +498,109 @@ describe('two tabs of one browser', () => {
     }) as never)
     return {
       store: tab.useUploadStore,
+      api: tabApi,
+      testing: tab.__uploadQueueTesting,
       tabId: tab.currentTabId(),
-      status: () => tab.useUploadStore.getState().files.find((f) => f.id === 'r')?.status,
+      status: (id = 'r') => tab.useUploadStore.getState().files.find((f) => f.id === id)?.status,
     }
   }
+
+  /**
+   * `GET /parts` for every tab answers only when the test says so, per version, and
+   * every waiting caller gets the same answer at the same moment.
+   */
+  function heldPartsByVersion(...tabs: Array<{ api: typeof api }>) {
+    const gates = new Map<string, { promise: Promise<unknown>; open: (v: unknown) => void }>()
+    const gate = (version: string) => {
+      let g = gates.get(version)
+      if (!g) {
+        let open!: (v: unknown) => void
+        const promise = new Promise((resolve) => { open = resolve })
+        g = { promise, open }
+        gates.set(version, g)
+      }
+      return g
+    }
+    for (const t of tabs) {
+      vi.mocked(t.api.get).mockImplementation(((path: string) => {
+        const version = /^\/upload\/([^/]+)\/parts$/.exec(path)?.[1]
+        return version ? gate(version).promise : new Promise(() => {})
+      }) as never)
+    }
+    return {
+      answer: (version: string, over: Record<string, unknown> = {}) =>
+        gate(version).open(resumable({ version_id: version, ...over })),
+    }
+  }
+
+  /** Every key and value in localStorage now, as it really is (not as a lagging tab sees it). */
+  const realGetItem = Storage.prototype.getItem
+  function snapshotStorage(): Map<string, string> {
+    const view = new Map<string, string>()
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i)!
+      view.set(key, realGetItem.call(window.localStorage, key)!)
+    }
+    return view
+  }
+
+  /** Whether a claim naming `tabId` is in storage, under whatever key claims are kept. */
+  function claimWrittenBy(tabId: string): boolean {
+    return Array.from(snapshotStorage()).some(([key, value]) => key.includes('claim') && value.includes(tabId))
+  }
+
+  it('claims two tabs make on two different rows at nearly the same moment both stand', async () => {
+    // Each tab resumes its own row. A write reaches the other tab's process a
+    // moment later, so the second tab writes its claim from a view of storage
+    // that has not seen the first tab's yet. A claim on one row must not undo a
+    // claim on another: the first tab would show Elsewhere with nobody sending.
+    window.localStorage.setItem('ff-uploads', JSON.stringify({
+      state: {
+        files: [
+          interrupted(),
+          interrupted({ id: 'r2', assetId: 'ra2', versionId: 'rv2', uploadId: 'ru2', s3Key: 'rk2' }),
+        ],
+      },
+      version: 0,
+    }))
+    const one = await openTab()
+    const two = await openTab()
+    one.testing.setClaimSettleMs(300)
+    two.testing.setClaimSettleMs(300)
+    const parts = heldPartsByVersion(one, two)
+
+    // Reads of localStorage made while `lagging` is set see it as it was then.
+    let lagging: Map<string, string> | null = null
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      if (lagging && this === window.localStorage) return lagging.get(key) ?? null
+      return realGetItem.call(this, key)
+    })
+
+    one.store.getState().resumeUpload('r', small('clip.mp4'))
+    two.store.getState().resumeUpload('r2', small('other.mp4'))
+    await settle()
+
+    const beforeOne = snapshotStorage()
+    parts.answer('rv', { upload_id: 'ru', s3_key: 'rk', asset_id: 'ra' })
+    await vi.waitFor(() => expect(claimWrittenBy(one.tabId)).toBe(true))
+
+    // Tab one is settling. Tab two takes its row up without having seen tab one's claim.
+    lagging = beforeOne
+    parts.answer('rv2', { upload_id: 'ru2', s3_key: 'rk2', asset_id: 'ra2', original_filename: 'other.mp4' })
+    await vi.waitFor(() => expect(claimWrittenBy(two.tabId)).toBe(true))
+    lagging = null
+
+    await vi.waitFor(() => {
+      expect(one.status('r')).not.toBe('starting')
+      expect(two.status('r2')).not.toBe('starting')
+    }, { timeout: 3_000 })
+    expect(one.status('r')).toBe('uploading')
+    expect(two.status('r2')).toBe('uploading')
+
+    one.store.getState().cancelUpload('r')
+    two.store.getState().cancelUpload('r2')
+    await settle()
+  })
 
   beforeEach(() => {
     presigns = 0
@@ -528,6 +635,37 @@ describe('two tabs of one browser', () => {
 
     // Stop the first tab's transfer, so its heartbeat does not outlive the test.
     first.store.getState().cancelUpload('r')
+    await settle()
+  })
+
+  it('a claim it cannot read is replaced, and the next tab to resume at once stands aside', async () => {
+    // A claim value that is not one (cut short, or written by something else)
+    // must not turn the claim off for that row: the tab writes its own over
+    // it, and the other tab, looking at the same moment, finds it.
+    window.localStorage.setItem('ff-uploads', JSON.stringify({ state: { files: [interrupted()] }, version: 0 }))
+    window.localStorage.setItem(resumeClaimKey('r'), '{"tab":"some-tab","nonce":')
+    const one = await openTab()
+    const two = await openTab()
+    one.testing.setClaimSettleMs(200)
+    two.testing.setClaimSettleMs(200)
+    const parts = heldPartsByVersion(one, two)
+
+    one.store.getState().resumeUpload('r', small('clip.mp4'))
+    two.store.getState().resumeUpload('r', small('clip.mp4'))
+    await settle()
+    // Both answers land together: each tab looks before either has stamped the row.
+    parts.answer('rv')
+
+    await vi.waitFor(() => {
+      expect(one.status()).not.toBe('starting')
+      expect(two.status()).not.toBe('starting')
+    }, { timeout: 3_000 })
+    expect(one.status()).toBe('uploading')
+    expect(two.status()).toBe('elsewhere')
+    expect(presigns).toBe(1)
+    expect(JSON.parse(window.localStorage.getItem(resumeClaimKey('r'))!)).toMatchObject({ tab: one.tabId })
+
+    one.store.getState().cancelUpload('r')
     await settle()
   })
 

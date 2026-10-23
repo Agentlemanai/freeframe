@@ -36,6 +36,8 @@ beforeEach(() => {
   window.localStorage.clear()
   useUploadStore.setState({ files: [], versionsRevision: 0, panelOpen: false })
   signInAs('user-1')
+  // A first sign-in fetches the account's upload history; no case here is about that.
+  vi.mocked(api.get).mockClear()
 })
 
 afterEach(() => {
@@ -83,7 +85,7 @@ describe('cancel', () => {
     expect(server.others()).toEqual(['abort u1'])
     expect(api.post).toHaveBeenCalledWith('/upload/abort', {
       s3_key: 'k1', upload_id: 'u1', version_id: 'v1', discard: true,
-    })
+    }, { pinSubject: 'user-1' })
     expect(listed(a)).toBe(false)
     expect(testing.runningIds()).toEqual([])
   })

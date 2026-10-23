@@ -10,7 +10,8 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
-vi.mock('@/lib/api', () => ({
+vi.mock('@/lib/api', async (orig) => ({
+  ...(await orig<typeof import('@/lib/api')>()),
   api: { post: vi.fn(), get: vi.fn(), patch: vi.fn() },
 }))
 const mutateSpy = vi.fn()
@@ -18,6 +19,10 @@ vi.mock('swr', () => ({ mutate: (...args: unknown[]) => mutateSpy(...args) }))
 
 import { api } from '@/lib/api'
 import { useUploadStore, type UploadFile } from '../upload-store'
+import { signInAs } from '@/test/upload-session'
+
+// Rows belong to the account that added them: with nobody signed in, nothing is added.
+beforeEach(() => signInAs('u1'))
 
 function row(patch: Partial<UploadFile> = {}): UploadFile {
   return {
@@ -31,6 +36,7 @@ function row(patch: Partial<UploadFile> = {}): UploadFile {
     processingProgress: 0,
     status: 'uploading',
     assetId: 'a1',
+    ownerId: 'u1',
     ...patch,
   } as UploadFile
 }
@@ -56,7 +62,7 @@ describe('renaming a row that is uploading', () => {
     const error = await useUploadStore.getState().renameUpload('row-1', 'Ep04 — Rohschnitt')
 
     expect(error).toBeNull()
-    expect(api.patch).toHaveBeenCalledWith('/assets/a1', { name: 'Ep04 — Rohschnitt' })
+    expect(api.patch).toHaveBeenCalledWith('/assets/a1', { name: 'Ep04 — Rohschnitt' }, { pinSubject: 'u1' })
     expect(names()).toEqual(['Ep04 — Rohschnitt'])
   })
 
@@ -66,7 +72,7 @@ describe('renaming a row that is uploading', () => {
 
     await useUploadStore.getState().renameUpload('row-1', '  Ep04  ')
 
-    expect(api.patch).toHaveBeenCalledWith('/assets/a1', { name: 'Ep04' })
+    expect(api.patch).toHaveBeenCalledWith('/assets/a1', { name: 'Ep04' }, { pinSubject: 'u1' })
   })
 
   it('does nothing for a name that did not change', async () => {
