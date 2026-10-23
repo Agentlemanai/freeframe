@@ -1,4 +1,5 @@
 import { expect, type Locator, type Page } from '@playwright/test'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import { type Account, accessToken, json, savedRefreshToken } from './accounts'
 import { authFile } from './env'
@@ -344,4 +345,170 @@ export async function dropFiles(
       delete (window as any).__e2eFolderCard
     }, inputId)
   }
+}
+
+// ─── Storage (infra scenarios) ─────────────────────────────────────────────────
+
+/**
+ * The e2e stack's MinIO container: `E2E_MINIO_CONTAINER`, default
+ * `ffe2e-minio-1` (the `-p ffe2e` stack in section 1 of the README).
+ *
+ * These helpers stop, start, pause and unplug a real container, so they act on
+ * that one container only. A name outside the `ffe2e-` stack is refused before
+ * anything else, and so is a container of that stack that is not its `minio`
+ * service (by its compose labels, read with a plain `docker inspect`): a typo
+ * such as `ffe2e-postgres-1` must not stop the database. Nothing here removes
+ * a container, a volume or a network.
+ */
+export function storageContainer(): string {
+  const name = process.env.E2E_MINIO_CONTAINER ?? 'ffe2e-minio-1'
+  if (!/^ffe2e-[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
+    throw new Error(`Refusing to touch container "${name}": the infra helpers act only on the ffe2e stack's MinIO (a name starting "ffe2e-").`)
+  }
+  if (!verifiedStorage.has(name)) {
+    let labels: Record<string, string> | null
+    try {
+      labels = JSON.parse(docker('inspect', '--format', '{{json .Config.Labels}}', name)) as Record<string, string> | null
+    } catch (error) {
+      throw new Error(`Refusing to touch container "${name}": cannot inspect it (${String(error).split('\n')[0]})`)
+    }
+    const service = labels?.['com.docker.compose.service']
+    const project = labels?.['com.docker.compose.project'] ?? ''
+    if (service !== 'minio' || !project.startsWith('ffe2e')) {
+      throw new Error(`Refusing to touch container "${name}": it is compose service "${service ?? 'none'}" of project "${project || 'none'}", not the ffe2e stack's minio.`)
+    }
+    verifiedStorage.add(name)
+  }
+  return name
+}
+const verifiedStorage = new Set<string>()
+
+function docker(...args: string[]): string {
+  return execFileSync('docker', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+}
+
+type Inspected = {
+  State: { Status: string; Running: boolean; Paused: boolean }
+  Config: { Labels: Record<string, string> | null }
+  HostConfig: { PortBindings: Record<string, Array<{ HostIp: string; HostPort: string }> | null> | null }
+  NetworkSettings: { Networks: Record<string, { Aliases: string[] | null; DNSNames?: string[] | null }> | null }
+}
+
+function inspectStorage(): Inspected {
+  const [found] = JSON.parse(docker('inspect', storageContainer())) as Inspected[]
+  return found
+}
+
+/**
+ * Where the container belongs: its compose network (`<project>_default`) and
+ * the names it answers to there (the compose service, which is the host name
+ * the API's S3 endpoint uses, and the container name). Read from the
+ * container's compose labels, which survive a disconnect, so a run killed
+ * mid-scenario can still be put back by the next one.
+ */
+function storageHome(c: Inspected): { network: string; aliases: string[] } {
+  const labels = c.Config.Labels ?? {}
+  const project = labels['com.docker.compose.project']
+  const service = labels['com.docker.compose.service']
+  if (!project || !service) throw new Error(`${storageContainer()} has no compose project/service labels; cannot tell its network`)
+  const network = `${project}_default`
+  if (!network.startsWith('ffe2e_')) throw new Error(`Refusing to touch network "${network}": not the ffe2e stack's`)
+  return { network, aliases: [service, storageContainer()] }
+}
+
+/** MinIO's liveness URL as the browser reaches it: the host port bound to the container's 9000. */
+function storageHealthUrl(c: Inspected): string {
+  const port = c.HostConfig.PortBindings?.['9000/tcp']?.[0]?.HostPort
+  if (!port) throw new Error(`${storageContainer()} publishes no host port for 9000/tcp`)
+  return `http://localhost:${port}/minio/health/live`
+}
+
+/**
+ * Wait until storage is back for both of its users: MinIO answers its liveness
+ * check on the host port (the browser's way in), and the container is on its
+ * compose network under the service name (the API's way in). Throws after
+ * `timeoutMs`, so a test that cannot put storage back says so.
+ */
+export async function waitForStorage(timeoutMs = 60_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let last = ''
+  for (;;) {
+    const c = inspectStorage()
+    const { network, aliases } = storageHome(c)
+    const names = c.NetworkSettings.Networks?.[network]?.DNSNames ?? c.NetworkSettings.Networks?.[network]?.Aliases ?? []
+    if (!c.State.Running || c.State.Paused) last = `container ${c.State.Status}${c.State.Paused ? ' (paused)' : ''}`
+    else if (!aliases.every((a) => names.includes(a))) last = `not on ${network} as ${aliases.join(', ')} (names: ${names.join(', ') || 'none'})`
+    else {
+      const status = await fetch(storageHealthUrl(c), { signal: AbortSignal.timeout(2_000) }).then((r) => r.status, (e) => String(e))
+      if (status === 200) return
+      last = `liveness check answered ${status}`
+    }
+    if (Date.now() > deadline) throw new Error(`Storage (${storageContainer()}) not healthy after ${timeoutMs} ms: ${last}`)
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+}
+
+/** `docker stop` the e2e MinIO: the browser's connections to it are refused, and the API cannot resolve it. */
+export function stopStorage(): void {
+  docker('stop', storageContainer())
+}
+
+/** `docker start` the e2e MinIO, and wait until it is healthy. */
+export async function startStorage(): Promise<void> {
+  docker('start', storageContainer())
+  await waitForStorage()
+}
+
+/**
+ * Make storage a black hole: reachable in name, answering nothing.
+ *
+ * - `'disconnect'` (default, the mechanism SCENARIOS.md S4 names): `docker
+ *   network disconnect` from its compose network. Measured on Docker Desktop
+ *   for Mac (2026-10-23): the browser's connection to the host port is still
+ *   accepted and the request then hangs (no answer in 15 s). The API cannot
+ *   resolve the service name, so a cold initiate fails at once with the coded
+ *   503 `storage_unavailable` (0.09 s); one sent on a connection its S3 client
+ *   already had open gets no answer and fails at its 10 s read timeout instead.
+ * - `'pause'`: `docker pause`. Every request hangs, the browser's and the
+ *   API's alike: the API's initiate waits out its 10 s read timeout and then
+ *   answers the same coded 503 (10.04 s, measured). The stricter test of a
+ *   time bound.
+ *
+ * (`stopStorage` is the third: refused at once on both sides.) Always undo it
+ * with `restoreStorage`, from an `afterEach` or a `finally`.
+ *
+ * The black hole of `'disconnect'` is Docker Desktop's: its port forwarder
+ * accepts the browser's connection and has nowhere to send it. That was
+ * measured on Docker Desktop for Mac only. On Linux the host port is served by
+ * `docker-proxy` (or iptables DNAT), which likely resets or refuses the
+ * connection once the container is off the network: the browser then sees a
+ * refusal, as with `stopStorage`, and S4 no longer tests a hang there. Use
+ * `'pause'` (S4b) for a hang on any host.
+ */
+export function blackholeStorage(how: 'disconnect' | 'pause' = 'disconnect'): void {
+  if (how === 'pause') {
+    docker('pause', storageContainer())
+    return
+  }
+  const { network } = storageHome(inspectStorage())
+  docker('network', 'disconnect', network, storageContainer())
+}
+
+/**
+ * Put storage back however it was taken away (stopped, paused, unplugged, or
+ * any of these together), and wait until it is healthy. Safe to call when
+ * nothing is wrong: it then only checks. Reconnecting gives the container back
+ * its service alias, which a plain `docker network connect` would not, and
+ * without which the API cannot find it.
+ */
+export async function restoreStorage(): Promise<void> {
+  let c = inspectStorage()
+  if (c.State.Paused) docker('unpause', storageContainer())
+  else if (!c.State.Running) docker('start', storageContainer())
+  c = inspectStorage()
+  const { network, aliases } = storageHome(c)
+  if (!c.NetworkSettings.Networks?.[network]) {
+    docker('network', 'connect', ...aliases.flatMap((a) => ['--alias', a]), network, storageContainer())
+  }
+  await waitForStorage()
 }

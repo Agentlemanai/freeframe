@@ -19,7 +19,8 @@ import {
   Pencil,
 } from 'lucide-react'
 import { cn, formatBytes, formatRelativeTime, formatTimeLeft } from '@/lib/utils'
-import { useUploadStore, useVisibleFiles, isOnItsWay, type UploadFile } from '@/stores/upload-store'
+import { useShallow } from 'zustand/react/shallow'
+import { useUploadStore, visibleFiles, findRow, isOnItsWay, type UploadFile } from '@/stores/upload-store'
 import { useUploadSpeedStore } from '@/stores/upload-speed-store'
 import { carriesFiles } from '@/lib/drag'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
@@ -73,6 +74,18 @@ function byQueueOrder(a: UploadFile, b: UploadFile): number {
 }
 
 /**
+ * The heading of a day before yesterday, "Oct 18". One formatter, made on first
+ * use and kept: the listing is worked out on every write to the store, and
+ * `toLocaleDateString` builds a new formatter on every call. It formats with the
+ * same locale and options, so the labels are the same to the byte.
+ */
+let dayFormat: Intl.DateTimeFormat | null = null
+function dayLabel(): Intl.DateTimeFormat {
+  if (dayFormat === null) dayFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
+  return dayFormat
+}
+
+/**
  * Groups an already sorted list under date headings, keeping its order.
  *
  * A row with a `dropSeq` was dropped, picked, resumed or retried in this page
@@ -95,10 +108,7 @@ function groupByDate(files: UploadFile[]): { label: string; items: UploadFile[] 
     } else if (f.createdAt >= yesterday) {
       label = 'Yesterday'
     } else {
-      label = new Date(f.createdAt).toLocaleDateString(undefined, {
-        month: 'short',
-        day: 'numeric',
-      })
+      label = dayLabel().format(f.createdAt)
     }
     if (!groups[label]) groups[label] = []
     groups[label].push(f)
@@ -106,6 +116,71 @@ function groupByDate(files: UploadFile[]): { label: string; items: UploadFile[] 
 
   return Object.entries(groups).map(([label, items]) => ({ label, items }))
 }
+
+/**
+ * What the panel lists for `filter`, top to bottom, as plain strings: `h:` and
+ * a date heading, or `r:` and a row id. Strings, flat, so that `useShallow`
+ * can tell an unchanged listing from a changed one: a progress write leaves
+ * every entry as it was, so the panel does not re-render for it, and the row
+ * it changed re-renders on its own.
+ */
+function listingOf(files: UploadFile[], filter: FilterTab): string[] {
+  // The way rows will start, not the time they were added: see `byQueueOrder`.
+  const listed = files.filter((f) => matchesFilter(f, filter)).sort(byQueueOrder)
+  const entries: string[] = []
+  for (const group of groupByDate(listed)) {
+    entries.push(`h:${group.label}`)
+    for (const f of group.items) entries.push(`r:${f.id}`)
+  }
+  return entries
+}
+
+interface PanelCounts {
+  all: number
+  active: number
+  complete: number
+  failed: number
+  /** Rows still waiting for their turn: a new file, the hold's probe, or a resume. */
+  queued: number
+}
+
+function countsOf(files: UploadFile[]): PanelCounts {
+  const counts: PanelCounts = { all: files.length, active: 0, complete: 0, failed: 0, queued: 0 }
+  for (const f of files) {
+    if (matchesFilter(f, 'active')) counts.active++
+    if (f.status === 'complete') counts.complete++
+    if (matchesFilter(f, 'failed')) counts.failed++
+    if (f.status === 'queued' || isWaitingResume(f)) counts.queued++
+  }
+  return counts
+}
+
+/**
+ * The header's count: the files running ("3 active") apart from the ones
+ * waiting for their turn ("2 queued"), as the rows' own badges show them. The
+ * Active tab counts both, since both are on their way.
+ */
+function headerCount(counts: PanelCounts): string {
+  const running = counts.active - counts.queued
+  const parts: string[] = []
+  if (running > 0) parts.push(`${running} active`)
+  if (counts.queued > 0) parts.push(`${counts.queued} queued`)
+  return parts.join(' · ')
+}
+
+/** A listing back in its date groups, in order. */
+function groupsOf(listing: string[]): { label: string; ids: string[] }[] {
+  const groups: { label: string; ids: string[] }[] = []
+  for (const entry of listing) {
+    if (entry.startsWith('h:')) groups.push({ label: entry.slice(2), ids: [] })
+    else groups[groups.length - 1].ids.push(entry.slice(2))
+  }
+  return groups
+}
+
+/** What a closed panel selects: nothing to sort or count on every write. */
+const NO_LISTING: string[] = []
+const NO_COUNTS: PanelCounts = { all: 0, active: 0, complete: 0, failed: 0, queued: 0 }
 
 // ─── Status Badge ─────────────────────────────────────────────────────────────
 
@@ -290,12 +365,78 @@ function UploadName({
   )
 }
 
+// ─── Relative time ────────────────────────────────────────────────────────────
+
+/**
+ * One clock for every "N minutes ago" in the panel, ticking once a minute while
+ * anything shows one. The interval starts with the first reader and stops with
+ * the last, so a closed panel, or one with no completed row, runs no timer.
+ */
+const TICK_MS = 60_000
+let tick = 0
+let tickTimer: ReturnType<typeof setInterval> | null = null
+const tickListeners = new Set<() => void>()
+
+function subscribeTick(listener: () => void): () => void {
+  tickListeners.add(listener)
+  if (tickTimer === null) {
+    tickTimer = setInterval(() => {
+      tick++
+      tickListeners.forEach((l) => l())
+    }, TICK_MS)
+  }
+  return () => {
+    tickListeners.delete(listener)
+    if (tickListeners.size === 0 && tickTimer !== null) {
+      clearInterval(tickTimer)
+      tickTimer = null
+    }
+  }
+}
+
+const readTick = () => tick
+
+/**
+ * "3 minutes ago", kept current. Rows re-render only on their own data, so a
+ * completed row would otherwise say "just now" for as long as the panel stayed
+ * open. The tick re-renders this text and nothing around it.
+ */
+function RelativeTime({ at }: { at: number }) {
+  React.useSyncExternalStore(subscribeTick, readTick, readTick)
+  return <>{formatRelativeTime(new Date(at).toISOString())}</>
+}
+
 // ─── Upload Item ──────────────────────────────────────────────────────────────
 
 const DISMISS_KEPT = 'Dismiss (the partial upload stays on the server until it is cleaned up)'
 
-function UploadItem({ upload }: { upload: UploadFile }) {
-  const { cancelUpload, removeFile, resumeUpload, discardUpload, retryUpload } = useUploadStore()
+/**
+ * One row of the panel, by id.
+ *
+ * It reads its own row and nothing else, and is memoised on the id, so a
+ * progress write, which replaces only the row it changes, re-renders only that
+ * row (spec goal 14). A row that has just left the store, or is another
+ * account's, reads as undefined and draws nothing.
+ */
+export const UploadItem = React.memo(function UploadItem({ fileId }: { fileId: string }) {
+  // Only the signed-in account's row, as `visibleFiles` has it: whose row this
+  // is does not rest on the listing alone.
+  const upload = useUploadStore((s) => {
+    const r = findRow(s, fileId)
+    return r !== undefined && r.ownerId !== undefined && r.ownerId === s.subject ? r : undefined
+  })
+  if (!upload) return null
+  return <UploadRow upload={upload} />
+})
+
+function UploadRow({ upload }: { upload: UploadFile }) {
+  // One selector per action: actions never change, and reading the whole store
+  // here would re-render the row on every write to any other.
+  const cancelUpload = useUploadStore((s) => s.cancelUpload)
+  const removeFile = useUploadStore((s) => s.removeFile)
+  const resumeUpload = useUploadStore((s) => s.resumeUpload)
+  const discardUpload = useUploadStore((s) => s.discardUpload)
+  const retryUpload = useUploadStore((s) => s.retryUpload)
   // Asked of the store rather than guessed from the row: both depend on what
   // this tab holds in memory (the `File` behind a refused row; a run still
   // settling, a Discard still out), which a row read from storage cannot say.
@@ -398,7 +539,7 @@ function UploadItem({ upload }: { upload: UploadFile }) {
           )}
           {upload.status === 'uploading' && (
             <span className="text-[11px] text-text-secondary">
-              {isFinalizing ? 'Finalizing...' : `Uploading ${upload.progress}%`}
+              {isFinalizing ? 'Finalizing…' : `Uploading ${upload.progress}%`}
             </span>
           )}
           {upload.status === 'uploading' && !isFinalizing && rate && (
@@ -409,12 +550,12 @@ function UploadItem({ upload }: { upload: UploadFile }) {
           )}
           {upload.status === 'processing' && (
             <span className="text-[11px] text-amber-400">
-              {upload.processingProgress > 0 ? `Processing ${upload.processingProgress}%` : 'Processing...'}
+              {upload.processingProgress > 0 ? `Processing ${upload.processingProgress}%` : 'Processing…'}
             </span>
           )}
           {upload.status === 'complete' && (
             <span className="text-[11px] text-text-tertiary">
-              {formatRelativeTime(new Date(upload.createdAt).toISOString())}
+              <RelativeTime at={upload.completedAt ?? upload.createdAt} />
             </span>
           )}
           {upload.status === 'failed' && upload.error && (
@@ -475,6 +616,7 @@ function UploadItem({ upload }: { upload: UploadFile }) {
                   onClick={() => filePicker.current?.click()}
                   className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-accent hover:bg-bg-hover transition-colors"
                   title={`Resume — pick ${upload.fileName} again`}
+                  aria-label={`Resume ${upload.fileName}`}
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
                 </button>
@@ -525,6 +667,7 @@ function UploadItem({ upload }: { upload: UploadFile }) {
             onClick={() => cancelUpload(upload.id)}
             className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
             title="Cancel upload"
+            aria-label={`Cancel upload of ${upload.fileName}`}
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -547,6 +690,7 @@ function UploadItem({ upload }: { upload: UploadFile }) {
                 onClick={() => retryUpload(upload.id)}
                 className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-accent hover:bg-bg-hover transition-colors"
                 title="Retry"
+                aria-label={`Retry ${upload.fileName}`}
               >
                 <RotateCcw className="h-3.5 w-3.5" />
               </button>
@@ -575,10 +719,22 @@ export function UploadsPanel({
    *  opens against its right edge, so it has to know which. */
   railCollapsed?: boolean
 } = {}) {
-  const { panelOpen, setPanelOpen, clearCompleted, cancelAllQueued, fetchHistory, fetchMoreHistory, historyHasMore, historyLoading } = useUploadStore()
-  // The signed-in account's rows only: another account's stay in the store, hidden.
-  const files = useVisibleFiles()
+  const panelOpen = useUploadStore((s) => s.panelOpen)
+  const setPanelOpen = useUploadStore((s) => s.setPanelOpen)
+  const headingRef = React.useRef<HTMLHeadingElement>(null)
+  const clearCompleted = useUploadStore((s) => s.clearCompleted)
+  const cancelAllQueued = useUploadStore((s) => s.cancelAllQueued)
+  const fetchHistory = useUploadStore((s) => s.fetchHistory)
+  const fetchMoreHistory = useUploadStore((s) => s.fetchMoreHistory)
+  const historyHasMore = useUploadStore((s) => s.historyHasMore)
+  const historyLoading = useUploadStore((s) => s.historyLoading)
   const [filter, setFilter] = React.useState<FilterTab>('active')
+  // The signed-in account's rows only: another account's stay in the store,
+  // hidden, and are neither listed nor counted. Ids and numbers rather than
+  // rows, so that the panel re-renders when what it lists changes and not on
+  // every progress write (spec goal 14).
+  const listing = useUploadStore(useShallow((s) => (s.panelOpen ? listingOf(visibleFiles(s), filter) : NO_LISTING)))
+  const counts = useUploadStore(useShallow((s) => (s.panelOpen ? countsOf(visibleFiles(s)) : NO_COUNTS)))
   const scrollRef = React.useRef<HTMLDivElement>(null)
   const sentinelRef = React.useRef<HTMLDivElement>(null)
 
@@ -610,21 +766,10 @@ export function UploadsPanel({
 
   if (!panelOpen) return null
 
-  // The way rows will start, not the time they were added: see `byQueueOrder`.
-  const sorted = [...files].sort(byQueueOrder)
-  const filtered = sorted.filter((f) => matchesFilter(f, filter))
-  const groups = groupByDate(filtered)
-
-  const counts = {
-    all: files.length,
-    active: files.filter((f) => matchesFilter(f, 'active')).length,
-    complete: files.filter((f) => f.status === 'complete').length,
-    failed: files.filter((f) => matchesFilter(f, 'failed')).length,
-  }
-  // Rows still waiting for their turn: a new file, the hold's probe, or a resume.
-  // `cancelAllQueued` applies each one's own Cancel and never touches a row whose
-  // turn has begun, so the action is offered exactly while it has someone to act on.
-  const anyQueued = files.some((f) => f.status === 'queued' || isWaitingResume(f))
+  // `cancelAllQueued` applies each waiting row's own Cancel and never touches a
+  // row whose turn has begun, so the action is offered exactly while it has
+  // someone to act on.
+  const anyQueued = counts.queued > 0
 
   const tabs: { id: FilterTab; label: string; count: number }[] = [
     { id: 'all', label: 'All', count: counts.all },
@@ -672,18 +817,23 @@ export function UploadsPanel({
       >
         {/* Header */}
         <div className="flex items-center justify-between px-4 h-12 border-b border-border shrink-0">
-          <h2 className="text-sm font-semibold text-text-primary">
+          {/* Focusable by script only: where focus goes when the button it was on goes away. */}
+          <h2 ref={headingRef} tabIndex={-1} className="text-sm font-semibold text-text-primary outline-none">
             Uploads
             {counts.active > 0 && (
               <span className="ml-1.5 text-xs font-normal text-accent">
-                {counts.active} active
+                {headerCount(counts)}
               </span>
             )}
           </h2>
           <div className="flex items-center gap-1">
             {anyQueued && (
               <button
-                onClick={cancelAllQueued}
+                onClick={() => {
+                  cancelAllQueued()
+                  // The button goes with the queued rows; without this, focus fell to the page.
+                  headingRef.current?.focus()
+                }}
                 className="text-xs text-text-tertiary hover:text-text-secondary transition-colors px-2 py-1 rounded hover:bg-bg-hover"
               >
                 Cancel all queued
@@ -736,7 +886,7 @@ export function UploadsPanel({
 
         {/* Content */}
         <div ref={scrollRef} className="flex-1 overflow-y-auto">
-          {filtered.length === 0 && !historyLoading ? (
+          {listing.length === 0 && !historyLoading ? (
             <div className="flex flex-col items-center justify-center h-full text-center px-6">
               <div className="h-12 w-12 rounded-full bg-bg-tertiary flex items-center justify-center mb-3">
                 <FileIcon className="h-6 w-6 text-text-tertiary" />
@@ -752,7 +902,7 @@ export function UploadsPanel({
             </div>
           ) : (
             <>
-              {groups.map((group) => (
+              {groupsOf(listing).map((group) => (
                 <div key={group.label}>
                   <div className="px-4 pt-4 pb-1">
                     <span
@@ -762,8 +912,8 @@ export function UploadsPanel({
                       {group.label}
                     </span>
                   </div>
-                  {group.items.map((upload) => (
-                    <UploadItem key={upload.id} upload={upload} />
+                  {group.ids.map((id) => (
+                    <UploadItem key={id} fileId={id} />
                   ))}
                 </div>
               ))}

@@ -8,6 +8,7 @@ import { createPartBudget, type PartBudget } from '@/lib/upload-budget'
 import { createUploadQueue, usableRetryAfter, type ActiveInfo, type QueueEntry } from '@/lib/upload-queue'
 import { classifyInitiateError, type InitiateOutcome } from '@/lib/upload-initiate-outcome'
 import { currentSubject, watchSubject } from '@/lib/upload-owner'
+import { onSessionEnded } from '@/lib/auth'
 import {
   assertReadable, FileUnreadableError, FILE_READ_FAILED_MESSAGE,
 } from '@/lib/upload-readable'
@@ -181,7 +182,10 @@ function beatingInAnotherTab(fileId: string, now: number): boolean {
 /**
  * Where a tab says it is taking an upload up, for the moment between deciding
  * to and its heartbeat reaching the other tabs (spec goal 11). One key per
- * row: `RESUME_CLAIM_PREFIX` followed by the row id.
+ * upload: `RESUME_CLAIM_PREFIX` followed by the version id. Not the row id: a
+ * row this tab is sending and the history row another tab shows for the same
+ * upload (`history-<asset id>`) are two ids for one multipart upload, and
+ * claims on two keys both stood, so both tabs sent into it.
  *
  * The check above reads the other tabs' heartbeats, and two tabs that Resume
  * the same row at once are both told nobody is sending it: each looks before
@@ -197,16 +201,16 @@ function beatingInAnotherTab(fileId: string, now: number): boolean {
  * resuming row is `starting`, and the start rule counts it as an active file
  * whose unfinished parts are still `'unknown'` (`Runner.unfinished`).
  *
- * A key per row, not one shared map: a tab writes a map from what it last
- * read, and a tab that had not yet seen another tab's claim on one row
- * removed it by claiming a different row, leaving that tab showing Elsewhere
+ * A key per upload, not one shared map: a tab writes a map from what it last
+ * read, and a tab that had not yet seen another tab's claim on one upload
+ * removed it by claiming a different one, leaving that tab showing Elsewhere
  * with nobody sending.
  */
 export const RESUME_CLAIM_PREFIX = 'ff-upload-claim:'
 
-/** Where the resume claim on `rowId` is kept (`RESUME_CLAIM_PREFIX`). */
-export function resumeClaimKey(rowId: string): string {
-  return `${RESUME_CLAIM_PREFIX}${rowId}`
+/** Where the resume claim on the upload of `versionId` is kept (`RESUME_CLAIM_PREFIX`). */
+export function resumeClaimKey(versionId: string): string {
+  return `${RESUME_CLAIM_PREFIX}${versionId}`
 }
 
 /**
@@ -250,13 +254,13 @@ function parseClaim(raw: string | null): ResumeClaim | null {
   }
 }
 
-/** The claim on `rowId`. Throws only when storage itself cannot be used. */
-function readClaim(rowId: string): ResumeClaim | null {
-  return parseClaim(window.localStorage.getItem(resumeClaimKey(rowId)))
+/** The claim on the upload of `versionId`. Throws only when storage itself cannot be used. */
+function readClaim(versionId: string): ResumeClaim | null {
+  return parseClaim(window.localStorage.getItem(resumeClaimKey(versionId)))
 }
 
 /**
- * Removes the claims on other rows that hold nobody off any more, so the keys
+ * Removes the claims on other uploads that hold nobody off any more, so the keys
  * of tabs that claimed and went away do not pile up. Only what this tab reads
  * as stale goes: a key it reads no value for is left alone.
  */
@@ -275,19 +279,19 @@ function pruneClaims(now: number, except: string): void {
 }
 
 /**
- * Claims the row for this tab, once the server and the stored heartbeats have
- * both said nobody is sending it. `won` is false when another tab's claim is
+ * Claims the upload of `versionId` for this tab, once the server and the
+ * stored heartbeats have both said nobody is sending it. `won` is false when another tab's claim is
  * still fresh, or when another tab's claim replaced this one while it settled.
  * `nonce` names this tab's claim, for `releaseClaim`. Storage that cannot be
  * used coordinates nothing, and the tab goes ahead, as it did before claims.
  */
-async function claimRow(rowId: string, signal: AbortSignal): Promise<{ won: boolean; nonce?: string }> {
+async function claimUpload(versionId: string, signal: AbortSignal): Promise<{ won: boolean; nonce?: string }> {
   const tab = currentTabId()
   const nonce = newTabId()
-  const key = resumeClaimKey(rowId)
+  const key = resumeClaimKey(versionId)
   const now = Date.now()
   try {
-    const theirs = readClaim(rowId)
+    const theirs = readClaim(versionId)
     if (theirs && theirs.tab !== tab && now - theirs.at < CLAIM_TTL_MS) return { won: false }
     window.localStorage.setItem(key, JSON.stringify({ tab, nonce, at: now }))
   } catch {
@@ -300,18 +304,18 @@ async function claimRow(rowId: string, signal: AbortSignal): Promise<{ won: bool
   }
   if (claimSettleMs > 0) await delayUnlessAborted(claimSettleMs, signal)
   try {
-    return readClaim(rowId)?.nonce === nonce ? { won: true, nonce } : { won: false }
+    return readClaim(versionId)?.nonce === nonce ? { won: true, nonce } : { won: false }
   } catch {
     return { won: true, nonce }
   }
 }
 
-/** Takes this tab's claim off the row, if it is still the one there. */
-function releaseClaim(rowId: string, nonce: string | undefined): void {
+/** Takes this tab's claim off the upload, if it is still the one there. */
+function releaseClaim(versionId: string, nonce: string | undefined): void {
   if (nonce === undefined) return
   try {
-    if (readClaim(rowId)?.nonce !== nonce) return
-    window.localStorage.removeItem(resumeClaimKey(rowId))
+    if (readClaim(versionId)?.nonce !== nonce) return
+    window.localStorage.removeItem(resumeClaimKey(versionId))
   } catch {
     /* storage unusable: nothing was claimed there */
   }
@@ -374,6 +378,9 @@ function activeElsewhere(
   // been taken up by another tab since.
   if (beatingInAnotherTab(row.id, now)) return true
   if (ownAndRecentAt(row, now)) return false
+  // The activity the server reports is a stamp this tab's own `/parts` made:
+  // nobody has moved the upload since.
+  if (touchedOnlyHere(info)) return false
   // A Resume this tab queued waits for its turn, and nothing stamps the row
   // while it waits, so judged at the turn a click made inside the grace was
   // refused as soon as the wait outlasted it: the tab's own last parts read as
@@ -443,6 +450,53 @@ function movedSinceClick(info: ResumeInfo, click: ResumeClick): boolean {
   const sinceMoved = serverNow - moved
   const sinceClick = click.askedAt - click.requestedAt + click.rtt
   return sinceMoved < sinceClick
+}
+
+/**
+ * The server's `RESUME_TOUCH_INTERVAL` (apps/api/routers/upload.py): `/parts`
+ * records itself as activity only when nothing has moved for this long.
+ */
+const PARTS_TOUCH_INTERVAL_MS = 5 * 60_000
+
+/**
+ * For each version, the latest `server_time` of a `/parts` answer of this
+ * tab's that recorded itself as activity, on the server's clock. Tab memory
+ * only: it says what this tab did, which no other tab can know.
+ */
+const ownTouches = new Map<string, number>()
+
+/**
+ * `GET /upload/{v}/parts`, remembering when its answer says the request itself
+ * stamped `last_activity_at`: nothing had moved for `PARTS_TOUCH_INTERVAL_MS`,
+ * or nothing had ever. The server stamps before it reads `server_time`, so
+ * the stamp is at or before that time. Recorded however the caller goes on to
+ * use the answer, including a Resume cancelled while it asked.
+ *
+ * An answer that did not stamp records nothing: the activity it reports is
+ * somebody else's, and it must still count as theirs.
+ */
+async function getParts(versionId: string, opts: { pinSubject?: string }): Promise<ResumeInfo> {
+  const info = await api.get<ResumeInfo>(`/upload/${versionId}/parts`, opts)
+  const answered = info?.server_time ? Date.parse(info.server_time) : NaN
+  if (!Number.isNaN(answered)) {
+    const before = info.last_activity_at ? Date.parse(info.last_activity_at) : null
+    const stamped = before === null || (!Number.isNaN(before) && answered - before >= PARTS_TOUCH_INTERVAL_MS)
+    if (stamped) ownTouches.set(versionId, Math.max(answered, ownTouches.get(versionId) ?? -Infinity))
+  }
+  return info
+}
+
+/**
+ * Whether the last activity the server reports for this upload is no later
+ * than a stamp this tab's own `/parts` made: the server's value only moves
+ * forward, so after that stamp anything at or before it is that stamp. Both
+ * times are on the server's clock.
+ */
+function touchedOnlyHere(info: ResumeInfo): boolean {
+  const own = ownTouches.get(info.version_id)
+  if (own === undefined || !info.last_activity_at) return false
+  const reported = Date.parse(info.last_activity_at)
+  return !Number.isNaN(reported) && reported <= own
 }
 
 /** Until when an upload that last moved at `lastActivity` counts as running. */
@@ -1349,6 +1403,14 @@ export interface UploadFile {
   s3Key?: string
   createdAt: number // timestamp for grouping
   /**
+   * When the row became `complete`: what its "N minutes ago" counts from.
+   * `createdAt` is when it was added, kept through a wait in the queue, a retry
+   * and a resume. Set on every move into `complete` (`withCompletion`), and for
+   * a history row from the version's last activity, the last time a part was
+   * sent, since the version records no finish time.
+   */
+  completedAt?: number
+  /**
    * The account that added the row: the access token's `sub` when it was
    * added, never the profile in `useAuthStore`, which is fetched once and goes
    * stale when another tab signs in. Every request the row's run makes is
@@ -1702,7 +1764,7 @@ async function completedVersionStatus(
  */
 async function finishAssembledUpload(versionId: string, ownerId: string | undefined): Promise<boolean> {
   try {
-    const info = await api.get<ResumeInfo>(`/upload/${versionId}/parts`, { pinSubject: ownerId })
+    const info = await getParts(versionId, { pinSubject: ownerId })
     if (info.state !== 'assembled') return false
     await api.post('/upload/complete', {
       s3_key: info.s3_key,
@@ -1765,6 +1827,7 @@ function mergeHistoryAssets(existing: UploadFile[], assets: AssetResponse[]): Up
         assetId: a.id,
         versionId: v.id,
         createdAt: new Date(v.created_at).getTime(),
+        ...(status === 'complete' ? { completedAt: new Date(v.last_activity_at ?? v.created_at).getTime() } : {}),
         elsewhereUntil: status === 'elsewhere' ? until : undefined,
         fromHistory: true,
         // `/me/assets?filter=owned` lists the assets this account created, so
@@ -1901,10 +1964,20 @@ const newRowId = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`
 const REFUSED_MESSAGE = 'The server refused this upload.'
 const ACCOUNT_SWITCHED_MESSAGE = 'Another account signed in. Add these files again after signing back in.'
 const SIGNED_OUT_MESSAGE = 'Signed out in another tab. Add these files again after signing in.'
+const SESSION_ENDED_MESSAGE = 'Your session ended. Add these files again after signing in.'
+
+/**
+ * Whether the session was last ended by this tab (`clearTokens`, heard through
+ * `onSessionEnded`) rather than by another tab (heard through the `storage`
+ * event). Only the wording of a signed-out row depends on it. Cleared as soon
+ * as anyone signs in again.
+ */
+let sessionEndedHere = false
 
 /** Why a row could not start as its owner: someone else is signed in, or nobody is. */
 function accountMessage(now: string | null): string {
-  return now === null ? SIGNED_OUT_MESSAGE : ACCOUNT_SWITCHED_MESSAGE
+  if (now !== null) return ACCOUNT_SWITCHED_MESSAGE
+  return sessionEndedHere ? SESSION_ENDED_MESSAGE : SIGNED_OUT_MESSAGE
 }
 
 /** A new row that cannot start because its owner is no longer signed in. */
@@ -1929,6 +2002,7 @@ function accountFailure(now: string | null): Partial<UploadFile> {
  * same account twice changes nothing.
  */
 function applySubject(next: string | null): void {
+  if (next !== null) sessionEndedHere = false
   const others = (f: UploadFile) => f.ownerId !== next && !runners.has(f.id)
   const files = useUploadStore.getState().files
   const newRows = new Set(files.filter((f) => f.status === 'queued' && others(f)).map((f) => f.id))
@@ -2064,13 +2138,18 @@ function refuseTurn(row: UploadFile, kind: 'new' | 'resume', now: string | null)
 }
 
 function rowById(id: string): UploadFile | undefined {
-  return useUploadStore.getState().files.find((f) => f.id === id)
+  return findRow(useUploadStore.getState(), id)
 }
 
 function patchRow(id: string, patch: Partial<UploadFile>): void {
   useUploadStore.setState((s) => ({
-    files: s.files.map((f) => (f.id === id ? { ...f, ...patch } : f)),
+    files: s.files.map((f) => (f.id === id ? withCompletion(f, { ...f, ...patch }) : f)),
   }))
+}
+
+/** `next`, with `completedAt` set to now when it is `prev` moving into `complete`. */
+function withCompletion(prev: UploadFile, next: UploadFile): UploadFile {
+  return next.status === 'complete' && prev.status !== 'complete' ? { ...next, completedAt: Date.now() } : next
 }
 
 function activeInfos(): ActiveInfo[] {
@@ -2165,8 +2244,9 @@ function endRun(id: string, runner: Runner, runKey: string): void {
   partBudget.forget(runKey)
   if (runners.get(id) === runner) runners.delete(id)
   noteRunsChanged()
-  // Cancelled while starting: whatever the initiate created has been thrown
-  // away by now, so there is nothing left for the row to say.
+  // Cancelled while starting: whatever the initiate created is being thrown
+  // away (the abort is on its way, not yet answered; see `cancelUpload`), so
+  // there is nothing left for the row to say.
   if (runner.removeWhenSettled) {
     useUploadStore.setState((s) => ({ files: s.files.filter((f) => f.id !== id) }))
   }
@@ -2653,8 +2733,14 @@ async function runNew(id: string, runner: Runner, runKey: string): Promise<void>
     // *any* error -- destroying the bytes that make a resume possible at
     // exactly the moment they became worth keeping. Everything else is left
     // for the user to resume or for the reaper to reclaim.
+    //
+    // Sent, not awaited: the run gives its place back now. The abort asks the
+    // API to have storage throw the parts away, and with storage hanging the
+    // API takes its client's whole retry budget to give up (minutes), during
+    // which the queue stood still behind a row that already read "Cancelled"
+    // (e2e S4, APP-BUG-5). `abortCancelled` handles its own answer.
     if (userCancelled() && upload_id && s3_key && version_id) {
-      await abortCancelled(useUploadStore.setState, { s3_key, upload_id, version_id }, owner)
+      void abortCancelled(useUploadStore.setState, { s3_key, upload_id, version_id }, owner)
     }
   } finally {
     watch?.stop()
@@ -2702,7 +2788,7 @@ async function runResume(id: string, runner: Runner, runKey: string): Promise<vo
     // browser that never saw them.
     const askedAt = Date.now()
     try {
-      info = await api.get<ResumeInfo>(`/upload/${versionId}/parts`, asOwner)
+      info = await getParts(versionId, asOwner)
     } catch (err) {
       const outcome = isAbortError(err) || isFinalRefusal(err) ? null : classifyInitiateError(err)
       // Cancelled while it asked: the row is already plain `interrupted` again,
@@ -2768,7 +2854,7 @@ async function runResume(id: string, runner: Runner, runKey: string): Promise<vo
     }
     // Another tab of this browser may have been told the same at the same
     // moment: only the tab whose claim stands goes on (see `RESUME_CLAIM_PREFIX`).
-    const claim = await claimRow(id, controller.signal)
+    const claim = await claimUpload(versionId, controller.signal)
     claimNonce = claim.nonce
     // Cancelled while the claim settled: back to plain `interrupted` already.
     if (runner.stoodDown) return
@@ -2947,8 +3033,9 @@ async function runResume(id: string, runner: Runner, runKey: string): Promise<vo
       }
     }
 
+    // Sent, not awaited, as in `runNew`: the place is given back now.
     if (userCancelled() && info) {
-      await abortCancelled(useUploadStore.setState, {
+      void abortCancelled(useUploadStore.setState, {
         s3_key: info.s3_key,
         upload_id: info.upload_id,
         version_id: info.version_id,
@@ -2957,7 +3044,7 @@ async function runResume(id: string, runner: Runner, runKey: string): Promise<vo
   } finally {
     watch?.stop()
     stopBeat()
-    releaseClaim(id, claimNonce)
+    releaseClaim(versionId, claimNonce)
     if (abortControllers[id] === controller) delete abortControllers[id]
     endRun(id, runner, runKey)
   }
@@ -3115,7 +3202,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
         // As the row's owner, like everything below: the panel follows the
         // account only once this tab hears of a change, and a Discard clicked
         // before then must not be sent as whoever signed in since.
-        info = await api.get<ResumeInfo>(`/upload/${row.versionId}/parts`, asOwner)
+        info = await getParts(row.versionId, asOwner)
       } catch (err) {
         // 404 or 409: the version is gone or no longer uploading, so the row has
         // nothing to offer. The multipart upload behind it may still be open --
@@ -3241,7 +3328,12 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     }
 
     // Initiating: what the initiate creates is thrown away when it answers
-    // (see `runNew`), and only then does the row leave.
+    // (see `runNew`), and only then does the row leave. "Thrown away" means
+    // the abort has been sent, not answered: the row leaves before
+    // `/upload/abort` answers (APP-BUG-5). A history fetch that lands in that
+    // window can still see the version `uploading` and adopt it back as a row,
+    // as it could before whenever the abort failed; the reaper and a Discard
+    // cover both.
     if (row.status === 'starting' && runner) runner.removeWhenSettled = true
     if (!runner) {
       fileRefs.delete(fileId)
@@ -3288,11 +3380,11 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
   },
 
   canRetry: (fileId) => {
-    const row = get().files.find((f) => f.id === fileId)
+    const row = findRow(get(), fileId)
     return row !== undefined && retryable(row)
   },
 
-  canResume: (fileId) => resumableNow(get().files.find((f) => f.id === fileId)),
+  canResume: (fileId) => resumableNow(findRow(get(), fileId)),
 
   renameUpload: async (fileId, name) => {
     const row = get().files.find((f) => f.id === fileId)
@@ -3436,7 +3528,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     set((s) => ({
       files: s.files.map((f) =>
         f.assetId === assetId && f.status === 'processing'
-          ? { ...f, status: 'complete' as const, processingProgress: 100 }
+          ? { ...f, status: 'complete' as const, processingProgress: 100, completedAt: Date.now() }
           : f,
       ),
     }))
@@ -3553,13 +3645,13 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
           // always changing status and can never reach this comparison equal.
           if (status === f.status) return f
           const keepsProgress = status === 'interrupted' || status === 'elsewhere'
-          return {
+          return withCompletion(f, {
             ...f,
             status,
             elsewhereUntil: stillMoving ? movingUntil : f.elsewhereUntil,
             progress: keepsProgress ? f.progress : 100,
             processingProgress: status === 'complete' ? 100 : 0,
-          }
+          })
         }),
       }))
     } catch {
@@ -3672,7 +3764,7 @@ async function adoptOwnerlessRows(): Promise<void> {
 async function checkOwner(f: UploadFile, versionId: string, owner: string): Promise<void> {
   adopting.add(f.id)
   try {
-    await api.get<ResumeInfo>(`/upload/${versionId}/parts`, { pinSubject: owner })
+    await getParts(versionId, { pinSubject: owner })
     useUploadStore.setState((s) => ({
       files: s.files.map((r) => (r.id === f.id && r.ownerId === undefined ? { ...r, ownerId: owner } : r)),
     }))
@@ -3893,6 +3985,27 @@ export function visibleFiles(state: UploadStore): UploadFile[] {
   return state.files.filter((f) => f.ownerId !== undefined && f.ownerId === state.subject)
 }
 
+/** The `files` array `rowIndex` was built from, and the index itself. */
+let rowIndexOf: UploadFile[] | null = null
+let rowIndex = new Map<string, UploadFile>()
+
+/**
+ * The row with `id`, or undefined. Every row of the panel asks this of the
+ * store on every write, for itself and for `canRetry` and `canResume`, so a
+ * linear `find` costs rows times rows per progress report: measured at 2,000
+ * rows, it was most of a 20 ms write. The index is built once per `files`
+ * array, which every write replaces and none mutates, so it cannot go stale.
+ * The first row with an id wins, as with `find`.
+ */
+export function findRow(state: Pick<UploadStore, 'files'>, id: string): UploadFile | undefined {
+  if (rowIndexOf !== state.files) {
+    rowIndex = new Map()
+    for (const f of state.files) if (!rowIndex.has(f.id)) rowIndex.set(f.id, f)
+    rowIndexOf = state.files
+  }
+  return rowIndex.get(id)
+}
+
 /**
  * A row this tab would lose if the page went away now (spec goal 12): waiting
  * for its turn, being started, or being sent. That is `queued` (new, or held),
@@ -3937,6 +4050,19 @@ if (typeof window !== 'undefined') {
 // arrives, before this tab can send anything more.
 if (typeof window !== 'undefined') {
   watchSubject((next) => applySubject(next))
+}
+
+// This tab ended the session: a refresh the server refused, or Log out. The
+// tab never hears its own `storage` event, and the page leaves for /login
+// straight after, so the same rule is applied here, before it goes: rows that
+// had not started fail and are saved with their owner, instead of vanishing
+// with the page's memory (spec goals 6 and 9). Rows being sent are left to
+// their run, as on any change; what was saved of them comes back Interrupted.
+if (typeof window !== 'undefined') {
+  onSessionEnded(() => {
+    sessionEndedHere = true
+    applySubject(null)
+  })
 }
 
 // Rows saved before this release are checked once the saved rows are loaded.
@@ -4017,6 +4143,8 @@ export const __uploadQueueTesting = {
     adopting.clear()
     historyGeneration++
     claimSettleMs = CLAIM_SETTLE_MS
+    sessionEndedHere = false
+    ownTouches.clear()
   },
   /**
    * How long a resume's claim waits for another tab's (see `RESUME_CLAIM_PREFIX`).

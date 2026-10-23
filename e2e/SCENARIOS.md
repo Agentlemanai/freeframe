@@ -19,35 +19,35 @@ version.
 
 | ID | Scenario | Expected | Engines | Phase | Automated in | Live Chrome run | Real Safari | Real Firefox |
 |---|---|---|---|---|---|---|---|---|
-| Q1 | Drop 50 mixed files (1 KB–40 MB, ~300 MB total), throttled to 2 MB/s, `test.setTimeout(30 min)` | at every 500 ms sample, rows in Starting, Resuming or Uploading (including finalizing) ≤ 3; start order = drop order; the next file starts only near the end of the one ahead | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#q1-drop-50-mixed-files-pass) | — | — |
-| Q2 | Drop 300 files of 200 KB with the panel open | all complete; no main-thread long task > 200 ms during the run (PerformanceObserver `longtask`, Chromium only) | Chromium | 6 | — | — | — | — |
-| Q3 | Two drops 2 s apart | the second drop's files start after the first drop's | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#q3-two-drops-2-s-apart-pass) | — | — |
-| Q4 | Rename a queued file | the asset is created with the new name | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#q4-rename-a-queued-file-pass) | — | — |
-| C1 | Cancel a queued file | the row disappears; no initiate for it (`countRequests`) | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#c1-cancel-a-queued-file-pass) | — | — |
-| C2 | "Cancel all queued" mid-run | active files continue; every queued row disappears | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#c2-cancel-all-queued-mid-run-pass) | — | — |
-| C3 | Cancel the active file | the next file starts; `/upload/abort` sent once | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#c3-cancel-the-active-file-pass) | — | — |
-| U1 | `touch` a queued file before its turn | that row: "The file changed or was moved after it was added. Add it again.", Dismiss only (no Retry); no initiate for it; the queue continues | Chromium, WebKit, Firefox | 3 | `tests/unreadable.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#u1-touch-a-queued-file-before-its-turn-pass) | — | — |
-| U2 | `remove` the sending file mid-part | the row ends Interrupted with the same copy within 90 s + backoff (Chromium errors the send at once; in WebKit the send hangs with no event and the part watchdog ends it); nothing is aborted; the queue continues | Chromium, WebKit, Firefox | 3 | `tests/unreadable.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#u2-rm-the-sending-file-mid-part-pass) | — | — |
-| U3 | `hangParts` / `stallParts` for parts of a file | the part watchdog aborts a part and retries it, and the queue does not freeze. A part that has sent its first byte and then stops is aborted after 90 s without upload progress. A part that has not sent a byte yet is aborted only when the whole tab has had no upload progress for 90 s, or when it has itself waited 5 min (the hard cap, so a part held behind busy sockets is not mistaken for a stalled one). A part that sent its last byte waits 5 min for the answer. The retry goes through; the 5 min cap alone is not automated (see Phase 3 results) | Chromium, WebKit, Firefox | 3 | `tests/unreadable.spec.ts` (U3: parts that never start, tab silent; U3b: a part that stops after progress, tab busy) | [PASS](live-runs/2026-10-22-phase-3.md#u3-parts-that-never-start-tab-silent-pass-stand-in-parts-held-nothing-sent), and [U3b](live-runs/2026-10-22-phase-3.md#u3b-a-part-that-stops-after-progress-tab-busy-pass-real-socket-stall-server) and [the two 5 min clocks](live-runs/2026-10-22-phase-3.md#u3c-the-two-5-min-clocks-u3s-text-the-5-min-cap-alone-is-not-automated-pass-real-sockets), run live | — | — |
-| N1 | `context.setOffline(true)` at enqueue, back online after 30 s | rows show "Waiting for connection"; none failed; all complete after reconnect (WebKit: `networkSwitch` aborts the API and bucket requests instead, see Phase 3 results) | Chromium, WebKit, Firefox | 3 | `tests/network.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#n1-offline-at-enqueue-pass) | — | — |
-| N2 | Offline mid-part for 20 s | the sending file's ladder recovers; queued files never fail | Chromium, WebKit, Firefox | 3 | `tests/network.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#n2-offline-mid-part-pass) | — | — |
-| S1 | `failInitiate` coded 503 three times | "Waiting for storage", then the queue continues; 3 retries spaced ≥ 5 s | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#s1-failinitiate-coded-503-pass-with-the-real-fault) | — | — |
-| S2 | `failParts(503)` on every PUT for 60 s | presign requests ≤ budget × 8 over the window (`countRequests`) | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#s2-failparts503-for-60-s-pass-stand-in-network-errors) | — | — |
-| S3 | Infra: `docker stop` storage mid-queue, start after 60 s | queued files hold; the sending file ends Interrupted (as today) or recovers | Chromium | 6 | — | — | — | — |
-| S4 | Infra: black-hole storage (`docker network disconnect`) | "Waiting for storage" within 20 s of the next file's turn | Chromium | 6 | — | — | — | — |
-| R1 | Interrupt an upload (close the page), reopen, Resume while 10 files are queued | the Resume starts next; its `ff-uploads` entry exists throughout | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` (R1, and R1b, the APP-BUG-1 regression test, fixed 2026-10-22) | [PASS after the fix, 2026-10-22](live-runs/2026-10-22-phase-2.md#r1-re-run-after-app-bug-1-fix-pass) (first run: [FAIL, APP-BUG-1](live-runs/2026-10-22-phase-2.md#r1-interrupt-reopen-resume-while-files-are-queued-fail-app-bug-1)) | — | — |
-| R2 | Two tabs, Resume the same interrupted row in both | exactly one tab presigns | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` (failed in WebKit until the APP-BUG-2 fix, 2026-10-22) | [PASS, three runs](live-runs/2026-10-22-phase-4.md#r2-two-tabs-resume-the-same-interrupted-row-pass-three-runs) | — | — |
-| R3 | Cancel during Resuming | the row returns to Interrupted; no `/upload/abort` | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#r3-cancel-during-resuming-pass) | — | — |
-| A1 | Two pages, one context: log out in B with files queued in A | A redirects to /login; after signing back in, A's queued files show as Failed with the signed-out message | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a1-log-out-in-another-tab-with-files-queued-pass) | — | — |
-| A2 | Accept an invite as `secondary` in tab B while A sends | A's sending row ends Interrupted; A's queued rows fail with the account message; no asset lands in `secondary`'s account | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a2-accept-an-invite-in-another-window-while-a-sends-pass) | — | — |
-| A3 | Sign in as `secondary` in the same browser after `primary` left interrupted rows | `secondary` sees none of them; `primary` sees them again after switching back | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a3-another-account-in-the-same-browser-after-primary-left-interrupted-rows-pass) | — | — |
-| L1 | Reload with files queued | the beforeunload dialog appears (`page.on('dialog')`, type `beforeunload`) in Chromium and WebKit | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` (L1, and L1 negative: nothing on its way, no prompt) | [PASS](live-runs/2026-10-23-phase-5.md#l1-reload-with-files-queued-pass) (L1 negative: PASS, console not read), and [closing the tab](live-runs/2026-10-23-phase-5.md#l1-close-the-tab-with-files-queued-pass) | — | — |
-| L2 | Log out with files queued | in-app confirm "N uploads will stop. Log out anyway?"; confirming navigates with no beforeunload dialog | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` (L2 with Cancel then Log out, L2 one file, L2 negative: nothing on its way, no confirm) | [PASS](live-runs/2026-10-23-phase-5.md#l2-log-out-with-files-queued-pass) | — | — |
-| L3 | Expired session (clear both tokens, then trigger a request) | redirect to /login, no dialog | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` | [PASS, both tokens cleared and the refresh refused](live-runs/2026-10-23-phase-5.md#l3-a-session-that-ends-by-force-pass) | — | — |
-| V1 | New Version during a long queue | the asset page shows "New version queued, waiting for other uploads."; the version appears without reload | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#v1-new-version-during-a-long-queue-pass) | — | — |
-| P1 | A storage cap that fits only about 3 of 10 files | at least one row Failed "Storage limit reached …" with Retry; every row ends Complete/Processing or Failed; none stays Queued or Starting; committed bytes exceed the cap by at most one file (with at most two files in flight; the cap counts only committed media) | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#p1-storage-cap-pass) | — | — |
-| P2 | Project deleted while 5 files are queued for it, plus 2 queued for another project | the 5 fail with 404; the 2 upload | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#p2-project-deleted-under-queued-files-pass) | — | — |
-| M | Manual, **real Safari and real Firefox**, every phase: the phase's scenarios from this table, plus "hard reload, then drop from Finder without clicking, then reload". By the end, every scenario above has a real Safari and a real Firefox result | record the result in `SCENARIOS.md` with browser versions, before that phase's PR merges | Safari, Firefox (manual) | every phase | — | — | — | — |
+| Q1 | Drop 50 mixed files (1 KB–40 MB, ~300 MB total), throttled to 2 MB/s, `test.setTimeout(30 min)` | at every 500 ms sample, rows in Starting, Resuming or Uploading (including finalizing) ≤ 3; start order = drop order; the next file starts only near the end of the one ahead | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#q1-drop-50-mixed-files-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#q1-pass) | — | — |
+| Q2 | Drop 300 files of 200 KB with the panel open | all complete; no main-thread long task > 200 ms during the run (PerformanceObserver `longtask`, Chromium only) | Chromium | 6 | `tests/scale.spec.ts` (fixed APP-BUG-3 and APP-BUG-4 on the way) | final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#q2-pass) | — | — |
+| Q3 | Two drops 2 s apart | the second drop's files start after the first drop's | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#q3-two-drops-2-s-apart-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#q3-pass) | — | — |
+| Q4 | Rename a queued file | the asset is created with the new name | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#q4-rename-a-queued-file-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#q4-pass) | — | — |
+| C1 | Cancel a queued file | the row disappears; no initiate for it (`countRequests`) | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#c1-cancel-a-queued-file-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#c1-pass) | — | — |
+| C2 | "Cancel all queued" mid-run | active files continue; every queued row disappears | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#c2-cancel-all-queued-mid-run-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#c2-pass) | — | — |
+| C3 | Cancel the active file | the next file starts; `/upload/abort` sent once | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#c3-cancel-the-active-file-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#c3-pass) | — | — |
+| U1 | `touch` a queued file before its turn | that row: "The file changed or was moved after it was added. Add it again.", Dismiss only (no Retry); no initiate for it; the queue continues | Chromium, WebKit, Firefox | 3 | `tests/unreadable.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#u1-touch-a-queued-file-before-its-turn-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#u1-pass) | — | — |
+| U2 | `remove` the sending file mid-part | the row ends Interrupted with the same copy within 90 s + backoff (Chromium errors the send at once; in WebKit the send hangs with no event and the part watchdog ends it); nothing is aborted; the queue continues | Chromium, WebKit, Firefox | 3 | `tests/unreadable.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#u2-rm-the-sending-file-mid-part-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#u2-pass) | — | — |
+| U3 | `hangParts` / `stallParts` for parts of a file | the part watchdog aborts a part and retries it, and the queue does not freeze. A part that has sent its first byte and then stops is aborted after 90 s without upload progress. A part that has not sent a byte yet is aborted only when the whole tab has had no upload progress for 90 s, or when it has itself waited 5 min (the hard cap, so a part held behind busy sockets is not mistaken for a stalled one). A part that sent its last byte waits 5 min for the answer. The retry goes through; the 5 min cap alone is not automated (see Phase 3 results) | Chromium, WebKit, Firefox | 3 | `tests/unreadable.spec.ts` (U3: parts that never start, tab silent; U3b: a part that stops after progress, tab busy) | [PASS](live-runs/2026-10-22-phase-3.md#u3-parts-that-never-start-tab-silent-pass-stand-in-parts-held-nothing-sent), and [U3b](live-runs/2026-10-22-phase-3.md#u3b-a-part-that-stops-after-progress-tab-busy-pass-real-socket-stall-server) and [the two 5 min clocks](live-runs/2026-10-22-phase-3.md#u3c-the-two-5-min-clocks-u3s-text-the-5-min-cap-alone-is-not-automated-pass-real-sockets), run live; final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#u3-pass), [U3b](live-runs/2026-10-23-final.md#u3b-pass) and [U3c](live-runs/2026-10-23-final.md#u3c-pass) | — | — |
+| N1 | `context.setOffline(true)` at enqueue, back online after 30 s | rows show "Waiting for connection"; none failed; all complete after reconnect (WebKit: `networkSwitch` aborts the API and bucket requests instead, see Phase 3 results) | Chromium, WebKit, Firefox | 3 | `tests/network.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#n1-offline-at-enqueue-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#n1-pass) | — | — |
+| N2 | Offline mid-part for 20 s | the sending file's ladder recovers; queued files never fail | Chromium, WebKit, Firefox | 3 | `tests/network.spec.ts` | [PASS](live-runs/2026-10-22-phase-3.md#n2-offline-mid-part-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#n2-pass) | — | — |
+| S1 | `failInitiate` coded 503 three times | "Waiting for storage", then the queue continues; 3 retries spaced ≥ 5 s | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#s1-failinitiate-coded-503-pass-with-the-real-fault); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#s1-pass) | — | — |
+| S2 | `failParts(503)` on every PUT for 60 s | presign requests ≤ budget × 8 over the window (`countRequests`) | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#s2-failparts503-for-60-s-pass-stand-in-network-errors); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#s2-pass) | — | — |
+| S3 | Infra: `docker stop` storage mid-queue, start after 60 s | queued files hold; the sending file ends Interrupted (as today) or recovers | Chromium | 6 | `tests/infra.spec.ts` (`E2E_INFRA=1`) | final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#s3-pass) | — | — |
+| S4 | Infra: black-hole storage (`docker network disconnect`) | "Waiting for storage" within 20 s of the next file's turn | Chromium | 6 | `tests/infra.spec.ts` (S4, and S4b with `docker pause`; `E2E_INFRA=1`; fixed APP-BUG-5 on the way) | final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#s4-pass) | — | — |
+| R1 | Interrupt an upload (close the page), reopen, Resume while 10 files are queued | the Resume starts next; its `ff-uploads` entry exists throughout | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` (R1, and R1b, the APP-BUG-1 regression test, fixed 2026-10-22) | [PASS after the fix, 2026-10-22](live-runs/2026-10-22-phase-2.md#r1-re-run-after-app-bug-1-fix-pass) (first run: [FAIL, APP-BUG-1](live-runs/2026-10-22-phase-2.md#r1-interrupt-reopen-resume-while-files-are-queued-fail-app-bug-1)); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#r1-pass) | — | — |
+| R2 | Two tabs, Resume the same interrupted row in both | exactly one tab presigns | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` (failed in WebKit until the APP-BUG-2 fix, 2026-10-22) | [PASS, three runs](live-runs/2026-10-22-phase-4.md#r2-two-tabs-resume-the-same-interrupted-row-pass-three-runs); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#r2-pass) | — | — |
+| R3 | Cancel during Resuming | the row returns to Interrupted; no `/upload/abort` | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#r3-cancel-during-resuming-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#r3-pass) | — | — |
+| A1 | Two pages, one context: log out in B with files queued in A | A redirects to /login; after signing back in, A's queued files show as Failed with the signed-out message | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a1-log-out-in-another-tab-with-files-queued-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#a1-pass) | — | — |
+| A2 | Accept an invite as `secondary` in tab B while A sends | A's sending row ends Interrupted; A's queued rows fail with the account message; no asset lands in `secondary`'s account | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a2-accept-an-invite-in-another-window-while-a-sends-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#a2-pass) | — | — |
+| A3 | Sign in as `secondary` in the same browser after `primary` left interrupted rows | `secondary` sees none of them; `primary` sees them again after switching back | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a3-another-account-in-the-same-browser-after-primary-left-interrupted-rows-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#a3-pass) | — | — |
+| L1 | Reload with files queued | the beforeunload dialog appears (`page.on('dialog')`, type `beforeunload`) in Chromium and WebKit | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` (L1, and L1 negative: nothing on its way, no prompt) | [PASS](live-runs/2026-10-23-phase-5.md#l1-reload-with-files-queued-pass) (L1 negative: PASS, console not read), and [closing the tab](live-runs/2026-10-23-phase-5.md#l1-close-the-tab-with-files-queued-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#l1-pass) | — | — |
+| L2 | Log out with files queued | in-app confirm "N uploads will stop. Log out anyway?"; confirming navigates with no beforeunload dialog | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` (L2 with Cancel then Log out, L2 one file, L2 negative: nothing on its way, no confirm) | [PASS](live-runs/2026-10-23-phase-5.md#l2-log-out-with-files-queued-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#l2-pass) | — | — |
+| L3 | Expired session (clear both tokens, then trigger a request) | redirect to /login, no dialog; signed back in, the queued files are Failed ("Your session ended. Add these files again after signing in.") and the sending ones Interrupted | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` | [PASS, both tokens cleared and the refresh refused](live-runs/2026-10-23-phase-5.md#l3-a-session-that-ends-by-force-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#l3-pass) | — | — |
+| V1 | New Version during a long queue | the asset page shows "New version queued, waiting for other uploads"; the version appears without reload | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#v1-new-version-during-a-long-queue-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#v1-pass) | — | — |
+| P1 | A storage cap that fits only about 3 of 10 files | at least one row Failed "Storage limit reached …" with Retry; every row ends Complete/Processing or Failed; none stays Queued or Starting; committed bytes exceed the cap by at most one file (with at most two files in flight; the cap counts only committed media) | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#p1-storage-cap-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#p1-pass) | — | — |
+| P2 | Project deleted while 5 files are queued for it, plus 2 queued for another project | the 5 fail with 404; the 2 upload | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#p2-project-deleted-under-queued-files-pass); final pass 2026-10-23: [PASS](live-runs/2026-10-23-final.md#p2-pass) | — | — |
+| M | Manual, **real Safari and real Firefox**, every phase: the phase's scenarios from this table, plus "hard reload, then drop from Finder without clicking, then reload". By the end, every scenario above has a real Safari and a real Firefox result | record the result in `SCENARIOS.md` with browser versions, before that phase's PR merges | Safari, Firefox (manual) | every phase | n/a (manual); every cell of the two columns to the right is still empty, see [Manual pass owed](#manual-pass-owed-real-safari-real-firefox) | — | — | — |
 
 ## Phase 2 automated results
 
@@ -138,7 +138,7 @@ with the before and after against the baseline. The "Live Chrome run" column abo
 - **Q1** at Fast 4G (the MCP has no 2 MB/s; same as the baseline): 6 initiates in the first second (baseline 50), at most 3 rows moving at all
   332 samples (baseline 50), start order exactly the drop order, at most 3 part PUTs in flight while throttled (baseline 61).
 - **Passing** (13 asked for, 12 passed the first time, 13 after the R1 re-run): Q1, Q3, Q4, C1, C2, C3, S1 (with the real fault, `docker stop` of the e2e MinIO), S2 (25 presigns in 60 s, bound 40),
-  R3, V1, P1 (0.5 file over the cap), P2. Plus the brief's exploratory checks: 50 files at Slow 3G (one initiate at a time, three files sending),
+  R3, V1, P1 (0.5 file over the cap), P2. Plus the test plan's exploratory checks: 50 files at Slow 3G (one initiate at a time, three files sending),
   `/upload/initiate` blocked for 30 s ("Waiting for connection", none failed), and a Resume while 20 files wait (starts next).
 - **R1 failed** in the first live pass (**APP-BUG-1**, fixed; see the re-run below): the Resume starts next, as expected, but a Resume that waits in the queue past the 30 s own-stop
   grace is read as "Still uploading in another tab or on another device" when its turn comes, and nothing is sent. Controlled
@@ -250,7 +250,7 @@ so the first three do ask together. No data is lost; the order among those three
 Run by hand in real, headed Chrome 154.0.8037.100 on the phase 3 branch (`0eb50cc1`), 2026-10-22: [`live-runs/2026-10-22-phase-3.md`](live-runs/2026-10-22-phase-3.md).
 The "Live Chrome run" column above links each scenario's section.
 
-- **Passing**: U1, U2, U3, N1, N2, plus the checks the brief asked for and two the live pass added: U3b (a part that sent 1.08 MB and
+- **Passing**: U1, U2, U3, N1, N2, plus the checks the test plan asked for and two the live pass added: U3b (a part that sent 1.08 MB and
   then stopped, tab busy: aborted 90.0 s after its own last progress, not 140 s), U3c (the two 5 min clocks the automated suite cannot
   run: a never-started part with a busy tab is aborted at 300.0 s, a part with every byte sent and no answer 299.98 s after its last
   byte), `rm` of a file that is sending (X1: all parts in flight, the upload completes from the unlinked file; X1b: a part still to
@@ -261,7 +261,7 @@ The "Live Chrome run" column above links each scenario's section.
 - **No app bug was found** in this pass. Observations (not failures): after a reconnect the app waits out its backoff (22 to 30 s here)
   rather than waking on the browser's `online` event; an outage that lands on `/upload/complete` leaves the row Interrupted with the
   browser's text "Failed to fetch" (X2), recoverable with Resume without re-sending.
-- **Laptop sleep: moved to the manual pass** (controller ruling R9: the machine is not put to sleep in an automated run).
+- **Laptop sleep: moved to the manual pass** (an automated run does not put the machine to sleep).
 - "Touch a file in a synced folder" used a plain local folder: the Google Drive, OneDrive and iCloud folders on the machine are the
   user's, not test locations.
 - Not run here: the manual real Safari and real Firefox pass (matrix row M).
@@ -327,7 +327,7 @@ What each one observed:
 completed; in one run one tab was then left Failed, "Upload is incomplete: 1 part(s) missing, starting at part 1.". Each tab
 looks in shared storage for the other's heartbeat once `/parts` answers (spec goal 11, step 2), and a write to localStorage
 reaches another tab's process a moment later, so each looked before the other's first stamp arrived. Now a resume that
-has been told nobody is sending writes a claim (one key per row, `ff-upload-claim:<row id>`), waits 500 ms for a competing
+has been told nobody is sending writes a claim (one key per upload, `ff-upload-claim:<version id>`), waits 500 ms for a competing
 claim still on its way, and goes on only if its claim stands; the other shows Elsewhere. The unit test in
 `upload-other-tab.test.ts` ("two tabs resuming the same upload at the same moment") reproduces it: the other tab's moves
 land just after this tab has looked, and before the fix this tab sent and completed. The same describe and "two tabs of
@@ -368,12 +368,12 @@ Observations (not failures of these scenarios):
 
 Run by hand in real, headed Chrome 154.0.8037.100 on the phase 4 branch (`75618d4b`), 2026-10-22, with two tabs and two windows of
 one profile: [`live-runs/2026-10-22-phase-4.md`](live-runs/2026-10-22-phase-4.md). The "Live Chrome run" column above links each
-scenario's section. The DevTools MCP's profile was held by another session's Chrome, so the pass drove its own headed Chrome over
-the DevTools protocol (`live-tools/cdp-driver.js`, `LIVE-CHROME.md` section 10). Through that driver every page read visible and
+scenario's section. The DevTools MCP's profile was held by a Chrome the pass had not started, so the pass drove its own headed
+Chrome over the DevTools protocol (`live-tools/cdp-driver.js`, `LIVE-CHROME.md` section 10). Through that driver every page read visible and
 focused (Playwright's focus emulation), so the throttling of a hidden tab or an occluded window (which bears on the claim settle and
 the heartbeat) was not exercised in any multi-tab step (A1, A3, R2 and its two variants); that is owed to the manual pass (row M).
 
-- **Passing**: A1, A2, A3 and R2, plus the brief's three checks:
+- **Passing**: A1, A2, A3 and R2, plus the test plan's three checks:
   - A1: the log out in tab B failed A's two queued rows at once with the signed-out copy, kept for primary; the three sending sent
     their presigned parts and stopped, Interrupted, with no completion; A went to `/login` 0.38 s after its next API call
     (Notifications), with no prompt; back as primary the rows were as left, and Resume completed one without re-sending.
@@ -518,8 +518,8 @@ Observations (not failures of these scenarios):
 
 Run by hand in real, headed Chrome 154.0.8037.100 on the phase 5 branch (`eeb6048d`), 2026-10-23 (19:03 to 19:20 UTC on the
 22nd): [`live-runs/2026-10-23-phase-5.md`](live-runs/2026-10-23-phase-5.md). The "Live Chrome run" column above links each
-scenario's section. The DevTools MCP's profile was again held by another session's Chrome, so the pass drove its own headed
-Chrome over the DevTools protocol (`live-tools/cdp-driver.js`, `LIVE-CHROME.md` section 10). The wake lock was watched from
+scenario's section. The DevTools MCP's profile was again held by a Chrome the pass had not started, so the pass drove its own
+headed Chrome over the DevTools protocol (`live-tools/cdp-driver.js`, `LIVE-CHROME.md` section 10). The wake lock was watched from
 outside the app (`live-tools/ffq-wakelock.js`, a wrapper on `WakeLock.prototype.request` installed before the app runs) and
 from the OS (`pmset -g assertions`: Chrome's "Blink Wake Lock" assertion).
 
@@ -540,7 +540,7 @@ these**: its uploading tab was a background tab that the emulation reported visi
 hidden tab holds no wake lock (the browser drops it on hide, as V measured), and the re-request on sign-in would be refused
 until the tab is shown. The real-browser outcome of W4 is owed to the manual pass.
 
-- **Passing**: L1, L2, L3 and the brief's checks:
+- **Passing**: L1, L2, L3 and the test plan's checks:
   - L1: a Reload with 3 sending and 2 queued raised Chrome's own `beforeunload` 4 ms later; Stay (dismissed after 3 s, the page
     held meanwhile) kept the document, the rows and the wake lock; Leave reloaded and the three that had started came back
     Interrupted. A Reload with only Interrupted rows asked nothing. **L1 negative** (a Reload with nothing on its way): no
@@ -566,6 +566,210 @@ until the tab is shown. The real-browser outcome of W4 is owed to the manual pas
   in W3, as in phase 3); own-tab Log out and Leave lose the never-started rows, which the confirmation's count includes.
 - Not run here: the manual real Safari and real Firefox pass (matrix row M), W4 with a truly hidden tab, the idle-timer check
   above, and a view of the dialog itself on screen (the driver answered it after 1.5 to 3 s; `screencapture` lacked permission).
+
+## Phase 6 automated results
+
+`tests/scale.spec.ts` (Q2) and `tests/infra.spec.ts` (S3, S4, and S4b, the same scenario with `docker pause`), run
+against the phase 6 branch (`feat/upload-queue-6-polish`) on the e2e stack, 2026-10-23. The infra specs are skipped unless
+`E2E_INFRA=1`; they stop, unplug or pause the stack's real MinIO through `fixtures/stack.ts` (`stopStorage`, `startStorage`,
+`blackholeStorage`, `restoreStorage`), which act only on the `ffe2e-` stack's MinIO container and put it back in `afterEach`,
+pass or fail, waiting for `/minio/health/live` on the host port before the next test.
+
+| Spec | Engine | Runs after the fixes | Duration |
+|---|---|---|---|
+| `scale.spec.ts` (Q2) | Chromium (Playwright 1.59, Chromium headless shell 1217) | 2 of 2 passed | 28 to 31 s each |
+| `scale.spec.ts` (Q2) | WebKit (Playwright 1.59) | 2 of 2 passed (completion only: WebKit reports no `longtask` entries) | 32 to 40 s each |
+| `infra.spec.ts` (S3, S4, S4b), `E2E_INFRA=1` | Chromium | 3 of 3 passed, 3 of 3 tests each time (S3 also passed twice before the APP-BUG-5 fix, which does not touch it) | 2.0 min each |
+| any | Firefox (Playwright's Firefox 1511) | **does not launch on this macOS machine** (Darwin 27), as in every phase. Not run | n/a |
+
+Q2 runs on a `next dev` server, so React is the development build; a production build does less work per render, and the
+long-task margins below are a dev-mode measurement.
+
+What each one observed (after the fixes below):
+
+- **Q2** 300 PNGs of 200 KB, signed in as `secondary` (whose panel has few earlier uploads, and to keep off primary's share of
+  the read limit), the uploads panel open before the drop. Chromium: all 300 uploaded in 18.6 to 18.7 s and Ready in 24.4 to
+  26.5 s; at most 3 rows Starting or Uploading at any 1 s sample; none failed, was interrupted or cancelled; each file
+  created once and the project holds 300 assets. **9 to 10 long tasks over 50 ms in the whole run, the longest 82 to 84 ms**
+  (bound 200 ms). The page's reads of the API: 368 to 390 in the run (limit 600 a minute), no request refused; the grid read
+  the project's assets 13 to 14 times and its last read returned all 300. WebKit: all 300 uploaded in 22.2 to 29.3 s, Ready
+  in 25.9 to 35.8 s, 185 to 272 reads, nothing refused.
+- **S3** five 1 MB PNGs, parts on hold: three Uploading, two Queued. `docker stop` of the MinIO, the held parts released into
+  the outage, 60 s, `docker start`. Through the 60 s: the three sending rows stayed Uploading (their part retry ladder), the
+  two queued stayed "Waiting to start", no row failed, no part was answered, no queued file was created. After the start, in
+  all three runs, **all three sending files recovered** (none ended Interrupted) and the two queued uploaded, everything
+  settled 1.2 to 2.4 s after storage was back; no `/upload/abort` was sent. **Fix round 1** added a Cancel of the first
+  sending file 15 s into the outage, so that a queued file's turn comes under `docker stop` too: the fourth file asked at
+  once, was answered 503 `storage_unavailable` (ten times, about 5 s apart, through the rest of the outage), read "Waiting
+  for storage" and held; the fifth never asked; after the start the fourth was created once and everything but the cancelled
+  file uploaded (the two still sending recovered), with the cancel's abort the only one sent.
+- **S4** (`docker network disconnect`, the row's mechanism) and **S4b** (`docker pause`): the same frozen queue, storage cut,
+  then the first sending file is cancelled, so the fourth file's turn comes. Its initiate is sent at once, answered with the
+  coded 503 `storage_unavailable`, and the row reads **"Waiting for storage" 10.1 to 10.2 s after its turn** in all six runs
+  (bound 20 s). For 10 s more nothing fails and the fifth file waits its turn. With storage back and the parts released,
+  the four that were not cancelled upload, the fourth created once.
+
+What each outage looks like from each side (measured with `curl` against the stack, Docker Desktop for Mac, 2026-10-23):
+
+| Outage | Browser to the host port (19000) | API `POST /upload/initiate` |
+|---|---|---|
+| `docker stop` | refused at once | 503 `storage_unavailable` in 0.01 s |
+| `docker network disconnect` | the connection is accepted, then no answer (15 s and counting) | 503 in 0.09 s from a cold API (the name no longer resolves); 10 s when its S3 client has a connection open already, as in S4 |
+| `docker pause` | the connection is accepted, then no answer | 503 after the initiate client's 10 s read timeout (10.04 s) |
+
+So `network disconnect` does black-hole the browser's side (it does not refuse), and `pause` black-holes both sides; S4 runs
+with each. Reconnecting must give the container back its compose alias (`minio`), which a plain `docker network connect`
+does not: `restoreStorage` reads the network and the alias from the container's compose labels, so a run killed mid-outage
+is put back by the next one's `beforeEach`.
+
+**APP-BUG-3 (fixed, `4a588d3a`): a large drop spent the account's read limit.** Every status move of every upload (three per
+file) refetched the project grid at once, two GETs each. The first Q2 runs read the API 2 222 times in 24 s (1 072
+`/projects/:id/assets`, 1 051 `/projects/:id/folders`), and a second 3 372 times, of which 2 796 were refused: a 429 carries
+no CORS header, so Chromium reports it as `net::ERR_FAILED`. The grid kept retrying into the limit until +59 s, when the
+minute ran out and its last read returned all 300; the test's own read of the project afterwards was refused with 429. Every
+other read of that account, in any tab, fails the same way for that minute. The refetch now runs at most once per 2 s (the
+first change after a quiet spell at once, the rest folded into one at the end of the gap). Unit tests in
+`hooks/__tests__/use-upload-refetch.test.tsx`; with the gap removed the 300-file test sees 898 refetches against a bound of 14.
+
+**APP-BUG-4 (fixed, `99164645`): every status move re-rendered the whole project page.** The same hook read the store through
+selectors, so each move re-rendered its caller, the project page, with every asset card in the grid. With only APP-BUG-3
+fixed, Q2 in Chromium had 276 to 298 long tasks over 50 ms, the longest 198 to 270 ms (one run failed the bound with 209, 206
+and 201 ms, the next passed at 198 ms), and the 300 files took 48 to 57 s to upload instead of 19 s. A 15 s CPU profile
+mid-drop had the main thread idle for 0.25 s and React's synchronous rendering for 10.3 s (`AssetCard` and its context-menu
+wrappers among the busiest). The hook now watches the store with a subscription and never re-renders the page. Q2's 200 ms
+bound caught this only marginally (1 run of 2); the unit test "does not re-render the caller when uploads change status
+either" pins it (61 renders before the fix, 1 after).
+
+**APP-BUG-5 (fixed, `acb82ae7`): a cancelled upload kept its place until `/upload/abort` answered.** The run awaited the abort
+before giving its place back, and with storage unreachable the API takes its S3 client's whole retry budget to answer: 10.5 s
+with MinIO unplugged and 310.6 s with it paused (measured with `curl`). Before the fix S4 failed in both forms: unplugged, the
+next file's initiate went out 65.2 s after the Cancel and "Waiting for storage" showed at 75.4 s; paused, the next file had
+not started 120 s later. The abort is now sent and not awaited. Unit test in `stores/__tests__/upload-queue-cancel.test.ts`
+("a cancelled upload gives its place to the next file at once ..."), which fails without the fix. C1, C2, C3, R3, Q3, V1 and
+the smoke test were re-run on Chromium and WebKit after these fixes: 14 of 14 passed.
+
+Observations, not fixed here (outside the upload queue; each pre-dates it on `main`):
+
+- **The processing poll reads once per processing row every 5 s.** `refreshProcessingItems` (driven by
+  `components/layout/upload-sse-bridge.tsx`) sends one `GET /assets/:id` per row in Processing, so it costs 12 reads a minute
+  per row: 340 to 360 of Q2's 390 reads in Chromium, where PNGs are Ready within seconds. Fifty rows that stay in Processing
+  (video, which transcodes for minutes) reach the 600-a-minute limit on their own. A batched read, or one per project, would
+  bound it.
+- **`POST /upload/abort` uses the API's default S3 client** (boto3's 60 s read timeout, retried), so with storage hanging one
+  abort holds its request and a worker thread for about 310 s before answering 503. Initiate (10 s, one attempt) and the
+  probes (3 s / 5 s) already have bounded clients.
+- Right after storage came back once (S4b's setup, straight after S4 restored the network), the API answered two initiates
+  503 `storage_unavailable`; the queue held them and they went through 5 s later, as designed.
+
+### Phase 6 gate, fix round 1 (2026-10-23)
+
+The test plan's step 2 in full, after fix round 1 (storage restored first in `afterEach`, the infra helpers refuse anything but
+the `minio` service of an `ffe2e` compose project, the cancel order pinned by a unit test, S3 cancelling a sending file
+mid-outage). Each run had its own `--output` directory under `/tmp`, deleted afterwards.
+
+| Run | Result | Duration |
+|---|---|---|
+| `pnpm test:chromium` (whole suite, `E2E_INFRA` unset) | 57 passed, 5 skipped (the two setup sign-ins, saved sessions reused, and the three infra tests); the `test.fail()` fixtures test is drawn as a cross and counts as passed | 13.1 min |
+| `pnpm test:webkit` (whole suite, started 70 s after) | 57 passed, 5 skipped, the same | 14.9 min |
+| `E2E_INFRA=1 pnpm test:chromium -- tests/infra.spec.ts` | 3 passed (S3, S4, S4b), 2 skipped (setup); and once more just before the whole suites, 3 passed | 2.0 min each |
+| Firefox | does not launch on this Mac, as before; not run | n/a |
+
+Nothing failed and nothing was re-run. Q2 inside the whole suites: Chromium uploaded 300 in 15.2 s, Ready in 22.0 s, 8 long
+tasks over 50 ms, the longest 79 ms, 321 reads, none refused; WebKit uploaded 300 in 19.4 s, Ready in 21.6 s, 138 reads, none
+refused. S3 in both infra runs: the fourth file held "Waiting for storage" (503 about every 5 s), the two still sending
+recovered, settled 2.4 to 4.8 s after the start. S4 and S4b: "Waiting for storage" 10.1 to 10.2 s after the next file's turn.
+The suite now has 57 tests per engine where Phase 5 had 55: Q2, and the `storageContainer()` refusal check in
+`fixtures.spec.ts`; the three infra tests are skipped without `E2E_INFRA=1`. Web unit suite 149 files, 1 503 tests; `tsc
+--noEmit` clean; lint 18 warnings, 0 errors.
+
+### Mutation and failure checks
+
+- Q2 fails on the app before APP-BUG-3's fix (the 429s above) and, marginally, before APP-BUG-4's (1 run of 2).
+- S4 and S4b fail on the app before APP-BUG-5's fix (the timings above).
+- S3 has no mutation of its own. Since fix round 1 it also cancels a sending file mid-outage, so the fourth file's turn
+  comes under `docker stop` and its hold ("Waiting for storage", no row failed, created once afterwards) is checked there
+  as well as in S4.
+
+## Phase 6 live Chrome results (the final pass)
+
+Run by hand in real, headed Chrome 154.0.8037.100 on top of the whole stack (`f3e0d9aa`, `feat/upload-queue-6-polish`),
+2026-10-23, with a fix round the same day: [`live-runs/2026-10-23-final.md`](live-runs/2026-10-23-final.md).
+
+- **Run and passed**: every matrix row from Q1 to P2, plus U3's two sub-cases (U3b, a part that stalls after progress, against the
+  stall server; U3c, the two 5 min clocks), L1's tab close and negative, L2's one-file variant and negative, and L3b (the refresh
+  refused). The "Live Chrome run" column above links each row.
+- **Not run here**: row M (real Safari, real Firefox), owed to the user; and the checks that have no matrix row (phase 2's E1 to E3,
+  phase 3's X1 to X3, phase 4's T1 to T3, phase 5's W1 to W4 and V).
+- How: the DevTools MCP's profile was held by a Chrome the pass had not started, so the pass drove headed Chromes of its own over the
+  DevTools protocol (`LIVE-CHROME.md` section 10), with the driver's new `trace`, `metrics`, `screencast` and `filesraw` standing in for the MCP's
+  trace, memory, GIF and file tools.
+- **Q1/Q3 wire concurrency**: the first run's `lsof` samples mixed two Chromes and are not evidence. Re-sampled per process in the fix
+  round: 9 storage sockets while throttled with 3 PUTs pending (the other 6 are the grid's thumbnail loads, a connection group of their
+  own), 11 just after the lift and then idle keep-alive. The verdicts rest on the probe's row samples and in-flight peaks.
+- **Q2 with a performance trace**: 300 uploaded in 19.2 s, Ready in 24.0 s; worst main-thread task 88 ms (trace) and 86 ms
+  (PerformanceObserver), none over 100 ms in the trace; `requestAnimationFrame` intervals p50 8.4 ms, p95 17.1 ms, max 116.8 ms on a
+  120 Hz display (the trace's own frame events time the whole pipeline over a longer window; the trace was deleted for holding a token).
+- **500 files at Fast 3G for 30 minutes** (secondary, panel open): all 500 Ready, the last completion at 29.6 min; two token expiries
+  handled; worst long task 125 ms. 350 were complete at 16.6 min and 500 at 29.6 min: the second half ran at half the rate, for a
+  reason not measured. Heap after a forced GC 19.6 MB before the drop, 63.8 MB at 16.6 min, 67.1 MB at 30.2 min: no unbounded growth over
+  the 13.6 min measured (+3.3 MB between 350 and 500 complete). That is not a leak test.
+- **A 1.45 GB, 180 s 1080p video**: uploaded in 20 s (139 parts), transcoded in 323 s, Ready, and it plays at 1920 x 1080 with no
+  dropped frames; the worker ran 317 tasks in that window, all succeeded.
+- GIFs of Q1, U2, A1 and L2 are attached to the pull request.
+- **No app bug of the upload queue was found.** Observations (in the report): a video run needs free storage, and a trash does not
+  give it back; and the main thread is busy (about 89% in Q2, 48% in the long run, mostly paint at 120 Hz
+  in a development build) without breaking any bound. Outside the feature, pre-existing: the floating "Powered by FreeFrame" badge
+  covers the project page's "Open in viewer to comment" link; a signed-out Notifications click raises an uncaught `ApiError` (phase 4);
+  a drop on a project page before the account's role has loaded is ignored, silently (phase 5).
+
+## Manual pass owed (real Safari, real Firefox)
+
+**Not one manual result has been recorded yet.** As of this commit every cell of the matrix's "Real Safari" and "Real
+Firefox" columns is empty (`—`): 29 rows, 58 cells, for every phase from 2 to 6. The passes in this file were run by
+Playwright (Chromium headless shell and Playwright's WebKit) and by hand in real Chrome; none of them is a real Safari or a
+real Firefox, and Playwright's Firefox does not launch on the Mac this was written on. The pass below is owed before the
+phase PRs merge. Record each result with the browser version, here and in the matrix row's two cells.
+
+Fill in once per pass: Safari version `____`, Firefox version `____`, macOS version `____`, branch and commit `____`, date `____`.
+
+| Item | Phase | What to do by hand | Real Safari | Real Firefox |
+|---|---|---|---|---|
+| Q1 | 2 | 50 mixed files, network throttled (Firefox: DevTools throttling; Safari: Network Link Conditioner); never more than 3 moving, drop order | — | — |
+| Q2 | 6 | 300 files of 200 KB with the panel open; all Ready, the page stays responsive (scroll the panel and the grid while it runs), the grid ends with 300 | — | — |
+| Q3 | 2 | two drops 2 s apart; the second's files start after the first's | — | — |
+| Q4 | 2 | rename a queued file; the asset gets the new name | — | — |
+| C1 | 2 | Cancel a queued file; the row goes, nothing sent for it | — | — |
+| C2 | 2 | "Cancel all queued" mid-run; active files go on | — | — |
+| C3 | 2 | Cancel the active file; the next starts | — | — |
+| U1 | 3 | `touch` a queued file before its turn; the changed-file copy, Dismiss only | — | — |
+| U2 | 3 | `rm` the sending file; Interrupted with the same copy, the queue goes on | — | — |
+| U3 | 3 | a part that stops (e.g. a proxy that stops reading); the part is retried, the queue does not freeze | — | — |
+| N1 | 3 | wifi off at the drop, on after 30 s; "Waiting for connection", none fails, all upload | — | — |
+| N2 | 3 | wifi off mid-part for 20 s; the sending files recover | — | — |
+| S1 | 2 | storage refusing initiates (`docker stop` of the e2e MinIO for 15 s at the drop); "Waiting for storage", then on | — | — |
+| S2 | 2 | part PUTs failing for 60 s; the queue does not storm (DevTools network panel) | — | — |
+| S3 | 6 | `docker stop ffe2e-minio-1` mid-queue, `docker start ffe2e-minio-1` 60 s later; queued files hold, sending ones recover or end Interrupted | — | — |
+| S4 | 6 | `docker network disconnect ffe2e_default ffe2e-minio-1`, cancel a sending file; "Waiting for storage" within 20 s; restore with `docker network connect --alias minio --alias ffe2e-minio-1 ffe2e_default ffe2e-minio-1` | — | — |
+| R1 | 2 | close the tab mid-upload, reopen, Resume while 10 files are queued; it goes next | — | — |
+| R2 | 4 | two tabs Resume the same row at once; one sends, the other shows Elsewhere | — | — |
+| R3 | 2 | Cancel during Resuming; back to Interrupted, no abort | — | — |
+| A1 | 4 | log out in tab B with files queued in tab A | — | — |
+| A2 | 4 | accept an invite in another window while A sends | — | — |
+| A3 | 4 | sign in as another account after primary left interrupted rows | — | — |
+| L1 | 5 | Reload with files queued: **the prompt seen on screen** (Stay keeps the page; Leave reloads). Unmeasured in Firefox by any engine so far | — | — |
+| L2 | 5 | Log out with files queued; the in-app confirm, then no browser prompt | — | — |
+| L3 | 5 | clear both tokens, then a request; to /login, no prompt | — | — |
+| V1 | 2 | New Version during a long queue | — | — |
+| P1 | 2 | a storage cap that fits about 3 of 10 files | — | — |
+| P2 | 2 | delete the project under 5 queued files | — | — |
+| M | every | hard reload, then drop from Finder **without clicking the page**, then reload (the leave prompt needs a user interaction first) | — | — |
+| W4 | 5 | wake lock in a **truly hidden** tab: another tab signs out and back in while this one uploads in the background; record whether a lock is held and when it is re-taken (`pmset -g assertions` shows the browser's assertion) | — | — |
+| Idle timer | 5 | during a long "Waiting for storage" hold with the display idle, do the short lock pulses on each retry keep the Mac awake? `pmset -g assertionslog` while it holds | — | — |
+| Laptop sleep | 3 | close the lid mid-upload for a minute, open it; the rows recover or end Interrupted, none lost (by a person, not an automated run) | — | — |
+
+Q2 and S3/S4 are on the list though they are Chromium-only in the matrix's Engines column, because the test plan for this phase
+asks for them by hand as well. S3 and S4 need the e2e stack (`-p ffe2e`) and must be put back afterwards
+(`docker start`, or `docker network connect` with the alias as above, then `curl http://localhost:19000/minio/health/live`).
 
 ## Already covered
 

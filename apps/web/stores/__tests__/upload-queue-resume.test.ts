@@ -470,6 +470,114 @@ describe('a resume and a discard', () => {
   })
 })
 
+/**
+ * `GET /upload/{v}/parts` as the server answers it (`list_held_parts`): it
+ * records the request as activity when nothing has moved for 5 minutes, and
+ * reports the activity it held before, with its clock as it answers. The
+ * first `held` answers wait for `release`; the rest answer at once.
+ */
+function stampingParts(lastActivity: number | null, held = 0) {
+  let last = lastActivity
+  const waiting: Array<() => void> = []
+  let calls = 0
+  vi.mocked(api.get).mockImplementation(((path: string) => {
+    if (!path.endsWith('/parts')) return Promise.resolve([])
+    calls += 1
+    const now = Date.now()
+    const previous = last
+    if (previous === null || now - previous >= 5 * 60_000) last = now
+    const answer = resumable({
+      file_size_bytes: 50 * MB,
+      last_activity_at: previous === null ? null : new Date(previous).toISOString(),
+      server_time: new Date(now).toISOString(),
+    })
+    if (calls > held) return Promise.resolve(answer)
+    return new Promise((resolve) => waiting.push(() => resolve(answer)))
+  }) as never)
+  return {
+    release: () => waiting.shift()!(),
+    calls: () => calls,
+    /** Another device presigns a part: activity the server records. */
+    movedElsewhere: () => { last = Date.now() },
+  }
+}
+
+describe("this tab's own /parts stamp", () => {
+  it('Resume, Cancel while it asks /parts, Resume again: the stamp its own /parts made is not read as another sender', async () => {
+    fakeServer(() => 'answer', 'hang')
+    const parts = stampingParts(Date.now() - 10 * 60_000, 1)
+    useUploadStore.setState({ files: [interrupted({ fileSize: 50 * MB })] })
+
+    useUploadStore.getState().resumeUpload('r', fileOf('clip.mp4'))
+    await settle()
+    expect(rowOf('r')).toMatchObject({ status: 'starting', resuming: true })
+    useUploadStore.getState().cancelUpload('r')
+    parts.release()
+    await settle()
+    expect(rowOf('r').status).toBe('interrupted')
+
+    useUploadStore.getState().resumeUpload('r', fileOf('clip.mp4'))
+    await settle()
+
+    expect(parts.calls()).toBe(2)
+    expect(rowOf('r').status).toBe('uploading')
+  })
+
+  it('Resume, Cancel while it asks /parts, then Discard: not refused', async () => {
+    const parts = stampingParts(Date.now() - 10 * 60_000, 1)
+    useUploadStore.setState({ files: [interrupted({ fileSize: 50 * MB })] })
+    useUploadStore.getState().resumeUpload('r', fileOf('clip.mp4'))
+    await settle()
+    useUploadStore.getState().cancelUpload('r')
+    parts.release()
+    await settle()
+
+    const said = await useUploadStore.getState().discardUpload('r')
+
+    expect(said).toBeNull()
+    expect(api.post).toHaveBeenCalledWith('/upload/abort', expect.objectContaining({ version_id: 'rv', discard: true }), { pinSubject: 'user-1' })
+    expect(files().find((f) => f.id === 'r')).toBeUndefined()
+  })
+
+  it("the adoption check's /parts stamp does not refuse a Discard right after it", async () => {
+    stampingParts(Date.now() - 10 * 60_000)
+    useUploadStore.setState({ files: [interrupted({ ownerId: undefined, ownerTab: undefined })] })
+    await testing.adoptOwnerlessRows()
+    expect(rowOf('r').ownerId).toBe('user-1')
+
+    const said = await useUploadStore.getState().discardUpload('r')
+
+    expect(said).toBeNull()
+    expect(api.post).toHaveBeenCalledWith('/upload/abort', expect.objectContaining({ version_id: 'rv', discard: true }), { pinSubject: 'user-1' })
+  })
+
+  it('a stamp made after this tab\'s own is another sender\'s', async () => {
+    const parts = stampingParts(Date.now() - 10 * 60_000)
+    useUploadStore.setState({ files: [interrupted({ ownerId: undefined, ownerTab: undefined })] })
+    await testing.adoptOwnerlessRows()
+    await new Promise((r) => setTimeout(r, 5))
+    parts.movedElsewhere()
+
+    const said = await useUploadStore.getState().discardUpload('r')
+
+    expect(said).toBe('Still uploading in another tab or on another device')
+    expect(rowOf('r').status).toBe('elsewhere')
+    expect(api.post).not.toHaveBeenCalled()
+  })
+
+  it('an answer that recorded nothing does not excuse the activity it reported', async () => {
+    // Another device moved it a minute ago, so no /parts here records anything.
+    stampingParts(Date.now() - 60_000)
+    useUploadStore.setState({ files: [interrupted({ ownerId: undefined, ownerTab: undefined })] })
+    await testing.adoptOwnerlessRows()
+
+    const said = await useUploadStore.getState().discardUpload('r')
+
+    expect(said).toBe('Still uploading in another tab or on another device')
+    expect(api.post).not.toHaveBeenCalled()
+  })
+})
+
 describe('two tabs of one browser', () => {
   /**
    * A second copy of the store, as another tab of this browser runs it: its
@@ -643,7 +751,7 @@ describe('two tabs of one browser', () => {
     // must not turn the claim off for that row: the tab writes its own over
     // it, and the other tab, looking at the same moment, finds it.
     window.localStorage.setItem('ff-uploads', JSON.stringify({ state: { files: [interrupted()] }, version: 0 }))
-    window.localStorage.setItem(resumeClaimKey('r'), '{"tab":"some-tab","nonce":')
+    window.localStorage.setItem(resumeClaimKey('rv'), '{"tab":"some-tab","nonce":')
     const one = await openTab()
     const two = await openTab()
     one.testing.setClaimSettleMs(200)
@@ -663,9 +771,46 @@ describe('two tabs of one browser', () => {
     expect(one.status()).toBe('uploading')
     expect(two.status()).toBe('elsewhere')
     expect(presigns).toBe(1)
-    expect(JSON.parse(window.localStorage.getItem(resumeClaimKey('r'))!)).toMatchObject({ tab: one.tabId })
+    expect(JSON.parse(window.localStorage.getItem(resumeClaimKey('rv'))!)).toMatchObject({ tab: one.tabId })
 
     one.store.getState().cancelUpload('r')
+    await settle()
+  })
+
+  it("a live row in one tab and the history row for the same upload in another, resumed at once: only one sends", async () => {
+    // The two rows have different ids (history rows are keyed on the asset)
+    // but name one version, one multipart upload. The claim is on the upload.
+    window.localStorage.setItem('ff-uploads', JSON.stringify({
+      state: {
+        files: [
+          interrupted(),
+          interrupted({ id: 'history-ra', fromHistory: true, uploadId: undefined, s3Key: undefined }),
+        ],
+      },
+      version: 0,
+    }))
+    const one = await openTab()
+    const two = await openTab()
+    one.testing.setClaimSettleMs(200)
+    two.testing.setClaimSettleMs(200)
+    const parts = heldPartsByVersion(one, two)
+
+    one.store.getState().resumeUpload('r', small('clip.mp4'))
+    two.store.getState().resumeUpload('history-ra', small('clip.mp4'))
+    await settle()
+    // Both answers land together: each tab looks before either has stamped its row.
+    parts.answer('rv')
+
+    await vi.waitFor(() => {
+      expect(one.status('r')).not.toBe('starting')
+      expect(two.status('history-ra')).not.toBe('starting')
+    }, { timeout: 3_000 })
+    expect(presigns).toBe(1)
+    expect([one.status('r'), two.status('history-ra')].sort()).toEqual(['elsewhere', 'uploading'])
+    expect(JSON.parse(window.localStorage.getItem(resumeClaimKey('rv'))!)).toHaveProperty('tab')
+
+    one.store.getState().cancelUpload('r')
+    two.store.getState().cancelUpload('history-ra')
     await settle()
   })
 

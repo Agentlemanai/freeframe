@@ -38,7 +38,7 @@ import { UploadsPanel } from '../uploads-panel'
 import { useUploadStore, __uploadQueueTesting as testing } from '@/stores/upload-store'
 import { signInAs, row } from '@/test/upload-session'
 import {
-  MB, fakeServer, fileOf, drop, rowOf, stored, settle, rehydrate, resumable,
+  MB, fakeServer, fileOf, small, drop, rowOf, stored, settle, rehydrate, resumable,
 } from '@/test/upload-queue-server'
 
 /** Every row of the open panel, top to bottom. */
@@ -201,6 +201,66 @@ describe('what a queued row says', () => {
 
 // ---------------------------------------------------------------- order
 
+describe('the panel header', () => {
+  const header = () => screen.getByRole('heading', { name: /^Uploads/ })
+
+  it('counts the files running apart from the ones waiting: "3 active · 2 queued"', async () => {
+    fakeServer(() => 'wait')
+    drop([small('a.jpg'), small('b.jpg'), small('c.jpg'), small('d.jpg'), small('e.jpg')])
+    await settle()
+    openPanel()
+
+    expect(header()).toHaveTextContent(/^Uploads3 active · 2 queued$/)
+  })
+
+  it('says only "N active" with nothing queued, and only "N queued" with nothing running', async () => {
+    const server = fakeServer(() => 'wait')
+    drop([small('a.jpg'), small('b.jpg')])
+    await settle()
+    const { unmount } = openPanel()
+    expect(header()).toHaveTextContent(/^Uploads2 active$/)
+    unmount()
+
+    useUploadStore.setState({ files: [row({ id: 'r', status: 'interrupted', queuedResume: true, versionId: 'rv' })] })
+    openPanel()
+    expect(header()).toHaveTextContent(/^Uploads1 queued$/)
+    expect(server.names()).toEqual(['a.jpg', 'b.jpg'])
+  })
+})
+
+describe('when a finished row says it finished', () => {
+  it('counts from when it finished: a file that waited 25 minutes says "just now"', () => {
+    useUploadStore.setState({
+      files: [row({ id: 'c', assetName: 'c', status: 'complete', createdAt: Date.now() - 25 * 60_000, completedAt: Date.now() })],
+    })
+    openPanel('All')
+
+    expect(within(rowNamed('c')).getByText('just now')).toBeInTheDocument()
+  })
+
+  it('a three-day-old row resumed and finished in this page load is under Today and says "just now"', () => {
+    useUploadStore.setState({
+      files: [row({
+        id: 'r', assetName: 'r', status: 'complete', dropSeq: 1,
+        createdAt: Date.now() - 3 * 24 * 60 * 60_000, completedAt: Date.now(),
+      })],
+    })
+    openPanel('All')
+
+    expect(headings()).toEqual(['Today'])
+    expect(within(rowNamed('r')).getByText('just now')).toBeInTheDocument()
+  })
+
+  it('a row with no completion time on record still counts from when it was added', () => {
+    useUploadStore.setState({
+      files: [row({ id: 'o', assetName: 'o', status: 'complete', createdAt: Date.now() - 25 * 60_000 })],
+    })
+    openPanel('All')
+
+    expect(within(rowNamed('o')).getByText('25 minutes ago')).toBeInTheDocument()
+  })
+})
+
 describe('the order of the rows', () => {
   it('rows of one drop list in start order', async () => {
     fakeServer(() => 'wait')
@@ -350,6 +410,8 @@ describe('Cancel all queued', () => {
     expect(names()).toEqual(['a'])
     expect(rowOf(a).status).toBe('starting')
     expect(cancelAllQueued()).toBeNull()
+    // The button went with the rows; focus goes to the panel's heading, not to the page.
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: /^Uploads/ }))
   })
 
   it('is also offered for a resume waiting for its turn, and not for rows nobody waits on', () => {
@@ -518,6 +580,24 @@ describe('the actions of a row', () => {
 })
 
 // ---------------------------------------------------------------- Retry and Dismiss
+
+describe('the row actions to a screen reader', () => {
+  it('Retry, Cancel and Resume each name the file they act on', async () => {
+    fakeServer((_, i) => (i === 0 ? new ApiError(400, 'This file is too large.') : 'wait'))
+    drop([fileOf('big.mov')])
+    await settle()
+    drop([small('a.jpg')])
+    await settle()
+    useUploadStore.setState((s) => ({
+      files: [...s.files, row({ id: 'r', assetName: 'r', fileName: 'clip.mp4', status: 'interrupted', versionId: 'rv', assetId: 'ra' })],
+    }))
+    openPanel('All')
+
+    expect(within(rowNamed('big')).getByRole('button', { name: 'Retry big.mov' })).toBeInTheDocument()
+    expect(within(rowNamed('a')).getByRole('button', { name: 'Cancel upload of a.jpg' })).toBeInTheDocument()
+    expect(within(rowNamed('r')).getByRole('button', { name: 'Resume clip.mp4' })).toBeInTheDocument()
+  })
+})
 
 describe('a row that failed before it started', () => {
   /** A drop whose first file the server refuses, and the row that leaves. */
