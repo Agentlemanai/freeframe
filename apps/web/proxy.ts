@@ -13,7 +13,7 @@ function isPublicRoute(pathname: string): boolean {
   return false
 }
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
 
   // Always allow public routes
@@ -27,7 +27,7 @@ export async function middleware(request: NextRequest) {
   if (!setupDone) {
     try {
       const res = await fetch(`${API_URL}/setup/status`, {
-        next: { revalidate: 60 }, // Cache for 60 seconds
+        cache: 'no-store', // the ff_setup_done cookie is the cache
       })
       if (res.ok) {
         const data = await res.json()
