@@ -4,8 +4,11 @@ import { mutate as globalMutate } from 'swr'
 import { api, ApiError } from '@/lib/api'
 import { createSpeedMeter, type SpeedMeter } from '@/lib/upload-speed'
 import { createPartBudget, type PartBudget } from '@/lib/upload-budget'
-import { createUploadQueue, type ActiveInfo, type QueueEntry } from '@/lib/upload-queue'
+import { createUploadQueue, usableRetryAfter, type ActiveInfo, type QueueEntry } from '@/lib/upload-queue'
 import { classifyInitiateError, type InitiateOutcome } from '@/lib/upload-initiate-outcome'
+import {
+  assertReadable, FileUnreadableError, FILE_READ_FAILED_MESSAGE,
+} from '@/lib/upload-readable'
 import { useUploadSpeedStore } from './upload-speed-store'
 import type { AssetResponse } from '@/types'
 
@@ -13,6 +16,53 @@ const CHUNK_SIZE = 10 * 1024 * 1024 // 10 MB
 const HISTORY_PAGE_SIZE = 20
 const PART_MAX_ATTEMPTS = 8 // per part, including the first try
 const PART_RETRY_BASE_MS = 2000 // 2s, 4s, 8s … ≈254s of total tolerance per part
+/**
+ * The part watchdog (spec goal 5). A part PUT is aborted, and retried, when it
+ * stops moving:
+ *
+ * - once it has sent its first byte, when no upload progress has come for
+ *   `PART_STALL_MS` while bytes remain. A browser reports progress every 50 ms
+ *   or so while bytes move, so 90 s of silence from a part that was moving is
+ *   a stopped part, not a slow uplink;
+ * - before its first byte, only when the whole tab has sent nothing for a full
+ *   `PART_STALL_MS`, or when the part itself has waited `PART_RESPONSE_WAIT_MS`.
+ *   Silence before the first byte is not proof of anything: a request the
+ *   browser holds for a socket gets no progress at all, and over HTTP/1.1 a
+ *   browser opens at most 6 connections per host, shared by every tab. Parts
+ *   past the sixth wait for a socket while the first six send (measured: about
+ *   12.5 s for 24 MiB parts on a local server in Chromium and WebKit, so
+ *   minutes for large parts on an ordinary uplink). While another part of the
+ *   tab is moving, the link is busy, not dead; the 5 min cap still ends a part
+ *   that will never start, such as a WebKit PUT of a file that changed on disk,
+ *   which hangs with no event at all;
+ * - after its last byte, when `PART_RESPONSE_WAIT_MS` passes with no answer. A
+ *   large part can legitimately sit with storage, or with a proxy that buffers
+ *   the whole body, before the answer comes.
+ */
+const PART_STALL_MS = 90_000
+const PART_RESPONSE_WAIT_MS = 300_000
+
+/**
+ * When any part in this tab last reported upload progress, on the
+ * `performance.now()` clock, so a part that has not sent its first byte can
+ * tell a busy link from a dead one (see `PART_STALL_MS`). One timestamp every
+ * part writes, read only when a waiting part's watchdog fires. That clock is
+ * monotonic, so a change of the wall clock cannot make the tab look silent.
+ */
+let tabProgressAt = -Infinity
+
+/**
+ * How long this tab has sent nothing, counting from `since` at the latest.
+ *
+ * The stamp lives as long as the module, which in a page is the page, on the
+ * one clock that never runs backwards. Tests share the module across tests and
+ * install a fresh fake clock for each, so a stamp left by one test would be
+ * read by the next as progress on its own clock: `__uploadQueueTesting.reset()`
+ * clears it.
+ */
+function tabQuietFor(since: number, now: number): number {
+  return now - Math.max(tabProgressAt, since)
+}
 
 /**
  * How often a tab that is transferring says so, and how long that is believed.
@@ -302,6 +352,19 @@ interface PartUploadError extends Error {
   permanent?: boolean
 }
 
+/**
+ * A part PUT the watchdog gave up on (see `PART_STALL_MS`). Retryable: the
+ * next attempt reads the file first, so a file that changed fails clearly
+ * there, and a connection that merely stopped gets a fresh request. Not an
+ * `AbortError`, which the caller would take for a user cancel.
+ */
+export class PartStalledError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PartStalledError'
+  }
+}
+
 /** A cancellation, as opposed to a failure: the caller reports the two differently. */
 function isAbortError(err: unknown): err is DOMException {
   return err instanceof DOMException && err.name === 'AbortError'
@@ -376,13 +439,22 @@ function etagOf(xhr: XMLHttpRequest): string {
  *   `uploadPart` and `uploadAllParts` tell a cancel from a failure;
  * - a network error, a timeout or an abort the browser started itself rejects
  *   with a plain error, which is retried, as fetch's TypeError was;
+ * - a part that stops moving is aborted by the watchdog and rejects with a
+ *   `PartStalledError`, which is retried too. Before the part's first byte,
+ *   it ends when no part of the tab has sent anything for `PART_STALL_MS`
+ *   (counted from the send at the earliest), or `PART_RESPONSE_WAIT_MS` after
+ *   the send. After it, the clock runs `PART_STALL_MS`
+ *   from every progress event while bytes remain, and `PART_RESPONSE_WAIT_MS`
+ *   from the one that reports the last byte. Progress is measured against the
+ *   chunk's own size, since a progress event's `total` is 0 when the length
+ *   is not computable;
  * - a non-2xx rejects with `permanent` set for a 4xx, so a status of 0 never
  *   counts as one;
  * - no Content-Type is set. `chunk` is a slice taken without a type, so the
  *   browser sends none, and the presigned URL signs none.
  *
  * The pool signal lives for the whole upload, so the abort listener is removed
- * again whichever way the request settles.
+ * again whichever way the request settles, and the watchdog's timer with it.
  */
 function putPart(
   url: string,
@@ -399,9 +471,68 @@ function putPart(
 
     const xhr = new XMLHttpRequest()
     const abort = () => xhr.abort()
-    const settle = () => signal.removeEventListener('abort', abort)
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    // Set only by the watchdog, just before its own abort, so `onabort` can
+    // tell that abort from a cancel and from one the browser started.
+    let stalled: PartStalledError | null = null
+    // Once set, nothing arms the watchdog again: a stray progress event after
+    // the request settled must not leave a timer behind.
+    let settled = false
+    const settle = () => {
+      settled = true
+      clearTimeout(watchdog)
+      signal.removeEventListener('abort', abort)
+    }
+    const giveUp = (why: string) => {
+      stalled = new PartStalledError(`Part ${partNumber} failed: ${why}`)
+      xhr.abort()
+      // `abort` fires synchronously on the hung request (measured in WebKit),
+      // and `onabort` rejects with `stalled`. Rejecting here too keeps the
+      // part from hanging should some browser not fire it.
+      settle()
+      reject(stalled)
+    }
+    // Before the first byte: the part ends when the whole tab has sent
+    // nothing for `PART_STALL_MS`, or when it has waited the cap itself.
+    // Otherwise it looks again when the tab's silence or the cap could next
+    // be reached, whichever is sooner.
+    const sentAt = performance.now()
+    const armBeforeStart = (delay: number) => {
+      watchdog = setTimeout(() => {
+        const now = performance.now()
+        const quiet = tabQuietFor(sentAt, now)
+        if (now - sentAt >= PART_RESPONSE_WAIT_MS) {
+          giveUp(`not started in ${PART_RESPONSE_WAIT_MS / 60_000} min`)
+        } else if (quiet >= PART_STALL_MS) {
+          giveUp(`no progress for ${PART_STALL_MS / 1000} s`)
+        } else {
+          armBeforeStart(Math.min(PART_STALL_MS - quiet, sentAt + PART_RESPONSE_WAIT_MS - now))
+        }
+      }, delay)
+    }
+    // After it: every byte sent re-arms the stall clock, and the last one
+    // swaps it for the longer wait on the answer.
+    const arm = (sent: number) => {
+      if (settled) return
+      clearTimeout(watchdog)
+      const done = sent >= chunk.size
+      watchdog = setTimeout(
+        () => giveUp(
+          done
+            ? `no answer ${PART_RESPONSE_WAIT_MS / 60_000} min after its last byte`
+            : `no progress for ${PART_STALL_MS / 1000} s`,
+        ),
+        done ? PART_RESPONSE_WAIT_MS : PART_STALL_MS,
+      )
+    }
 
-    xhr.upload.onprogress = (event) => onBytes(event.loaded)
+    xhr.upload.onprogress = (event) => {
+      onBytes(event.loaded)
+      // An event that reports nothing sent says nothing moved.
+      if (event.loaded <= 0) return
+      tabProgressAt = performance.now()
+      arm(event.loaded)
+    }
     xhr.onload = () => {
       settle()
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -417,9 +548,11 @@ function putPart(
       reject(new TypeError(`Part ${partNumber} failed: network error`))
     }
     // No timeout is set, as fetch had none: a 10 MB part on a slow uplink can
-    // take minutes and must not be cut off. The handler stays so that one set
-    // later, here or by a browser, fails the part retryably instead of leaving
-    // the promise unsettled, since a timeout fires neither load nor error.
+    // take minutes and must not be cut off, and `timeout` bounds the whole
+    // request, not the silence in it -- that is the watchdog's job. The
+    // handler stays so that one set later, here or by a browser, fails the
+    // part retryably instead of leaving the promise unsettled, since a timeout
+    // fires neither load nor error.
     xhr.ontimeout = () => {
       settle()
       reject(new TypeError(`Part ${partNumber} failed: timed out`))
@@ -429,18 +562,29 @@ function putPart(
     // where fetch rejected with a TypeError and the part was retried. Only an
     // abort of the signal may come out as an AbortError: the caller takes that
     // for a user cancel and discards every part the backend holds.
+    //
+    // The watchdog's own abort is a failure too, and comes out as the
+    // `PartStalledError` it set. A cancel wins over it.
     xhr.onabort = () => {
       settle()
       reject(
         signal.aborted
           ? new DOMException(`Part ${partNumber} cancelled`, 'AbortError')
-          : new TypeError(`Part ${partNumber} failed: aborted`),
+          : stalled ?? new TypeError(`Part ${partNumber} failed: aborted`),
       )
     }
 
     xhr.open('PUT', url)
     signal.addEventListener('abort', abort, { once: true })
-    xhr.send(chunk)
+    // An empty part has nothing to send, so it waits only on its answer.
+    if (chunk.size === 0) arm(0)
+    else armBeforeStart(PART_STALL_MS)
+    try {
+      xhr.send(chunk)
+    } catch (err) {
+      settle()
+      reject(err)
+    }
   })
 }
 
@@ -484,6 +628,19 @@ interface PartSlots {
  *   between, so the pass sees the retry waiting when it sees the sleeper gone.
  *   `woke()` runs however the sleep ended, a cancel included, because every
  *   `sleeping()` has to be matched.
+ *
+ * Every retry reads one byte of the file before it asks for a URL (see
+ * lib/upload-readable.ts): a file that changed or moved while the part backed
+ * off makes `xhr.send` hang in WebKit, so a retry must find that out first.
+ * The read is the first step of the attempt, after `acquire()` and before the
+ * presign, so the rules above hold untouched: the slot is taken before the
+ * presign as ever, and the read holds it for a few milliseconds, as the
+ * presign that follows does. Reading before `acquire()` would put an `await`
+ * between `woke()` and `acquire()`, which the contract forbids. A file that
+ * fails the read is not retried: the attempt ends, the `finally` gives the
+ * slot back, and `sleeping()` is not called because there is no sleep to
+ * match. The first attempt is not read; a first attempt that hangs is for the
+ * part watchdog, and its retry reads.
  */
 async function uploadPart(
   file: File,
@@ -507,6 +664,7 @@ async function uploadPart(
       // Inside the attempt, so the `finally` below gives the slot back even if
       // the hook throws.
       if (attempt === 1) slots.onFirstGrant?.()
+      if (attempt > 1) await assertReadable(file)
       return await uploadPartOnce(file, s3Key, uploadId, partNumber, controller, chunkSize, onBytes)
     } catch (err) {
       // The next attempt sends the part from its first byte again, so what
@@ -514,6 +672,8 @@ async function uploadPart(
       onBytes(0)
       if (signal.aborted) throw err
       if (isAbortError(err)) throw err
+      // The handle stays stale however often it is tried.
+      if (err instanceof FileUnreadableError) throw err
       if ((err as PartUploadError)?.permanent) throw err
       if (attempt === PART_MAX_ATTEMPTS) throw err
 
@@ -1434,6 +1594,8 @@ const startTargets = new Map<string, StartTarget>()
  * that whatever takes the probe away (a cancel, a discard) can clear it.
  */
 let probeTimer: ReturnType<typeof setTimeout> | null = null
+/** When the probe's pending try is due (`Date.now()` clock); meaningful only while `probeTimer` is set. */
+let probeDueAt = 0
 
 let dropSeqs = 0
 
@@ -1592,12 +1754,20 @@ function endRun(id: string, runner: Runner, runKey: string): void {
   pump()
 }
 
-function scheduleProbe(id: string): void {
+/**
+ * The probe's next try, after the backoff. The timer tries whichever row is the
+ * probe when it fires: a row that takes the role over while it runs
+ * (`holdRow`) makes the try the old probe was waiting for.
+ */
+function scheduleProbe(): void {
   if (probeTimer !== null) clearTimeout(probeTimer)
+  const delay = queue.hold.nextDelayMs()
+  probeDueAt = Date.now() + delay
   probeTimer = setTimeout(() => {
     probeTimer = null
-    retryProbe(id)
-  }, queue.hold.nextDelayMs())
+    const id = queue.hold.probeId
+    if (id !== null) retryProbe(id)
+  }, delay)
 }
 
 function retryProbe(id: string): void {
@@ -1629,7 +1799,7 @@ function passOnProbe(): void {
   }
   const reason = queue.hold.reason ?? 'connection'
   patchRow(next, { holdReason: reason })
-  scheduleProbe(next)
+  scheduleProbe()
 }
 
 /** A row the user no longer wants started: out of the queue, and out of the probe role if it held it. */
@@ -1651,8 +1821,21 @@ function endHoldIfProbe(id: string): void {
 /**
  * The connection or storage is down. The row goes back to waiting: as the
  * probe, which alone tries again, or, when another row already is the probe,
- * first in line behind it. A resume goes back to being a queued resume, never
- * to `queued`: it has an upload on the server to come back to.
+ * in line behind it among the rows the outage held back, at the place it was
+ * queued in, so they start again in the order they were dropped and keep their
+ * places in the panel. A resume goes back to being a queued resume, never to
+ * `queued`: it has an upload on the server to come back to.
+ *
+ * Rows that were initiating together fail in whatever order the network gives
+ * up on them, and the first to fail became the probe. When this row was queued
+ * before that probe and the probe is only waiting out its backoff, this row
+ * takes the role over, on the same backoff, and the probe waits in line: the
+ * probe is the first to start once the way is open, and that must be the
+ * earliest file. A probe whose try is already out keeps the role for that try,
+ * as there is never more than one try at a time; when that try fails as well,
+ * the earliest row waiting behind it takes the role over for the next one. A
+ * row that takes the role over with a retry-after longer than the wait left
+ * waits for the retry-after, and the backoff doubles from it.
  */
 function holdRow(
   id: string,
@@ -1666,12 +1849,37 @@ function holdRow(
     ? { status: 'queued', progress: 0 }
     : { status: 'interrupted', queuedResume: true, resuming: undefined, progress: 0 }
   if (queue.hold.begin(id, reason, retryAfterMs)) {
-    patchRow(id, { ...waiting, holdReason: reason })
-    scheduleProbe(id)
-  } else {
-    queue.enqueue([queueEntry(row, kind)], 'next')
-    patchRow(id, { ...waiting, holdReason: undefined, queueSeq: queue.queueSeq(id) })
+    // The probe failed (again). A row that went back while its try was out,
+    // queued before it, makes the next try instead.
+    const first = queue.firstNext()
+    if (first && queue.queueSeq(first.id) < queue.queueSeq(id)
+      && queue.hold.takeOver(first.id, reason, queueEntry(row, kind))) {
+      patchRow(id, { ...waiting, holdReason: undefined })
+      patchRow(first.id, { holdReason: reason })
+    } else {
+      patchRow(id, { ...waiting, holdReason: reason })
+    }
+    scheduleProbe()
+    return
   }
+  const probe = queue.hold.probeId
+  const probeRow = probe === null ? undefined : rowById(probe)
+  // Waiting for its turn, so between tries: a probe whose try is out is `starting`.
+  const probeKind = turnKind(probeRow)
+  if (probeRow && probeKind && queue.queueSeq(id) < queue.queueSeq(probeRow.id)
+    && queue.hold.takeOver(id, reason, queueEntry(probeRow, probeKind))) {
+    patchRow(probeRow.id, { holdReason: undefined })
+    patchRow(id, { ...waiting, holdReason: reason })
+    // The try it takes over is due when the old probe's was, unless it was told to wait longer.
+    const asked = usableRetryAfter(retryAfterMs)
+    if (asked !== undefined && probeTimer !== null && asked > probeDueAt - Date.now()) {
+      queue.hold.begin(id, reason, retryAfterMs)
+      scheduleProbe()
+    }
+    return
+  }
+  queue.enqueue([queueEntry(row, kind)], 'held')
+  patchRow(id, { ...waiting, holdReason: undefined, queueSeq: queue.queueSeq(id) })
 }
 
 /** The reason a refused row shows. */
@@ -1726,6 +1934,47 @@ function onInitiateFailed(id: string, err: unknown): void {
 }
 
 /**
+ * A run that ends before it has asked the server anything cannot say the way to
+ * the server is open, so a hold it was probing passes to the next waiting row,
+ * as when its probe is cancelled. Left alone, the hold would keep a probe that
+ * never tries again and no row would start.
+ */
+function handOffProbe(id: string): void {
+  if (queue.hold.probeId === id) passOnProbe()
+}
+
+/** What a row says about a failed read: the browser's own words, or a plain fallback. */
+function readFailureMessage(err: unknown): string {
+  // Not `instanceof Error`: a `DOMException` need not be one in every realm.
+  const message = typeof err === 'object' && err !== null ? (err as { message?: unknown }).message : undefined
+  const said = typeof message === 'string' ? message.trim() : ''
+  return said === '' ? FILE_READ_FAILED_MESSAGE : said
+}
+
+/**
+ * A new file whose turn came could not be read (spec goal 5). Nothing was
+ * created, so the row fails as any refusal at initiate does.
+ *
+ * A file that changed or moved (`FileUnreadableError`) stays unreadable -- its
+ * `File` handle is stale -- so Retry is not offered and only adding the file
+ * again helps. Any other failure to read says nothing about the file, so Retry
+ * is offered, as for a refusal. Either way the row was about to ask the server
+ * something it now will not, so a hold it was probing passes on. A row cancelled
+ * while it was read is removed when its run ends, whatever it says until then.
+ */
+function failUnreadableBeforeStart(id: string, err: unknown): void {
+  handOffProbe(id)
+  patchRow(id, {
+    status: 'failed',
+    failedBeforeStart: true,
+    retryable: !(err instanceof FileUnreadableError),
+    holdReason: undefined,
+    progress: 0,
+    error: readFailureMessage(err),
+  })
+}
+
+/**
  * A new upload's turn: initiate (or create the version), then send every part
  * and complete. Everything that announces a transfer starts here, at the turn,
  * and not when the row was added.
@@ -1764,6 +2013,20 @@ async function runNew(id: string, runner: Runner, runKey: string): Promise<void>
     const startRow = rowById(id)
     const sentName = startRow?.assetName ?? file.name
     const projectId = startRow?.projectId ?? ''
+
+    // Before the server hears of the file, so a file that changed or moved
+    // while it waited creates nothing (goal 4) and the queue moves on.
+    try {
+      await assertReadable(file)
+    } catch (err) {
+      failUnreadableBeforeStart(id, err)
+      return
+    }
+    // Cancelled while it was read: nothing has been sent, and nothing will be.
+    if (controller.signal.aborted) {
+      handOffProbe(id)
+      throw new DOMException('Upload cancelled', 'AbortError')
+    }
 
     let initRes: InitiateResponse
     try {
@@ -2069,6 +2332,17 @@ async function runResume(id: string, runner: Runner, runKey: string): Promise<vo
       }
       if (file.size !== info.file_size_bytes) {
         throw new Error('File does not match original')
+      }
+      // The bytes are needed only now: after `/parts` has said so, and not for
+      // an `assembled` upload, which the picked file may be unreadable for and
+      // still complete. A file that changed or moved while the Resume waited
+      // ends the run here, `interrupted` with the reason through the `catch`
+      // below, before any presign. By now `/parts` has answered, so the hold
+      // this row was probing is already over.
+      try {
+        await assertReadable(file)
+      } catch (err) {
+        throw err instanceof FileUnreadableError ? err : new Error(readFailureMessage(err))
       }
       const resumeWatch = transferWatch(id, file.size, updateFile)
       watch = resumeWatch
@@ -2939,7 +3213,10 @@ if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
  * run hanging would otherwise hold places in the next test's queue.
  */
 export const __uploadQueueTesting = {
-  /** An empty queue, no runs, no hold, and a fresh part budget. Runs still in flight are forgotten, not stopped. */
+  /**
+   * An empty queue, no runs, no hold, a fresh part budget, and no progress
+   * heard in the tab. Runs still in flight are forgotten, not stopped.
+   */
   reset(): void {
     if (probeTimer !== null) clearTimeout(probeTimer)
     probeTimer = null
@@ -2952,6 +3229,7 @@ export const __uploadQueueTesting = {
     for (const id of Object.keys(abortControllers)) delete abortControllers[id]
     partBudget = createPartBudget(UPLOAD_CONCURRENCY)
     wakeLockHolders = 0
+    tabProgressAt = -Infinity
   },
   hasAbortController: (id: string): boolean => abortControllers[id] !== undefined,
   /** Rows whose run has begun and not yet ended. */

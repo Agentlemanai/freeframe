@@ -8,7 +8,7 @@ vi.mock('@/lib/api', () => ({
 }))
 
 import { api } from '@/lib/api'
-import { uploadAllParts } from '../upload-store'
+import { uploadAllParts, PartStalledError, __uploadQueueTesting } from '../upload-store'
 import { installXhrFake, ok, fail, type FakeXhr, type PartHandler } from '@/test/xhr-fake'
 import { createPartBudget, type PartBudget } from '@/lib/upload-budget'
 
@@ -54,6 +54,12 @@ function mockPresignPerPart() {
 function partOf(url: string): number {
   return Number(url.split('-').pop())
 }
+
+// The part watchdog reads when any part of the tab last moved, which outlives
+// a test; each test starts from a tab that has heard nothing.
+beforeEach(() => {
+  __uploadQueueTesting.reset()
+})
 
 describe('uploadAllParts', () => {
   let controller: AbortController
@@ -694,11 +700,351 @@ describe('the part PUT', () => {
     })
 
     const promise = uploadAllParts(makeFile(4 * CHUNK_SIZE + 1000), 'key', 'upload-1', controller, vi.fn(), slots(5))
-    await vi.runAllTimersAsync()
+    // Past the first backoff rung and its jitter, and well short of any
+    // watchdog, so a watchdog left behind is still pending to be counted.
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(await promise).toHaveLength(5)
 
     expect([2, 3, 4, 5].map((part) => attempts.get(part))).toEqual([2, 2, 2, 2])
     expect(live.size).toBe(0)
+    // Nor a watchdog: each attempt's clock went with it, however it settled.
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+describe('the part watchdog', () => {
+  let controller: AbortController
+
+  /** Mirror the store's watchdog: no progress while bytes remain, and the wait after the last byte. */
+  const PART_STALL_MS = 90_000
+  const PART_RESPONSE_WAIT_MS = 300_000
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+    controller = new AbortController()
+    mockPresignPerPart()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  /** A part on the wire that only an abort ends, as a WebKit PUT on a changed file is. */
+  const hang = () => new Promise<never>(() => {})
+
+  it('a part with no progress for 90 s is aborted and retried', async () => {
+    // In WebKit a part whose file changed on disk hangs with no event at all,
+    // so nothing but a clock can say it is stuck. The retry reads the file
+    // first (Task 3.1), which is what turns that hang into a clear failure.
+    const requests: FakeXhr[] = []
+    const put = mockPut()
+    put
+      .mockImplementationOnce((_url, request) => {
+        requests.push(request)
+        return hang()
+      })
+      .mockImplementationOnce((_url, request) => {
+        requests.push(request)
+        return ok('"etag-1"')
+      })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn(), slots())
+    await vi.advanceTimersByTimeAsync(PART_STALL_MS - 1)
+    expect(requests).toHaveLength(1)
+    expect(requests[0].aborted).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(1)
+    expect(requests[0].aborted).toBe(true)
+
+    await vi.runAllTimersAsync()
+    expect(await promise).toEqual([{ PartNumber: 1, ETag: '"etag-1"' }])
+    expect(put).toHaveBeenCalledTimes(2)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('names a stall, not a cancel, once every attempt has stalled', async () => {
+    // The watchdog's own abort must not come out as an AbortError: the caller
+    // takes that for a user cancel and discards every part the backend holds.
+    const put = mockPut(() => hang())
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn(), slots())
+    const settled = promise.catch((err: unknown) => err)
+    await vi.runAllTimersAsync()
+
+    const err = await settled
+    expect(err).toBeInstanceOf(PartStalledError)
+    expect(err).not.toBeInstanceOf(DOMException)
+    expect((err as Error).message).toBe('Part 1 failed: no progress for 90 s')
+    expect(put).toHaveBeenCalledTimes(8)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('progress every 60 s keeps a slow part alive', async () => {
+    // A slow but live uplink must never be cut off: any byte that moves resets
+    // the clock, however long the part takes in all.
+    let request!: FakeXhr
+    let answer!: () => void
+    const put = mockPut((_url, r) => {
+      request = r
+      return new Promise((resolve) => {
+        answer = () => resolve(ok('"etag-1"'))
+      })
+    })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn(), slots())
+    await vi.advanceTimersByTimeAsync(0)
+    for (let k = 1; k <= 10; k++) {
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(request.aborted).toBe(false)
+      request.progress(k * 100)
+    }
+
+    answer()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await promise).toEqual([{ PartNumber: 1, ETag: '"etag-1"' }])
+    expect(put).toHaveBeenCalledTimes(1)
+    expect(request.aborted).toBe(false)
+    // The watchdog went with the answer.
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('a part that sent every byte waits 5 min for its answer, then retries', async () => {
+    // Storage, or a proxy that buffers the body, can take a while to answer a
+    // 256 MiB part after its last byte, and nothing moves on the upload side
+    // meanwhile. The 90 s clock would cut that off; the wait for an answer is
+    // longer.
+    const requests: FakeXhr[] = []
+    const put = mockPut()
+    put
+      .mockImplementationOnce((_url, request) => {
+        requests.push(request)
+        request.progress(512)
+        request.progress(1024)
+        return hang()
+      })
+      .mockImplementationOnce((_url, request) => {
+        requests.push(request)
+        return ok('"etag-1"')
+      })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn(), slots())
+    await vi.advanceTimersByTimeAsync(PART_STALL_MS * 2)
+    expect(requests[0].aborted).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(PART_RESPONSE_WAIT_MS - PART_STALL_MS * 2 - 1)
+    expect(requests[0].aborted).toBe(false)
+    expect(requests).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(1)
+    expect(requests[0].aborted).toBe(true)
+
+    await vi.runAllTimersAsync()
+    expect(await promise).toEqual([{ PartNumber: 1, ETag: '"etag-1"' }])
+    expect(put).toHaveBeenCalledTimes(2)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('names the wait for an answer once every attempt has run it out', async () => {
+    mockPut((_url, request) => {
+      request.progress(1024)
+      return hang()
+    })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn(), slots())
+    const settled = promise.catch((err: unknown) => err)
+    await vi.runAllTimersAsync()
+
+    const err = await settled
+    expect(err).toBeInstanceOf(PartStalledError)
+    expect((err as Error).message).toBe('Part 1 failed: no answer 5 min after its last byte')
+  })
+
+  it('user cancel during a stall still reports AbortError', async () => {
+    const requests: FakeXhr[] = []
+    const put = mockPut((_url, request) => {
+      requests.push(request)
+      return hang()
+    })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn(), slots())
+    const settled = promise.catch((err: unknown) => err)
+    await vi.advanceTimersByTimeAsync(PART_STALL_MS - 30_000)
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const err = await settled
+    expect(requests[0].aborted).toBe(true)
+    expect(err).toBeInstanceOf(DOMException)
+    expect((err as DOMException).name).toBe('AbortError')
+    expect((err as DOMException).message).toBe('Part 1 cancelled')
+    // The watchdog went with the cancel: nothing fires later, and nothing is retried.
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(PART_RESPONSE_WAIT_MS)
+    expect(put).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * Two parts of 1000 bytes in flight together. Each part's first attempt
+   * stays on the wire until the test answers it; any later attempt succeeds.
+   */
+  function twoParts() {
+    const first = new Map<number, { request: FakeXhr; answer: () => void }>()
+    const put = mockPut((url, request) => {
+      const part = partOf(url)
+      if (first.has(part)) return ok(`"etag-${part}"`)
+      return new Promise((resolve) => {
+        first.set(part, { request, answer: () => resolve(ok(`"etag-${part}"`)) })
+      })
+    })
+    const promise = uploadAllParts(makeFile(2000), 'key', 'upload-1', controller, vi.fn(), {
+      budget: createPartBudget(2), fileKey: 'f', chunkSize: 1000,
+    })
+    const part = (n: number) => first.get(n)!
+    const attemptsOf = (n: number) => put.mock.calls.filter(([url]) => partOf(url) === n).length
+    return { promise, part, attemptsOf }
+  }
+
+  it('a part waiting for a socket is not given up on while another part of the tab is moving', async () => {
+    // Over HTTP/1.1 a browser holds a request past the sixth to a host until a
+    // socket is free, and that request reports no progress meanwhile
+    // (measured: about 12.5 s for 24 MiB parts in Chromium and WebKit). The
+    // link is busy, not dead, so the waiting part is left alone.
+    const { promise, part, attemptsOf } = twoParts()
+    await vi.advanceTimersByTimeAsync(0)
+    const sending = part(1).request
+    const waiting = part(2).request
+
+    for (let t = 1; t <= 8; t++) {
+      await vi.advanceTimersByTimeAsync(30_000)
+      sending.progress(t * 100)
+      // Its first byte at 120 s, past the 90 s a moving part is allowed.
+      if (t >= 4) waiting.progress((t - 3) * 100)
+    }
+    expect(sending.aborted).toBe(false)
+    expect(waiting.aborted).toBe(false)
+
+    part(1).answer()
+    part(2).answer()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await promise).toEqual([
+      { PartNumber: 1, ETag: '"etag-1"' },
+      { PartNumber: 2, ETag: '"etag-2"' },
+    ])
+    expect([attemptsOf(1), attemptsOf(2)]).toEqual([1, 1])
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('a part that has sent nothing is given up on once the whole tab has been silent for 90 s', async () => {
+    // The other part moves until 40 s and then stops. The waiting part has
+    // not been waiting on a busy link since then, and goes 90 s after it.
+    const { promise, part, attemptsOf } = twoParts()
+    await vi.advanceTimersByTimeAsync(0)
+    const sending = part(1).request
+    const waiting = part(2).request
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    sending.progress(100)
+    await vi.advanceTimersByTimeAsync(30_000)
+    sending.progress(200)
+
+    await vi.advanceTimersByTimeAsync(PART_STALL_MS - 1)
+    expect(waiting.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    // 130 s: 90 s after the tab's last byte, not 90 s after the send.
+    expect(waiting.aborted).toBe(true)
+
+    await vi.runAllTimersAsync()
+    expect(await promise).toHaveLength(2)
+    expect(attemptsOf(2)).toBe(2)
+  })
+
+  it('a part that never starts is given up on at 5 min even while another part keeps moving', async () => {
+    // A WebKit PUT of a file that changed on disk hangs with no event at all,
+    // whatever its siblings do. The cap ends it, and its retry reads the file.
+    const { promise, part, attemptsOf } = twoParts()
+    await vi.advanceTimersByTimeAsync(0)
+    const sending = part(1).request
+    const waiting = part(2).request
+
+    for (let t = 1; t <= 9; t++) {
+      await vi.advanceTimersByTimeAsync(30_000)
+      sending.progress(t * 50)
+    }
+    await vi.advanceTimersByTimeAsync(PART_RESPONSE_WAIT_MS - 270_000 - 1)
+    expect(waiting.aborted).toBe(false)
+    sending.progress(500)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(waiting.aborted).toBe(true)
+    expect(sending.aborted).toBe(false)
+
+    part(1).answer()
+    await vi.runAllTimersAsync()
+    expect(await promise).toHaveLength(2)
+    expect([attemptsOf(1), attemptsOf(2)]).toEqual([1, 2])
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('a progress event after the part settled leaves no timer behind', async () => {
+    // Browsers report upload progress before the answer, but a stray event
+    // after it must not arm a watchdog nothing will ever clear.
+    let request!: FakeXhr
+    mockPut((_url, r) => {
+      request = r
+      return ok('"etag-1"')
+    })
+
+    const promise = uploadAllParts(makeFile(1024), 'key', 'upload-1', controller, vi.fn(), slots())
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await promise).toEqual([{ PartNumber: 1, ETag: '"etag-1"' }])
+
+    // Straight to the handler: the fake, like a browser, drops it once settled.
+    request.upload.onprogress!({ loaded: 512, total: 1024, lengthComputable: true } as ProgressEvent)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('a stalled attempt goes to sleep before it gives its slot back', async () => {
+    // A stall is a failed attempt like any other, so it keeps the budget's
+    // order (see 'a failing attempt goes to sleep before it gives its slot back').
+    const inner = createPartBudget(2)
+    const log: string[] = []
+    const budget: PartBudget = {
+      size: inner.size,
+      acquire: async (fileKey, signal, kind) => {
+        log.push(`acquire ${kind}`)
+        const release = await inner.acquire(fileKey, signal, kind)
+        return () => {
+          log.push('release')
+          release()
+        }
+      },
+      sleeping: (fileKey) => {
+        log.push('sleeping')
+        inner.sleeping(fileKey)
+      },
+      woke: (fileKey) => {
+        log.push('woke')
+        inner.woke(fileKey)
+      },
+      setRank: (fileKey, rank) => inner.setRank(fileKey, rank),
+      forget: (fileKey) => {
+        log.push('forget')
+        inner.forget(fileKey)
+      },
+    }
+    const put = mockPut()
+    put.mockImplementationOnce(() => hang()).mockResolvedValueOnce(ok('"etag-1"'))
+
+    const promise = uploadAllParts(makeFile(1000), 'key', 'upload-1', controller, vi.fn(), {
+      budget, fileKey: 'f', chunkSize: 1000,
+    })
+    await vi.runAllTimersAsync()
+    await promise
+
+    expect(log).toEqual([
+      'acquire fresh', 'sleeping', 'release', 'woke', 'acquire retry', 'release', 'forget',
+    ])
   })
 })
 
