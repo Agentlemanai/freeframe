@@ -29,6 +29,7 @@ import { DownloadMenu } from '@/components/shared/download-menu'
 import { CommentCountBadge } from '@/components/shared/comment-count-badge'
 import { ShareReviewScreen } from './share-review-screen'
 import { usePageTitle } from '@/hooks/use-page-title'
+import { SHARE_ASSETS_PAGE_SIZE } from '@/lib/share-page'
 import { Avatar } from '@/components/shared/avatar'
 import type {
   SharePermission,
@@ -653,7 +654,12 @@ export function FolderShareViewer({
   const [searchQuery, setSearchQuery] = React.useState('')
   const [foldersExpanded, setFoldersExpanded] = React.useState(true)
   const [assetsExpanded, setAssetsExpanded] = React.useState(true)
-  const [panelOpen, setPanelOpen] = React.useState(() => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches)
+  // The comments pane starts closed. A guest following a link came to look at
+  // the media, and on a laptop the pane took a third of the grid before they
+  // had picked anything — it showed "Select an asset to view comments". The
+  // panel belongs to the asset viewer, where ShareReviewScreen opens its own
+  // sidebar by default; here it stays behind the header toggle.
+  const [panelOpen, setPanelOpen] = React.useState(false)
   const [viewingAsset, setViewingAsset] = React.useState<FolderShareAssetItem | null>(null)
 
   // Page title; the hook re-applies it once branding loads and when React remounts the metadata title
@@ -678,7 +684,7 @@ export function FolderShareViewer({
   const thumbnailScale = appearance.thumbnail_scale ?? 'fill'
   const showCardInfo = appearance.show_card_info !== false
   const isGridLayout = appearance.layout !== 'list'
-  const perPage = 24
+  const perPage = SHARE_ASSETS_PAGE_SIZE
 
   // Grid column classes based on card_size
   const gridCols = cardSize === 's'

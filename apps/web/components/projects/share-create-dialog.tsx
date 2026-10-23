@@ -16,18 +16,25 @@ import {
   Images,
   ChevronRight,
   ChevronLeft,
+  ChevronDown,
   MessageSquare,
   Download,
   Key,
   Clock,
   Droplets,
   LayoutGrid,
+  Paintbrush,
 } from 'lucide-react'
 import * as Switch from '@radix-ui/react-switch'
 import { cn, copyToClipboard, dateInputValue, endOfDayISO } from '@/lib/utils'
 import { withBasePath } from '@/lib/base-path'
 import { Button } from '@/components/ui/button'
 import { api } from '@/lib/api'
+import {
+  ShareAppearanceFields,
+  DEFAULT_SHARE_APPEARANCE,
+  appearanceFromView,
+} from '@/components/projects/share-appearance-fields'
 import type { AssetResponse, Folder, ShareLink, ShareLinkAppearance } from '@/types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -45,6 +52,11 @@ interface ShareCreateDialogProps {
   initialResult?: CreatedShareResult | null
   onShareCreated: () => void
   onAdvancedSettings?: (token: string) => void
+  /**
+   * Whether the dialog opens over a folder view, so "Use my current view" has
+   * something on screen to copy. The asset review page passes false.
+   */
+  currentViewAvailable?: boolean
 }
 
 type SelectedItem =
@@ -290,6 +302,7 @@ interface ShareConfig {
   expiresAt: string | null
   watermark: boolean
   visibility: 'public' | 'secure'
+  appearance: ShareLinkAppearance
 }
 
 // ─── Configure Phase ──────────────────────────────────────────────────────────
@@ -302,9 +315,12 @@ interface ConfigurePhaseProps {
   /** Set once the link exists; the settings lock and the footer offers Copy and Close */
   createdUrl: string | null
   onClose: () => void
+  /** A single asset makes an asset link, which only takes a theme and accent */
+  linkKind: 'asset' | 'collection'
+  canCopyCurrentView: boolean
 }
 
-function ConfigurePhase({ defaultTitle, onBack, onCreate, creating, createdUrl, onClose }: ConfigurePhaseProps) {
+function ConfigurePhase({ defaultTitle, onBack, onCreate, creating, createdUrl, onClose, linkKind, canCopyCurrentView }: ConfigurePhaseProps) {
   const [title, setTitle] = React.useState(defaultTitle)
   // Comments on, downloads off, matching ShareLinkCreate on the API. Both have to
   // move together or a link created through the API keeps the old behaviour while
@@ -317,6 +333,12 @@ function ConfigurePhase({ defaultTitle, onBack, onCreate, creating, createdUrl, 
   const [watermark, setWatermark] = React.useState(false)
   const [expiresAt, setExpiresAt] = React.useState('')
   const [visibility, setVisibility] = React.useState<'public' | 'secure'>('public')
+  // The link's own look, editable right here. It starts on the share defaults
+  // (same as the API's), not on the viewer's current view, so a link never
+  // depends on how one browser happened to be set up. "Use my current view"
+  // inside the block copies the view in once, at the click.
+  const [appearance, setAppearance] = React.useState<ShareLinkAppearance>(DEFAULT_SHARE_APPEARANCE)
+  const [showAppearance, setShowAppearance] = React.useState(false)
   const { status: copyStatus, copy } = useCopyStatus(createdUrl ?? '')
 
   function handleCreate() {
@@ -328,6 +350,7 @@ function ConfigurePhase({ defaultTitle, onBack, onCreate, creating, createdUrl, 
       expiresAt: expiresAt || null,
       watermark,
       visibility,
+      appearance,
     })
   }
 
@@ -350,10 +373,13 @@ function ConfigurePhase({ defaultTitle, onBack, onCreate, creating, createdUrl, 
         </Dialog.Close>
       </div>
 
-      {/* Content — locked once the link exists, since the settings are already applied */}
+      {/* Content — locked once the link exists, since the settings are already
+          applied. The scrollbar's space stays reserved (`[scrollbar-gutter:stable]`)
+          so the content box keeps one width: hiding the grid-only rows on list
+          layout made the scrollbar come and go, which visibly widened the dialog. */}
       <fieldset
         disabled={!!createdUrl}
-        className="px-5 py-4 space-y-4 max-h-[60vh] overflow-y-auto min-w-0 disabled:opacity-60"
+        className="px-5 py-4 space-y-4 max-h-[60vh] overflow-y-auto min-w-0 disabled:opacity-60 [scrollbar-gutter:stable]"
       >
         {/* Link name */}
         <div className="space-y-1.5">
@@ -487,6 +513,41 @@ function ConfigurePhase({ defaultTitle, onBack, onCreate, creating, createdUrl, 
               <Switch.Thumb className="block w-4 h-4 rounded-full bg-white shadow transition-transform translate-x-0.5 data-[state=checked]:translate-x-[18px]" />
             </Switch.Root>
           </div>
+        </div>
+
+        {/* Appearance — same block as the link panel's Settings > Appearance,
+            so how the client sees the link is picked here, not rebuilt by
+            hand afterwards. Goes out with the create request itself. */}
+        <div className="border-t border-border pt-1">
+          <button
+            type="button"
+            onClick={() => setShowAppearance((v) => !v)}
+            className="flex w-full items-center justify-between py-2.5"
+          >
+            <div className="flex items-center gap-2.5">
+              <Paintbrush className="h-4 w-4 text-text-tertiary" />
+              <span className="text-sm text-text-primary">Appearance</span>
+            </div>
+            {showAppearance ? (
+              <ChevronDown className="h-4 w-4 text-text-tertiary" />
+            ) : (
+              <ChevronRight className="h-4 w-4 text-text-tertiary" />
+            )}
+          </button>
+          {showAppearance && (
+            <div className="rounded-lg border border-border bg-bg-tertiary/50 p-3">
+              <ShareAppearanceFields
+                appearance={appearance}
+                kind={linkKind}
+                onChange={(patch) => setAppearance((a) => ({ ...a, ...patch }))}
+                onUseCurrentView={
+                  canCopyCurrentView
+                    ? () => setAppearance((a) => ({ ...a, ...appearanceFromView() }))
+                    : undefined
+                }
+              />
+            </div>
+          )}
         </div>
       </fieldset>
 
@@ -669,21 +730,33 @@ function LinkCreatedPhase({ result, allResults, onSelectResult, onDone, onAdvanc
   }, [result.token, result.title])
   const [urlCopied, setUrlCopied] = React.useState(false)
   const [urlCopyFailed, setUrlCopyFailed] = React.useState(false)
-  const [layout, setLayout] = React.useState<'grid' | 'list'>('grid')
+  // The full appearance, not just the layout: the PATCH below replaces the
+  // whole object server-side, so switching layout must carry the rest along.
+  const [appearance, setAppearance] = React.useState<ShareLinkAppearance>(DEFAULT_SHARE_APPEARANCE)
+  // The token whose appearance `appearance` holds. Until it matches the link
+  // shown, the layout switch is disabled: patching then would send the
+  // defaults, or the previous link's appearance, over this link's own.
+  const [appearanceToken, setAppearanceToken] = React.useState<string | null>(null)
   const titleInputRef = React.useRef<HTMLInputElement>(null)
   const debounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Fetch share link details to initialize settings
   React.useEffect(() => {
+    // Switching between created links refetches; a late answer for the link
+    // switched away from must not land on the one now shown.
+    let cancelled = false
     api.get<ShareLink>(`/share/${result.token}/details`).then((data) => {
+      if (cancelled) return
       setAllowComments(data.permission === 'comment' || data.permission === 'approve')
       setAllowDownloads(data.allow_download)
       setPassphrase(data.has_password ?? false)
       setWatermark(data.show_watermark)
       setExpiresAt(dateInputValue(data.expires_at))
-      setLayout((data.appearance as ShareLinkAppearance | null)?.layout || 'grid')
+      setAppearance({ ...DEFAULT_SHARE_APPEARANCE, ...(data.appearance ?? {}) })
+      setAppearanceToken(result.token)
       setVisibility(data.visibility === 'secure' ? 'secure' : 'public')
     }).catch(() => {})
+    return () => { cancelled = true }
   }, [result.token])
 
   const shareUrl = buildShareUrl(result.token)
@@ -772,8 +845,9 @@ function LinkCreatedPhase({ result, allResults, onSelectResult, onDone, onAdvanc
         </Dialog.Close>
       </div>
 
-      {/* Content */}
-      <div className="px-5 py-4 space-y-4 max-h-[60vh] overflow-y-auto">
+      {/* Content — scrollbar gutter reserved here too; the Settings tab's
+          layout switch hides rows the same way the configure phase does */}
+      <div className="px-5 py-4 space-y-4 max-h-[60vh] overflow-y-auto [scrollbar-gutter:stable]">
         {/* Multiple share links switcher */}
         {allResults && allResults.length > 1 && (
           <div className="space-y-1">
@@ -896,8 +970,13 @@ function LinkCreatedPhase({ result, allResults, onSelectResult, onDone, onAdvanc
                   {(['grid', 'list'] as const).map((l) => (
                     <button
                       key={l}
-                      onClick={() => { setLayout(l); patchLink({ appearance: { layout: l, theme: 'dark', accent_color: null, open_in_viewer: true, sort_by: 'created_at' } }) }}
-                      className={cn('rounded-md px-3 py-1 text-2xs font-medium capitalize', layout === l ? 'bg-accent text-white' : 'text-text-tertiary hover:text-text-primary')}
+                      disabled={appearanceToken !== result.token}
+                      onClick={() => {
+                        const next = { ...appearance, layout: l }
+                        setAppearance(next)
+                        patchLink({ appearance: next })
+                      }}
+                      className={cn('rounded-md px-3 py-1 text-2xs font-medium capitalize', appearance.layout === l ? 'bg-accent text-white' : 'text-text-tertiary hover:text-text-primary', 'disabled:opacity-50')}
                     >{l}</button>
                   ))}
                 </div>
@@ -1049,6 +1128,7 @@ export function ShareCreateDialog({
   initialResult,
   onShareCreated,
   onAdvancedSettings,
+  currentViewAvailable = true,
 }: ShareCreateDialogProps) {
   type Phase = 'selection' | 'configure' | 'result'
 
@@ -1167,6 +1247,7 @@ export function ShareCreateDialog({
         visibility: config.visibility,
         allow_download: config.allowDownloads,
         show_watermark: config.watermark,
+        appearance: config.appearance,
       }
       if (config.passphrase) settings.password = config.passphrase
       if (config.expiresAt) settings.expires_at = endOfDayISO(config.expiresAt)
@@ -1251,6 +1332,13 @@ export function ShareCreateDialog({
               creating={creating}
               createdUrl={createdUrl}
               onClose={handleDone}
+              linkKind={
+                selectedItems.size === 1 &&
+                Array.from(selectedItems.values())[0].type === 'asset'
+                  ? 'asset'
+                  : 'collection'
+              }
+              canCopyCurrentView={currentViewAvailable}
             />
           ) : (
             <SelectionPhase
