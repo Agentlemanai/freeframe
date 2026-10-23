@@ -193,14 +193,16 @@ describe('cancel', () => {
 
     expect(rowOf(a).status).toBe('uploading')
     expect(server.calls).not.toContain('presign u1')
-    expect(testing.wakeLockHolders()).toBe(2)
+    expect(testing.wakeLockWanted()).toBe(true)
 
     useUploadStore.getState().cancelUpload(a)
     await flush()
 
     expect(rowOf(a).status).toBe('cancelled')
     expect(aborts(server.calls)).toEqual(['abort u1'])
-    expect(testing.wakeLockHolders()).toBe(1)
+    // `b` is still moving, so the lock is still wanted. The boolean cannot say
+    // which row wants it; it goes only once `b` is cancelled too, below.
+    expect(testing.wakeLockWanted()).toBe(true)
     expect(testing.runningIds()).toEqual([b])
     expect(testing.hasAbortController(a)).toBe(false)
 
@@ -209,6 +211,12 @@ describe('cancel', () => {
     expect(rowOf(a).heartbeatAt).toBe(beat)
     expect(aborts(server.calls)).toEqual(['abort u1'])
     expect(server.calls).not.toContain('presign u1')
+
+    // Nothing is moving once the last one is cancelled: the lock goes.
+    useUploadStore.getState().cancelUpload(b)
+    await flush()
+    expect(rowOf(b).status).toBe('cancelled')
+    expect(testing.wakeLockWanted()).toBe(false)
   })
 })
 

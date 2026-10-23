@@ -41,9 +41,9 @@ version.
 | A1 | Two pages, one context: log out in B with files queued in A | A redirects to /login; after signing back in, A's queued files show as Failed with the signed-out message | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a1-log-out-in-another-tab-with-files-queued-pass) | — | — |
 | A2 | Accept an invite as `secondary` in tab B while A sends | A's sending row ends Interrupted; A's queued rows fail with the account message; no asset lands in `secondary`'s account | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a2-accept-an-invite-in-another-window-while-a-sends-pass) | — | — |
 | A3 | Sign in as `secondary` in the same browser after `primary` left interrupted rows | `secondary` sees none of them; `primary` sees them again after switching back | Chromium, WebKit, Firefox | 4 | `tests/accounts.spec.ts` | [PASS](live-runs/2026-10-22-phase-4.md#a3-another-account-in-the-same-browser-after-primary-left-interrupted-rows-pass) | — | — |
-| L1 | Reload with files queued | the beforeunload dialog appears (`page.on('dialog')`, type `beforeunload`) in Chromium and WebKit | Chromium, WebKit, Firefox | 5 | — | — | — | — |
-| L2 | Log out with files queued | in-app confirm "N uploads will stop. Log out anyway?"; confirming navigates with no beforeunload dialog | Chromium, WebKit, Firefox | 5 | — | — | — | — |
-| L3 | Expired session (clear both tokens, then trigger a request) | redirect to /login, no dialog | Chromium, WebKit, Firefox | 5 | — | — | — | — |
+| L1 | Reload with files queued | the beforeunload dialog appears (`page.on('dialog')`, type `beforeunload`) in Chromium and WebKit | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` (L1, and L1 negative: nothing on its way, no prompt) | [PASS](live-runs/2026-10-23-phase-5.md#l1-reload-with-files-queued-pass) (L1 negative: PASS, console not read), and [closing the tab](live-runs/2026-10-23-phase-5.md#l1-close-the-tab-with-files-queued-pass) | — | — |
+| L2 | Log out with files queued | in-app confirm "N uploads will stop. Log out anyway?"; confirming navigates with no beforeunload dialog | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` (L2 with Cancel then Log out, L2 one file, L2 negative: nothing on its way, no confirm) | [PASS](live-runs/2026-10-23-phase-5.md#l2-log-out-with-files-queued-pass) | — | — |
+| L3 | Expired session (clear both tokens, then trigger a request) | redirect to /login, no dialog | Chromium, WebKit, Firefox | 5 | `tests/leave.spec.ts` | [PASS, both tokens cleared and the refresh refused](live-runs/2026-10-23-phase-5.md#l3-a-session-that-ends-by-force-pass) | — | — |
 | V1 | New Version during a long queue | the asset page shows "New version queued, waiting for other uploads."; the version appears without reload | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#v1-new-version-during-a-long-queue-pass) | — | — |
 | P1 | A storage cap that fits only about 3 of 10 files | at least one row Failed "Storage limit reached …" with Retry; every row ends Complete/Processing or Failed; none stays Queued or Starting; committed bytes exceed the cap by at most one file (with at most two files in flight; the cap counts only committed media) | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#p1-storage-cap-pass) | — | — |
 | P2 | Project deleted while 5 files are queued for it, plus 2 queued for another project | the 5 fail with 404; the 2 upload | Chromium, WebKit, Firefox | 2 | `tests/queue.spec.ts` | [PASS](live-runs/2026-10-22-phase-2.md#p2-project-deleted-under-queued-files-pass) | — | — |
@@ -398,6 +398,174 @@ the heartbeat) was not exercised in any multi-tab step (A1, A3, R2 and its two v
   account change or a history load (as on `main`); a second open tab keeps the uploading tab's token fresh, so the 401 path shows
   only with one tab.
 - Not run here: the manual real Safari and real Firefox pass (matrix row M).
+
+## Phase 5 automated results
+
+`tests/leave.spec.ts` (L1, L2, L3, and a negative for each of L1 and L2), run against the phase 5 branch
+(`feat/upload-queue-5-leave`) on the e2e stack, 2026-10-23. Each test clicks the page before it leaves (the panel's
+Uploads button and All tab), since a browser prompts only a page that has had a user interaction; the negatives click too.
+
+| Engine | Result | Duration |
+|---|---|---|
+| Chromium (Playwright 1.59, Chromium headless shell 1217) | `leave.spec.ts --repeat-each=3`: 18 of 18 passed (setup skipped, saved sessions reused) | 46.1 s |
+| WebKit (Playwright 1.59) | the same: 18 of 18 passed | 54.4 s |
+| Firefox (Playwright's Firefox 1511) | **does not launch on this macOS machine** (Darwin 27), as before. Not run. Run `pnpm test:firefox` wherever it launches, and do the manual real-Firefox pass | n/a |
+
+**L1 has not been run on Firefox**: Playwright's Firefox does not launch on this Mac, so whether and how Firefox raises the
+prompt here is unmeasured (owed to a machine where it launches, and to the manual real-Firefox pass).
+
+Per test (seconds, Chromium / WebKit, the three runs): L1 3.6 3.4 3.4 / 4.0 3.7 3.7, L1 negative 2.0 2.0 2.1 / 2.1 1.9 1.9,
+L2 3.4 3.3 3.1 / 4.0 4.0 4.1, L2 one file 2.1 2.1 2.1 / 2.6 2.6 2.7, L2 negative 1.9 1.9 1.9 / 2.3 2.3 3.6, L3 1.9 1.6 1.7 /
+1.8 1.9 3.0. No retry (`retries` is 0).
+
+What each one observed:
+
+- **L1** five 1 MB PNGs, parts on hold: three Uploading, two Queued. `page.reload()` raises a dialog of type
+  `beforeunload`. Dismissed, the document stays (a marker set on `window` is still there a second later) and the five rows
+  read exactly as before. Reloaded again (after another click) and accepted, the page reloads: the three that had started
+  come back Interrupted (asserted). The two that were queued were not listed after the reload in these runs; that is not
+  asserted (the row does not ask for it, and keeping never-started files across a reload is a non-goal of the design, not
+  a promise either way). **L1 negative**: one PNG uploaded to Ready, then a reload: no dialog,
+  and the document is replaced.
+- **L2** (as `secondary`) the same frozen queue; Log out from the sidebar's account menu opens the in-app confirmation titled
+  exactly "5 uploads will stop. Log out anyway?". Cancel closes it, both tokens are unchanged, `<body>` is not left at
+  `pointer-events: none`, the next clicks land (the Uploads panel opens, the rows are as they were, the account menu opens
+  again). Log out again and confirm: `/login`, both tokens gone, no `beforeunload` dialog. **L2 one file**: the title reads
+  "1 upload will stop. Log out anyway?", and confirming leaves with no dialog. **L2 negative**: with one upload Ready and
+  nothing on its way, Log out goes straight to `/login`; a `MutationObserver` watching for any `role="dialog"` (its finding
+  kept in sessionStorage across the load) saw none, and there was no browser prompt.
+- **L3** the same frozen queue (as primary), then both tokens are removed from localStorage in the page itself (no `storage`
+  event, so nothing reacts: the three sending rows are still saved as `uploading`). Opening Notifications asks the API,
+  which answers 401; with no refresh token `clearTokens` sends the page to `/login`, with no dialog.
+
+**Engine quirk: how Playwright reports a dismissed `beforeunload`** (measured in both engines, Playwright 1.59, recorded in
+the spec's header). Every way of leaving shows the prompt as a `dialog` of type `beforeunload`, and accepting it lets every
+one of them through. Dismissing it:
+
+| Navigation | Chromium | WebKit |
+|---|---|---|
+| `page.reload()` | the promise never settles (runs to its timeout) | rejects, "navigation cancelled by beforeunload dialog" |
+| `page.goto(url)` | rejects, `net::ERR_ABORTED` | the promise never settles (runs to its timeout) |
+| `page.evaluate(() => location.reload())` | resolves | resolves |
+| `page.close({ runBeforeUnload: true })` | resolves, the page stays open | resolves, the page stays open |
+
+So L1 reloads with `page.reload()` (the browser's own Reload, not a script's) without awaiting it when the prompt is
+dismissed: it awaits the dialog event, then looks at the page.
+
+Each scenario was checked against a temporary mutation of the app (reverted, never committed; `apps/` clean afterwards),
+in the engines each bullet names, and failed for the intended reason:
+
+- `useUploadLeaveGuard()` not mounted in `app/(dashboard)/layout.tsx`: **L1 fails** (no dialog within 15 s), in Chromium and
+  in WebKit. Everything else passes, as it should: they all expect no prompt.
+- the sidebar's Log out calling `logout()` directly, with no confirmation: **L2 and L2 one file fail** (no confirmation;
+  the page is already on `/login`), in Chromium.
+- `clearTokens` no longer setting the suppression flag: **L2, L2 one file and L3 fail** with a `beforeunload` dialog on the
+  way to `/login`, in Chromium and in WebKit (L3 checked again on Chromium against the final spec).
+
+One check does **not** catch its mutation: L2's "Cancel leaves the page clickable" (`<body>` not at `pointer-events:
+none`, and the next click lands). With `e31deb08`'s handoff reverted (the sidebar's `requestLogout` calling `setLogoutAsk`
+inside the menu's `onSelect` instead of through `afterMenuCloses`), L2 still passed, twice in Chromium and twice in WebKit
+(fix round 1, 2026-10-23). The web container has one copy of Radix's `react-dismissable-layer` (1.2.1), and the lock that
+handoff prevents comes from duplicate layers, which this stack cannot reproduce. The check stays as a guard against a lock
+left behind for any other reason; the handoff itself is pinned by the jsdom unit test "asks only once the menu has let go
+of the page" (`components/layout/__tests__/sidebar-logout-confirm.test.tsx`).
+
+The spec's 429 diagnostic was checked once by hand (fix round 1): a temporary test that fulfils `GET /me/notifications`
+with 429 and no CORS header through `page.route`, then fails on purpose, ended with "The API answered 429 (its per-account
+read limit) 2 times during this test" in Chromium and in WebKit (both counted as responses). A real 429 reached WebKit as a
+failed request only (its error text names the status), and the diagnostic fired on it during development ("22 times").
+
+After fix round 1 (the wording above, L1 no longer checking the never-started rows), `leave.spec.ts` was run once per
+engine: Chromium 6 of 6 (17.7 s), WebKit 6 of 6 (18.2 s).
+
+**No app bug of the upload queue was found.**
+
+Observations (not failures of these scenarios):
+
+- **These short tests can spend the API's per-account read limit.** `GlobalRateLimitMiddleware` allows each account 600
+  reads a minute. One of these tests reads about 30 times in 2 to 4 s (the dev server's strict mode asks twice for most
+  things), so with every test signed in as primary, a WebKit `--repeat-each=3` was refused with 429 on its 18th test in two runs
+  of two, and runs started within a minute of another failed earlier (traces: the failed requests read "Status code:
+  429"). After the split below, a Chromium run started straight after a WebKit run still met one 429, on its 2nd test. The L2 tests now sign
+  in as `secondary`, which halves each account's share, and the spec counts 429s and names them when a test fails. Wait a
+  minute between back-to-back runs of this file.
+- **A 429 from the API has no CORS header** (the browser reports "not allowed by Access-Control-Allow-Origin. Status code:
+  429"), so the page sees a network failure, cannot read `Retry-After`, and SWR retries into the same window. Pre-existing,
+  not part of the upload queue; not fixed here.
+- **A drop on a project page before it knows the account's role goes nowhere, silently.** The role comes from the
+  project's members matched against `/auth/me`, and until both answer it is "viewer". The drop region's handlers are
+  attached all along but return early while it is not enabled (`useFileDropRegion`), so the drop is ignored (no row, no
+  message). With the API answering normally that window is well under a second; under the 429s above it lasted
+  the whole test. The spec waits for the header's Upload button (drawn on the same condition) before dropping. The same
+  window is the likely cause of the Phase 4 note that R1 in WebKit sometimes "never sees its first upload start" (not
+  re-measured there); `dropFiles` could wait for it too.
+- Not run here: the manual real Safari and real Firefox pass (matrix row M), which also owes "hard reload, then drop from
+  Finder without clicking, then reload". The live Chrome pass is below.
+
+### Phase 5 gate (2026-10-23, at `dd623474`)
+
+- Chromium: the whole suite, 55 passed, 2 skipped (12.8 min).
+- WebKit: the whole suite, 55 passed, 2 skipped (14.4 min). No flake this time, including R1 and R2.
+- Firefox (Playwright `firefox` project): still does not launch on this Mac (`browserType.launch` times out after 180 s,
+  `sandbox_extension_issue_file_to_process failed ... Operation not permitted`). No test ran.
+- Web unit suite 148 files, 1485 tests; `tsc --noEmit` clean; lint 18 warnings, 0 errors; API suite 1563 passed, 3 skipped,
+  2 failures that predate this work (`test_deleted_project_routes` metadata-field cases).
+- Not run yet: the manual real Safari and real Firefox pass of L1-L3 (row M), owed before PR 5 merges. It should also cover what
+  the live pass could not: the wake lock in a truly hidden tab (W4), whether the short lock pulses on each retry during a hold
+  keep the machine awake (`pmset -g assertionslog` with an idle display), and the leave prompt seen on screen.
+
+## Phase 5 live Chrome results
+
+Run by hand in real, headed Chrome 154.0.8037.100 on the phase 5 branch (`eeb6048d`), 2026-10-23 (19:03 to 19:20 UTC on the
+22nd): [`live-runs/2026-10-23-phase-5.md`](live-runs/2026-10-23-phase-5.md). The "Live Chrome run" column above links each
+scenario's section. The DevTools MCP's profile was again held by another session's Chrome, so the pass drove its own headed
+Chrome over the DevTools protocol (`live-tools/cdp-driver.js`, `LIVE-CHROME.md` section 10). The wake lock was watched from
+outside the app (`live-tools/ffq-wakelock.js`, a wrapper on `WakeLock.prototype.request` installed before the app runs) and
+from the OS (`pmset -g assertions`: Chrome's "Blink Wake Lock" assertion).
+
+The wake-lock checks have no rows of their own in the matrix; the live report labels them:
+
+- **W1**: the lock while six files send (`Fast 4G`).
+- **V**: the lock given up when the tab is hidden and taken again when it is shown (a real tab switch).
+- **W2** and **W2b**: the lock during a storage hold ("Waiting for storage"; 3 and 9 refused initiates).
+- **W3**: the lock while rows only wait (offline, "Waiting for connection").
+- **W4**: the lock when another tab of the same browser signs out, then signs back in.
+
+**Visibility caveat.** Through the driver every page reads visible (Playwright's focus emulation, which a second DevTools
+session cannot turn off: measured). The re-acquire on visibility (V) was therefore run with the driver stopped, over a plain
+DevTools connection (`live-tools/cdp-raw.js`), with a real foreground tab and a real tab switch back; no minimize. Every other
+step ran with every page treated as visible, so a hidden tab's timer throttling was not in play there. **W4 is the weakest of
+these**: its uploading tab was a background tab that the emulation reported visible, so W4 shows only the app's own logic
+(release on the other tab's sign-out, a new request on sign-in). It is not what a real browser does with that tab: a truly
+hidden tab holds no wake lock (the browser drops it on hide, as V measured), and the re-request on sign-in would be refused
+until the tab is shown. The real-browser outcome of W4 is owed to the manual pass.
+
+- **Passing**: L1, L2, L3 and the brief's checks:
+  - L1: a Reload with 3 sending and 2 queued raised Chrome's own `beforeunload` 4 ms later; Stay (dismissed after 3 s, the page
+    held meanwhile) kept the document, the rows and the wake lock; Leave reloaded and the three that had started came back
+    Interrupted. A Reload with only Interrupted rows asked nothing. **L1 negative** (a Reload with nothing on its way): no
+    prompt, **PASS (console not read)**. Closing the tab (`Page.close` with `beforeunload`) asked each time: the first close
+    with 3 sending and 0 queued (two queued rows had been cancelled by a tooling slip), the second and third with 3 sending and
+    2 queued; Stay kept the tab, Leave closed it.
+  - L2: "5 uploads will stop. Log out anyway?" opened 13 ms after the account menu closed; Cancel kept the tokens, the rows, the
+    lock and a clickable page; Log out went to `/login` with no browser prompt. "1 upload will stop. Log out anyway?" behaved the
+    same. With nothing on its way Log out asked nothing.
+  - L3: with both tokens removed nothing reacted until the next request (401), then `/login` 0.43 s later with no prompt; with
+    both tokens spoiled the server refused the refresh (401) and the page was on `/login` 0.5 s after the first 401, no prompt.
+  - Wake lock: **W1, PASS (console not read)**: one lock from 12 ms after the drop to the moment the last of six files went to
+    Processing, never re-asked between files. W2b and W3, PASS: during a 35 s "Waiting for storage" hold and a 62 s offline wait
+    no lock was held between tries, and each probe try took it for 3 to 11 ms. **V, PASS (console not read)**: hidden by a real
+    tab switch, the browser dropped it, and the app asked again in the same millisecond the tab was shown. W4, PASS for the
+    app's logic only (see the caveat): a sign-out in another tab released it at once, and signing back in took it again while
+    the rows still moved. While on a hold the leave warning stays armed though the lock is not (by design).
+- **No app bug was found** in what was read. The console was **not read** for W1, V and the L1 negative (the first driver
+  session's records ended with it, and V ran with no recorder), so an uncaught error there would have gone unseen; every other
+  step's console was read and had none. Observations (not failures): a hold costs one short lock per probe try (whether those
+  pulses reset the OS idle timer was not measured, see the live report); leaving the page in the tab that ends the session
+  reaches `pagehide` with the lock held and the browser drops it with the document; the queue does not wake on `online` (29.8 s
+  in W3, as in phase 3); own-tab Log out and Leave lose the never-started rows, which the confirmation's count includes.
+- Not run here: the manual real Safari and real Firefox pass (matrix row M), W4 with a truly hidden tab, the idle-timer check
+  above, and a view of the dialog itself on screen (the driver answered it after 1.5 to 3 s; `screencapture` lacked permission).
 
 ## Already covered
 

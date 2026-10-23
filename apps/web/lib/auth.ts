@@ -24,8 +24,45 @@ export function setTokens(access: string, refresh: string): void {
   document.cookie = `${REFRESH_TOKEN_KEY}=${refresh}; path=/; max-age=${60 * 60 * 24 * 7}; SameSite=Lax`
 }
 
+/**
+ * Set when the session is ended on purpose, so the leave-page warning
+ * (`hooks/use-upload-leave-guard.ts`) stays quiet for the navigation to /login
+ * that follows. Never cleared in a real page: the next thing that happens to
+ * this document is that it goes away. If it does not (the load is aborted, or
+ * the page comes back from the back/forward cache), `isLeaveGuardSuppressed`
+ * stops honouring it as soon as there is a session again.
+ */
+let leaveGuardSuppressed = false
+
+/**
+ * Whether the browser must not be asked to prompt for the navigation in
+ * progress: the session was ended on purpose and has not come back since. The
+ * prompt exists for a session worth keeping the page for, and with a token in
+ * storage again, signed in on this document or in another tab, there is one.
+ */
+export function isLeaveGuardSuppressed(): boolean {
+  return leaveGuardSuppressed && getAccessToken() === null
+}
+
+/** Exported for tests. */
+export function resetLeaveGuardSuppression(): void {
+  leaveGuardSuppressed = false
+}
+
+/**
+ * Ends the session in this tab: the tokens go and the page loads /login.
+ *
+ * Every caller means it. A refresh the server refused, or one with no token to
+ * send, ends the session by force, and a Log out has already asked about the
+ * uploads it would stop (`components/layout/sidebar.tsx`). Either way the
+ * tokens are gone before the page leaves, so the browser's "Leave site?"
+ * prompt has nothing to offer: "Stay" would leave a tab with no session that
+ * signs itself out again on the next request. The flag is set before the
+ * navigation, every time.
+ */
 export function clearTokens(): void {
   if (typeof window === 'undefined') return
+  leaveGuardSuppressed = true
   localStorage.removeItem(ACCESS_TOKEN_KEY)
   localStorage.removeItem(REFRESH_TOKEN_KEY)
   // Clear auth cookies

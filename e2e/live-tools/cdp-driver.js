@@ -7,9 +7,18 @@ const http = require('node:http')
 const CDP = Number(process.argv[3] || 9333)
 const PORT = Number(process.argv[4] || 9334)
 
-/** Replaces the value of every `token=` query parameter, so no access token leaves the driver. */
+/**
+ * Replaces the value of every `token=` query parameter, so no access token leaves the driver. The value stops at the next
+ * `&`, `#`, whitespace, quote, `<`, `>` or backslash, so a URL inside JSON text is redacted without eating the rest of it.
+ */
 function redact(text) {
-  return String(text).replace(/([?&]token=)[^&]*/g, '$1<redacted>')
+  return String(text).replace(/([?&]token=)[^&#\s"'<>\\]*/g, '$1<redacted>')
+}
+
+/** `redact` applied to every string inside a JSON-able value (what a handler returns). */
+function redactValue(value) {
+  if (value === undefined) return value
+  return JSON.parse(redact(JSON.stringify(value)))
 }
 
 /**
@@ -22,7 +31,7 @@ function allowed(headers, port) {
   return headers.host === `127.0.0.1:${port}` || headers.host === `localhost:${port}`
 }
 
-module.exports = { redact, allowed }
+module.exports = { redact, redactValue, allowed }
 if (require.main !== module) return
 const { chromium } = require(process.argv[2])
 
@@ -40,14 +49,23 @@ const PRESETS = {
   const adopt = (page) => {
     for (const v of pages.values()) if (v.page === page) return
     const id = next++
-    const rec = { page, net: [], console: [], dialogs: [], cdp: null }
+    // dialogAnswer / dialogDelayMs: how this page's dialogs are answered (the `dialogs` command sets them). Dismiss at once
+    // by default; a delay leaves the browser's own dialog on screen, and the page blocked, for that long.
+    const rec = { page, net: [], console: [], dialogs: [], cdp: null, dialogAnswer: 'dismiss', dialogDelayMs: 0 }
     pages.set(id, rec)
     page.on('request', (r) => rec.net.push({ at: Date.now(), method: r.method(), url: r.url(), type: r.resourceType(), status: null, req: r }))
     page.on('requestfinished', async (r) => { const e = rec.net.find((x) => x.req === r); if (e) { try { e.status = (await r.response())?.status() ?? null } catch {} } })
     page.on('requestfailed', (r) => { const e = rec.net.find((x) => x.req === r); if (e) e.status = r.failure()?.errorText ?? 'failed' })
     page.on('console', (m) => rec.console.push({ at: Date.now(), type: m.type(), text: m.text().slice(0, 500) }))
     page.on('pageerror', (e) => rec.console.push({ at: Date.now(), type: 'pageerror', text: String(e).slice(0, 500) }))
-    page.on('dialog', (d) => { rec.dialogs.push({ at: Date.now(), type: d.type(), message: d.message() }); d.dismiss().catch(() => {}) })
+    page.on('dialog', (d) => {
+      const e = { at: Date.now(), type: d.type(), message: d.message(), answer: rec.dialogAnswer, answeredAt: null }
+      rec.dialogs.push(e)
+      setTimeout(() => {
+        e.answeredAt = Date.now()
+        ;(e.answer === 'accept' ? d.accept() : d.dismiss()).catch(() => {})
+      }, rec.dialogDelayMs)
+    })
     page.on('close', () => { rec.closed = Date.now() })
   }
   ctx.pages().forEach(adopt)
@@ -56,7 +74,7 @@ const PRESETS = {
   const cdpOf = async (rec) => (rec.cdp ??= await ctx.newCDPSession(rec.page))
 
   const handlers = {
-    pages: async () => [...pages].filter(([, r]) => !r.closed).map(([id, r]) => ({ id, url: r.page.url() })),
+    pages: async () => [...pages].filter(([, r]) => !r.closed).map(([id, r]) => ({ id, url: redact(r.page.url()) })),
     // window: true opens a new window (Target.createTarget newWindow), else a tab in the current window.
     new: async ({ url, window }) => {
       const s = await browser.newBrowserCDPSession()
@@ -67,14 +85,39 @@ const PRESETS = {
       await page.waitForLoadState('domcontentloaded').catch(() => {})
       return [...pages].find(([, r]) => r.page === page)[0]
     },
-    goto: async ({ page, url }) => { await get(page).page.goto(url, { waitUntil: 'domcontentloaded' }); return get(page).page.url() },
-    reload: async ({ page }) => { await get(page).page.reload({ waitUntil: 'domcontentloaded' }); return get(page).page.url() },
-    url: async ({ page }) => get(page).page.url(),
+    goto: async ({ page, url }) => { await get(page).page.goto(url, { waitUntil: 'domcontentloaded' }); return redact(get(page).page.url()) },
+    // Page.reload over the protocol (not a person's Reload button). nowait: return at once, since a dismissed beforeunload
+    // leaves Playwright's promise unsettled.
+    reload: async ({ page, nowait }) => {
+      const p = get(page).page.reload({ waitUntil: 'domcontentloaded' })
+      if (nowait) { p.catch(() => {}); return { started: Date.now() } }
+      await p
+      return redact(get(page).page.url())
+    },
+    // A script run on every new document of this page before the app's own (Page.addScriptToEvaluateOnNewDocument).
+    init: async ({ page, path }) => { await get(page).page.addInitScript({ path }); return path },
+    // Emulation.setFocusEmulationEnabled on the driver's own session. enabled: false does NOT reveal the page's real
+    // visibility: Playwright's session keeps its focus emulation, and a background tab still read "visible" (measured in
+    // phase 5; only `hasFocus()` went false). For a really hidden tab, stop the driver and use cdp-raw.js.
+    focus: async ({ page, enabled }) => {
+      const s = await cdpOf(get(page))
+      await s.send('Emulation.setFocusEmulationEnabled', { enabled: !!enabled })
+      return { enabled: !!enabled, at: Date.now() }
+    },
+    // The window holding this page (Browser.getWindowForTarget). Unverified for its purpose: it answered in phase 5, but the OS
+    // screenshot of the browser's dialog it was meant for was never taken (`screencapture -R` lacked permission).
+    bounds: async ({ page }) => {
+      const s = await cdpOf(get(page))
+      const { targetInfo } = await s.send('Target.getTargetInfo')
+      const b = await browser.newBrowserCDPSession()
+      return b.send('Browser.getWindowForTarget', { targetId: targetInfo.targetId })
+    },
+    url: async ({ page }) => redact(get(page).page.url()),
     eval: async ({ page, fn, timeout }) => {
       const p = get(page).page.evaluate(`(${fn})()`)
-      return timeout ? Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('eval timeout')), timeout))]) : p
+      return redactValue(await (timeout ? Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('eval timeout')), timeout))]) : p))
     },
-    evalfile: async ({ page, path }) => get(page).page.evaluate(require('node:fs').readFileSync(path, 'utf8')),
+    evalfile: async ({ page, path }) => redactValue(await get(page).page.evaluate(require('node:fs').readFileSync(path, 'utf8'))),
     files: async ({ page, selector, paths }) => { await get(page).page.setInputFiles(selector, paths); return paths.length },
     click: async ({ page, selector, text }) => {
       const p = get(page).page
@@ -99,8 +142,16 @@ const PRESETS = {
     console: async ({ page, since }) => get(page).console
       .filter((e) => !since || e.at >= since)
       .map((e) => ({ ...e, text: redact(e.text) })),
-    dialogs: async ({ page }) => get(page).dialogs,
-    close: async ({ page }) => { await get(page).page.close(); return 'closed' },
+    dialogs: async ({ page, answer, delayMs }) => {
+      const rec = get(page)
+      if (answer) rec.dialogAnswer = answer
+      if (delayMs !== undefined) rec.dialogDelayMs = delayMs
+      return rec.dialogs
+    },
+    // Page.close over the protocol. runBeforeUnload: the page's beforeunload runs first, so it may ask (not a person's close
+    // button or Cmd+W, which the protocol cannot press).
+    close: async ({ page, runBeforeUnload }) => { await get(page).page.close({ runBeforeUnload: !!runBeforeUnload }); return { closed: !!get(page).closed, at: Date.now() } },
+    closed: async ({ page }) => ({ closed: get(page).closed ?? null }),
     now: async () => Date.now(),
   }
 
