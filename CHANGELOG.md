@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The database URL pins the psycopg2 driver.** SQLAlchemy 2.1 changed the default driver for a bare `postgresql://` URL from psycopg2 to psycopg (v3), which is not installed; the API now names `psycopg2` explicitly, so the connection keeps working across the upgrade. A `DATABASE_URL` that already names a driver (for example `postgresql+psycopg://` for psycopg v3) is left as is. (#544)
+
 ## [1.20.0] - 2026-10-23
 
 A rebuilt upload experience. Files now upload through a queue instead of all at once, so a large drop finishes whole files rather than leaving many half-sent; uploads belong to the account that added them and survive account switches, sign-outs, files changed on disk, stalled parts and storage outages; the browser warns before you leave a page with uploads in flight, and Log out asks first; and the Uploads panel stays responsive under hundreds of files. This release also fixes a security issue in the sign-in redirect (see Security), and carries fixes to project settings, the notification drawer and failed notification fetches.
