@@ -1,8 +1,12 @@
 import logging
 import math
 import os
+import ssl
 import time
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import (
+    BotoCoreError, ClientError, HTTPClientError, SSLError,
+    ConnectionError as BotoConnectionError,
+)
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 import uuid
@@ -113,7 +117,14 @@ def initiate_upload(
     s3_key = f"raw/{body.project_id}/{asset.id}/{version.id}/original{ext}"
 
     # Initiate S3 multipart upload
-    upload_id = create_multipart_upload(s3_key, body.mime_type)
+    try:
+        upload_id = create_multipart_upload(s3_key, body.mime_type)
+    except Exception as exc:  # noqa: BLE001 - classified by storage_initiate_error
+        err = storage_initiate_error(exc)
+        if err is None:
+            raise
+        db.rollback()
+        raise err from exc
 
     # Record which S3 upload backs this version. Without it nothing server-side can
     # map a version to its multipart upload, so the reaper has to sweep the whole
@@ -199,16 +210,138 @@ def presign_part(
     return PresignPartResponse(presigned_url=url, part_number=body.part_number)
 
 
+# Codes S3 and its clones use for "try again shortly", throttling included. Some
+# stores answer them with a 4xx, so the code is checked as well as the status.
+_TRANSIENT_STORAGE_CODES = frozenset({
+    "SlowDown", "ServiceUnavailable", "InternalError", "RequestTimeout",
+    "Throttling", "ThrottlingException", "TooManyRequests", "RequestThrottled",
+})
+
+
+# What a TLS failure says when the TLS setup itself is wrong: a certificate that
+# does not validate, a protocol version the two ends do not share, or TLS spoken
+# to a port that does not speak it. Matched lowercase against the whole error
+# chain. Anything else -- the peer closing the connection or resetting it during
+# the handshake, which a TCP proxy in front of restarting storage does -- is an
+# outage like any dropped connection.
+_TLS_CONFIG_MARKERS = (
+    "certificate",
+    "wrong version number",
+    "unsupported protocol",
+    "protocol version",
+    "no protocols available",
+    "unknown ca",
+    "hostname",
+)
+
+
+def _tls_misconfigured(exc: BaseException) -> bool:
+    """Whether an SSLError is a configuration fault that waiting will not fix.
+
+    botocore raises its SSLError around urllib3's, around the `ssl` module's, so
+    the whole chain is read: the wrapped error, causes and contexts, and their
+    text. The endpoint URL botocore puts in its message is left out, so a host
+    that happens to be called "certificates" decides nothing.
+    """
+    texts: list[str] = []
+    urls: list[str] = []
+    stack: list[object] = [exc]
+    seen: set[int] = set()
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, ssl.SSLCertVerificationError):
+            return True
+        texts.append(str(e))
+        if not isinstance(e, BaseException):
+            continue
+        kwargs = getattr(e, "kwargs", None)
+        if isinstance(kwargs, dict):
+            stack.append(kwargs.get("error"))
+            if isinstance(kwargs.get("endpoint_url"), str):
+                urls.append(kwargs["endpoint_url"])
+        stack.extend([e.__cause__, e.__context__])
+        stack.extend(a for a in e.args if isinstance(a, BaseException))
+    text = " ".join(texts)
+    for url in urls:
+        text = text.replace(url, " ")
+    return any(marker in text.lower() for marker in _TLS_CONFIG_MARKERS)
+
+
+def storage_initiate_error(exc: Exception) -> HTTPException | None:
+    """The coded answer for a storage failure while an upload is being started.
+
+    503 `storage_unavailable` (with `Retry-After`) when waiting could help: storage
+    could not be reached, timed out, cut a TLS handshake short, or is shedding load
+    or throttling (a 429, or a throttling code on any status). 500 `storage_error`
+    when it answered and refused (a 4xx, or a 501 for a call it does not
+    implement), or its TLS setup is wrong (a certificate that does not validate, a
+    protocol version mismatch): waiting will not fix either, and the admin has to.
+    None for everything else, which the caller re-raises: a bad argument or a bug
+    is not a storage outage and must stay loud.
+
+    The web queue keys off `code` to decide between backing off and giving up.
+    """
+    transient = False
+    if isinstance(exc, SSLError):
+        # botocore files SSLError under ConnectionError, so this has to come first.
+        transient = not _tls_misconfigured(exc)
+    elif isinstance(exc, (BotoConnectionError, HTTPClientError)):
+        transient = True
+    elif isinstance(exc, ClientError):
+        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = exc.response.get("Error", {}).get("Code")
+        # 429 is throttling whatever the code says. 501 is the store saying it
+        # does not implement the call: a 5xx, but no wait will change it.
+        transient = (
+            (isinstance(status_code, int) and (status_code == 429 or (status_code >= 500 and status_code != 501)))
+            or code in _TRANSIENT_STORAGE_CODES
+        )
+    else:
+        return None
+
+    # Handled here, so nothing else will record why storage failed.
+    logger.warning("Storage failed while starting an upload: %r", exc)
+    if transient:
+        return HTTPException(
+            status_code=503,
+            detail={
+                "code": "storage_unavailable",
+                "message": "Could not reach storage to start this upload. Please retry.",
+                "retry_after": 5,
+            },
+            headers={"Retry-After": "5"},
+        )
+    return HTTPException(
+        status_code=500,
+        detail={
+            "code": "storage_error",
+            "message": "Storage refused the upload. Ask your admin to check the storage settings.",
+        },
+    )
+
+
 def _storage_unreachable(what: str = "check") -> HTTPException:
     """The answer to "could not find out" on every path that has to give one.
 
     Never 409. A conflict says the request can never succeed, and this client
     treats it as final -- it marks the upload failed and fires /upload/abort -- so
     answering a storage hiccup that way destroys a version that may be complete.
+
+    Coded the way `storage_initiate_error` codes its 503, so the web queue reads
+    a `/parts` that cannot reach storage as a storage hold ("Waiting for
+    storage") rather than as the user's connection. `message` is the sentence
+    the string detail used to be, which is what a client shows.
     """
     return HTTPException(
         status_code=503,
-        detail=f"Could not reach storage to {what} this upload. Please retry.",
+        detail={
+            "code": "storage_unavailable",
+            "message": f"Could not reach storage to {what} this upload. Please retry.",
+            "retry_after": 5,
+        },
         headers={"Retry-After": "5"},
     )
 
@@ -923,17 +1056,36 @@ def abort_upload(
             _dispose_version_files, _strip_asset_with_no_versions,
         )
         asset_id = version.asset_id
+        last_version = db.query(AssetVersion).filter(
+            AssetVersion.asset_id == asset_id,
+            AssetVersion.id != version.id,
+            AssetVersion.deleted_at.is_(None),
+        ).first() is None
+        # Removing the asset is authorized the way deleting an asset is
+        # everywhere else, by a live role on a live project. `created_by` only
+        # says who started the upload, and survives that person being taken off
+        # the project; and nothing in a project in the trash is changed, so a
+        # restore brings it back as it was.
+        #
+        # Without that, an upload that is the asset's last version is not
+        # disposed of here: the version alone would go, and the asset would be
+        # left with none, a card in the grid that cannot be opened, which no
+        # sweep ever collects (the reaper strips only the assets of versions it
+        # reaps itself). Its multipart upload is already aborted above, so its
+        # bytes are gone now; the version stays `uploading` for the reaper, which
+        # takes it and the asset together once it has been idle for the window,
+        # as it did for every upload before Discard existed.
+        if last_version and not _may_remove_asset(db, asset_id, current_user):
+            db.commit()
+            logger.info(
+                "upload %s discarded by user %s; its multipart is aborted and the "
+                "version is left to the reaper with asset %s",
+                version.id, current_user.id, asset_id,
+            )
+            return
         _dispose_version_files(db, version)
         db.flush()
-        # Removing the asset is authorized the way deleting an asset is
-        # everywhere else, by a live role on the project. `created_by` only says
-        # who started the upload, and survives that person being taken off the
-        # project. Without the role the version still goes, since it is theirs,
-        # and an asset left with no versions is the reaper's to collect.
-        stripped = (
-            _may_remove_asset(db, asset_id, current_user)
-            and _strip_asset_with_no_versions(db, asset_id)
-        )
+        stripped = last_version and _strip_asset_with_no_versions(db, asset_id)
         db.commit()
         logger.info(
             "upload %s discarded by user %s; asset %s %s",
