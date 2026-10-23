@@ -6,7 +6,7 @@ browser, uploads that outlive a page, two tabs sharing one `localStorage`, an S3
 that misbehaves.
 
 For the hands-on pass in a real, headed Chrome driven through DevTools (not run by `pnpm test`),
-see [`LIVE-CHROME.md`](LIVE-CHROME.md); its results are in `live-runs/`.
+see [`LIVE-CHROME.md`](LIVE-CHROME.md); its results are in `live-runs/` and the scripts it loads into the page are in `live-tools/`.
 
 This is a standalone package with its own `package.json` and lockfile. Nothing in `apps/web`
 depends on it, and `pnpm install` at the repo root does not touch it.
@@ -91,6 +91,15 @@ pnpm test:chromium                          # one engine
 pnpm test:webkit -- tests/smoke.spec.ts     # one file
 ```
 
+**Check the disk before a run.** Uploaded objects stay in the stack's MinIO (about 0.5 to 1 GB per full run), and the
+Docker VM's disk is shared with everything else on the machine. At about 99% full MinIO answers part PUTs with 507 and
+every scenario that completes an upload stalls in the retry ladder. Run
+`docker exec ffe2e-minio-1 df -h /data` first (the container of the `-p ffe2e` stack; use the name of yours) and clear the
+bucket past about 90%: either empty this stack's objects
+(`docker exec ffe2e-minio-1 sh -c 'rm -rf /data/freeframe/raw/* /data/freeframe/processed/*'`, objects of this stack only; the
+database rows that point at them go stale and nothing reads them) or recreate the stack (`down -v`, then `up -d --build`; the
+accounts and sessions are recreated by `accounts.ts`).
+
 `workers` is 1 and `retries` is 0 on purpose: the scenarios share one backend and a retry that
 passes would hide the races they exist to catch. A failure keeps a trace:
 `pnpm exec playwright show-trace test-results/<test>/trace.zip`.
@@ -104,6 +113,7 @@ passes would hide the races they exist to catch. A failure keeps a trace:
 | `E2E_PRIMARY_EMAIL`     | unset                   | Only for a stack that already has a superadmin and no `.accounts.json`: an existing superadmin to use as `primary`. |
 | `E2E_PRIMARY_PASSWORD`  | unset                   | Its password. |
 | `E2E_FORCE_LOGIN`       | unset                   | Set to `1` to sign both accounts in through the form even if their saved sessions still work. |
+| `E2E_UPLOAD_CONCURRENCY` | `5`                    | The part budget of the stack under test (its `NEXT_PUBLIC_UPLOAD_CONCURRENCY`). `queue.spec.ts` uses it for the start-rule check (Q1) and the presign bound (S2); set it when the stack's value is not 5. |
 
 ## How it works
 
@@ -133,15 +143,28 @@ key in the stack's Redis: `docker exec <redis container> redis-cli del rl:login:
 
 | File          | Gives you |
 | ------------- | --------- |
-| `stack.ts`    | `apiUrl()`, `signIn`, `signInThroughForm`, `createProject`, `resetUploads`, `openUploads`, `dropFiles`, `rows` |
+| `stack.ts`    | `apiUrl()`, `signIn`, `signInThroughForm`, `createProject`, `resetUploads`, `openUploads`, `closeUploads`, `dropFiles`, `rows`, `uploadRow` |
 | `files.ts`    | `makeFiles` (real random-content files on disk), `touch`, `remove`, `rewrite`, `liveFilesDir` |
-| `faults.ts`   | `throttleParts`, `failParts`, `hangParts`, `failInitiate`, `countRequests`, all on `page.route` (`throttleParts` also reads part sizes the page records) |
+| `faults.ts`   | `throttleParts`, `failParts`, `hangParts`, `holdParts`, `failInitiate`, `countRequests`, all on `page.route` (`throttleParts` also reads part sizes the page records) |
 | `accounts.ts` | `primary()`, `secondary()` and the `Account` type |
 
 `dropFiles` cannot drag from the desktop, so it builds the `DataTransfer` a browser would: real
-`File` objects read from disk, delivered as `dragenter`, `dragover` and `drop`. `rows` reads the
-uploads panel's DOM. Both depend on how those parts of the page are built, and the selectors
-are kept in `fixtures/stack.ts`.
+`File` objects read from disk, delivered as `dragenter`, `dragover` and `drop`. It waits for the
+drop region to be hydrated first: a drop that lands before React has attached its handlers goes
+nowhere (seen in WebKit, about one run in eight). `rows` reads the uploads panel by
+`data-testid="upload-row"`: `status` is the row's `data-status` (`queued`, `starting`, `uploading`,
+`processing`, `complete`, `failed`, `cancelled`, `interrupted`, `elsewhere`, not the badge's
+wording), `kind` its `data-detail` and `detail` the line it shows. A row without a status makes
+`rows` throw. Both depend on how those parts of the page are built, and the selectors are kept in
+`fixtures/stack.ts`.
+
+`tests/queue.spec.ts` holds the upload queue's scenarios (see `SCENARIOS.md`, one `test()` per ID).
+Most of them freeze the queue with `holdParts` (the files that started sit in Uploading with their
+parts held, the rest wait), look at it, act, then release it. Q1 moves about 290 MB and takes under
+a minute with the throttle at 2 MB/s; S2 is a 60 s window; the files they make are removed when each
+test ends. P1 sets the instance storage cap and part size through the admin API and puts both back in
+a `finally`; if a run is killed mid-test the cap stays, and the next P1 refuses to start until it is
+reset (`PUT /instance/settings` with `storage_limit_bytes: 0` and `upload_part_size_bytes: 0`).
 
 `tests/fixtures.spec.ts` checks each fixture's observable effect (a throttled part really is
 slow, an injected 500 reaches the page, a folder drop lands in the folder, ...) on every engine.

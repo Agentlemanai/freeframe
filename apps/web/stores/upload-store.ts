@@ -3,6 +3,9 @@ import { persist, createJSONStorage } from 'zustand/middleware'
 import { mutate as globalMutate } from 'swr'
 import { api, ApiError } from '@/lib/api'
 import { createSpeedMeter, type SpeedMeter } from '@/lib/upload-speed'
+import { createPartBudget, type PartBudget } from '@/lib/upload-budget'
+import { createUploadQueue, type ActiveInfo, type QueueEntry } from '@/lib/upload-queue'
+import { classifyInitiateError, type InitiateOutcome } from '@/lib/upload-initiate-outcome'
 import { useUploadSpeedStore } from './upload-speed-store'
 import type { AssetResponse } from '@/types'
 
@@ -88,16 +91,33 @@ function standingOfStoredRow(f: UploadFile, now: number): UploadFile {
   return { ...f, status: 'interrupted', error: undefined }
 }
 
-/** The heartbeat the row carries in shared storage right now, as the tab doing
- *  the work last wrote it -- not the copy this tab read when it loaded. */
-function storedHeartbeat(fileId: string): number | undefined {
+/** Who is sending the row, as shared storage holds it right now: what the tab
+ *  doing the work last wrote, not the copy this tab read when it loaded. */
+function storedRow(fileId: string): { ownerTab?: string; heartbeatAt?: number } | undefined {
   try {
     const raw = window.localStorage.getItem('ff-uploads')
     const files = (JSON.parse(raw ?? '{}') as { state?: { files?: UploadFile[] } }).state?.files
-    return files?.find((f) => f.id === fileId)?.heartbeatAt
+    const found = files?.find((f) => f.id === fileId)
+    return found ? { ownerTab: found.ownerTab, heartbeatAt: found.heartbeatAt } : undefined
   } catch {
     return undefined
   }
+}
+
+/** The heartbeat the row carries in shared storage right now. */
+function storedHeartbeat(fileId: string): number | undefined {
+  return storedRow(fileId)?.heartbeatAt
+}
+
+/** Whether shared storage says another tab of this browser is sending the row now. */
+function beatingInAnotherTab(fileId: string, now: number): boolean {
+  const stored = storedRow(fileId)
+  return (
+    stored?.ownerTab !== undefined &&
+    stored.ownerTab !== currentTabId() &&
+    stored.heartbeatAt !== undefined &&
+    now - stored.heartbeatAt < LIVE_WINDOW_MS
+  )
 }
 
 /**
@@ -127,7 +147,10 @@ const OWN_STOP_GRACE_MS = HEARTBEAT_MS * 2
  * So: this tab is sending it now, or it stopped sending it just now. Both are
  * read from this browser's own clock (`heartbeatAt` is written here, by the
  * tab doing the work), so no server timestamp is compared against a local one
- * and the skew in `liveUntil` is not made worse.
+ * and the skew in `liveUntil` is not made worse. A Resume that waited in the
+ * queue is judged as of its click, and whether the server saw the upload move
+ * after that click is read from two durations, each on one clock (see
+ * `movedSinceClick`), so that adds no comparison across clocks either.
  *
  * What this cannot do is tell "my own transfer dropped five seconds ago" from
  * "my transfer dropped and another device has already taken over", because
@@ -140,19 +163,89 @@ function activeElsewhere(
   info: ResumeInfo,
   now: number,
   attempt?: AbortController,
+  click?: ResumeClick,
 ): boolean {
   // `attempt` is the caller's own controller, where the caller is the one
   // trying to start a transfer: `resumeUpload` registers it before it asks the
   // server anything, so without excluding it here every resume would count as
   // this tab already sending and the guard would never refuse.
   if (isSendingHere(row.id, attempt)) return false
-  const ownAndRecent =
-    row.ownerTab === currentTabId() &&
-    row.heartbeatAt !== undefined &&
-    now - row.heartbeatAt < OWN_STOP_GRACE_MS
-  if (ownAndRecent) return false
+  // Another tab of this browser is stamping it. The server's
+  // `last_activity_at` cannot say so: it records that bytes moved, and a tab
+  // that has just taken the upload up has not moved any yet. Read before the
+  // exemption below, because a row this tab sent until a moment ago may have
+  // been taken up by another tab since.
+  if (beatingInAnotherTab(row.id, now)) return true
+  if (ownAndRecentAt(row, now)) return false
+  // A Resume this tab queued waits for its turn, and nothing stamps the row
+  // while it waits, so judged at the turn a click made inside the grace was
+  // refused as soon as the wait outlasted it: the tab's own last parts read as
+  // somebody else's. It is judged as of the click instead, as it would have
+  // been with nothing ahead of it, and only if the server has seen nothing
+  // move since: a device that took the upload up during the wait has
+  // presigned, which moves `last_activity_at` past the click.
+  if (
+    click !== undefined &&
+    ownAndRecentAt(row, click.requestedAt) &&
+    !movedSinceClick(info, click)
+  ) {
+    return false
+  }
   const until = liveUntil(info.last_activity_at)
   return until !== undefined && now < until
+}
+
+/** Whether this tab stopped sending the row less than the grace before `at`. */
+function ownAndRecentAt(row: UploadFile, at: number): boolean {
+  return (
+    row.ownerTab === currentTabId() &&
+    row.heartbeatAt !== undefined &&
+    at - row.heartbeatAt < OWN_STOP_GRACE_MS
+  )
+}
+
+/** A queued Resume's click, and the `/parts` request its turn made, all on this browser's clock. */
+interface ResumeClick {
+  /** When the user clicked Resume. */
+  requestedAt: number
+  /** When the turn sent `GET /parts`. */
+  askedAt: number
+  /** How long `/parts` took to answer. */
+  rtt: number
+}
+
+/**
+ * Whether the server saw the upload move after the Resume click.
+ *
+ * `last_activity_at` is on the server's clock and the click on this one, and
+ * the two need not agree: a VM clock left behind by a host's sleep is off by
+ * minutes, and comparing the stamps directly would move the line between
+ * "before the click" and "after it" by that much. So two durations are
+ * compared, each read on one clock: how long before its answer the server last
+ * saw the upload move (`server_time - last_activity_at`), and how long before
+ * the answer arrived the click was (`askedAt - requestedAt + rtt`). The server
+ * may have read its clock at any moment of the round trip; counting the whole
+ * round trip takes the latest, where an activity after the click is hardest
+ * to see, so a doubt reads as moved.
+ *
+ * Anything missing or unreadable also reads as moved, which leaves the
+ * decision to `liveUntil` as before: an older server sends no `server_time`.
+ * Nothing on record means nothing moved.
+ *
+ * One case reads as moved that is not: a `/parts` of this tab's own that timed
+ * out here after the server, idle for `RESUME_TOUCH_INTERVAL` (5 min), had
+ * already recorded it as activity. The row goes `elsewhere` for the window,
+ * which is the safe way to be wrong, and it is rare.
+ */
+function movedSinceClick(info: ResumeInfo, click: ResumeClick): boolean {
+  if (!info.last_activity_at) return false
+  if (!info.server_time) return true
+  const moved = Date.parse(info.last_activity_at)
+  const serverNow = Date.parse(info.server_time)
+  if (Number.isNaN(moved) || Number.isNaN(serverNow)) return true
+  const sinceMoved = serverNow - moved
+  const sinceClick = click.askedAt - click.requestedAt + click.rtt
+  return sinceMoved < sinceClick
 }
 
 /** Until when an upload that last moved at `lastActivity` counts as running. */
@@ -165,7 +258,7 @@ function liveUntil(lastActivity: string | null | undefined): number | undefined 
 const ELSEWHERE_MESSAGE = 'Still uploading in another tab or on another device'
 
 /**
- * Parts in flight per upload.
+ * Parts in flight across the whole tab, however many files are uploading.
  *
  * Five hides the per-part presign round-trip without opening more sockets than
  * a browser grants one origin (HTTP/1.1 allows six, and the SSE stream holds
@@ -181,6 +274,24 @@ const UPLOAD_CONCURRENCY = (() => {
   if (!Number.isFinite(configured) || configured < 1) return 5
   return Math.min(Math.floor(configured), 16)
 })()
+
+/**
+ * The slots every part of every upload in this tab takes turns on. One budget,
+ * so three files uploading at once send as many parts between them as one file
+ * did alone, rather than three times as many.
+ */
+let partBudget = createPartBudget(UPLOAD_CONCURRENCY)
+
+let partRuns = 0
+/**
+ * The key one run of an upload goes by in `partBudget`. A row can run more than
+ * once -- a resume after a stop -- and a call left over from the earlier run
+ * must not count against the later one, so the key names the run, not the row.
+ */
+function partRunKey(rowId: string): string {
+  partRuns += 1
+  return `${rowId}:${partRuns}`
+}
 
 /**
  * A failure that repeating cannot fix — a 4xx from the storage backend means the
@@ -201,7 +312,10 @@ function isPermanentStatus(status: number): boolean {
   return status >= 400 && status < 500 && status !== 408 && status !== 429
 }
 
-/** Uploads one part exactly once. Returns its ETag. */
+/**
+ * Uploads one part exactly once. Returns its ETag. The caller holds a budget
+ * slot for the whole call.
+ */
 async function uploadPartOnce(
   file: File,
   s3Key: string,
@@ -211,6 +325,13 @@ async function uploadPartOnce(
   chunkSize: number,
   onBytes: (sent: number) => void,
 ): Promise<string> {
+  // A slot can be granted in the same turn as the upload stops: the grant is
+  // delivered on a microtask, and the abort that came first cannot take it back.
+  // Asking for a URL then would be a round trip for a part nothing will send.
+  if (controller.signal.aborted) {
+    throw new DOMException(`Part ${partNumber} cancelled`, 'AbortError')
+  }
+
   const start = (partNumber - 1) * chunkSize
   const chunk = file.slice(start, Math.min(start + chunkSize, file.size))
 
@@ -323,6 +444,14 @@ function putPart(
   })
 }
 
+/** Where a part takes its slots, and who hears that it got its first one. */
+interface PartSlots {
+  budget: PartBudget
+  fileKey: string
+  /** Runs once, when the part's first attempt is granted a slot. */
+  onFirstGrant?: () => void
+}
+
 /**
  * Uploads one part, retrying with exponential backoff and jitter.
  *
@@ -337,6 +466,24 @@ function putPart(
  *
  * Jitter keeps concurrent uploads from retrying in lockstep. A user-initiated
  * cancel is never retried.
+ *
+ * Every attempt holds a slot of the tab-wide budget from before its presign
+ * until it settles, and none is held during the backoff between attempts: a
+ * part waiting out a 2-minute rung would otherwise keep a slot that another
+ * file could be sending on. The order of the calls is the budget's contract
+ * (see lib/upload-budget.ts), and two of them are easy to break by moving a
+ * line, so they are written where they have to be:
+ *
+ * - `sleeping()` is called in the `catch` and `release()` in the `finally` of
+ *   the same attempt, so the part is counted asleep before its slot is free.
+ *   The budget grants on a microtask; a part that gave its slot back and said
+ *   it was asleep only a microtask later would let the grant pass hand the slot
+ *   to a fresh part of the same file, which is the retry storm the budget's cap
+ *   exists to stop.
+ * - `woke()` and the retry's `acquire()` follow each other with no `await`
+ *   between, so the pass sees the retry waiting when it sees the sleeper gone.
+ *   `woke()` runs however the sleep ended, a cancel included, because every
+ *   `sleeping()` has to be matched.
  */
 async function uploadPart(
   file: File,
@@ -346,33 +493,46 @@ async function uploadPart(
   controller: AbortController,
   chunkSize: number,
   onBytes: (sent: number) => void,
+  slots: PartSlots,
 ): Promise<string> {
+  const { budget, fileKey } = slots
+  const signal = controller.signal
   let lastError: unknown
 
-  for (let attempt = 1; attempt <= PART_MAX_ATTEMPTS; attempt++) {
+  // Rejects with an AbortError if the upload stops while this waits.
+  let release = await budget.acquire(fileKey, signal, 'fresh')
+
+  for (let attempt = 1; ; attempt++) {
     try {
+      // Inside the attempt, so the `finally` below gives the slot back even if
+      // the hook throws.
+      if (attempt === 1) slots.onFirstGrant?.()
       return await uploadPartOnce(file, s3Key, uploadId, partNumber, controller, chunkSize, onBytes)
     } catch (err) {
       // The next attempt sends the part from its first byte again, so what
       // this one got across no longer counts.
       onBytes(0)
-      if (controller.signal.aborted) throw err
-      if (err instanceof DOMException && err.name === 'AbortError') throw err
+      if (signal.aborted) throw err
+      if (isAbortError(err)) throw err
       if ((err as PartUploadError)?.permanent) throw err
+      if (attempt === PART_MAX_ATTEMPTS) throw err
 
       lastError = err
-      if (attempt === PART_MAX_ATTEMPTS) break
-
-      const delay = PART_RETRY_BASE_MS * 2 ** (attempt - 1) + Math.random() * 250
-      await delayUnlessAborted(delay, controller.signal)
-      // Waking early means the upload is over — the user cancelled, or a sibling
-      // part failed for good. Another attempt would spend a presign round-trip
-      // and 10 MB of uplink on a part nothing will ever complete.
-      if (controller.signal.aborted) break
+      // Before `release()` below, in this same synchronous run. See above.
+      budget.sleeping(fileKey)
+    } finally {
+      release()
     }
-  }
 
-  throw lastError
+    const delay = PART_RETRY_BASE_MS * 2 ** (attempt - 1) + Math.random() * 250
+    await delayUnlessAborted(delay, signal)
+    budget.woke(fileKey)
+    // Waking early means the upload is over — the user cancelled, or a sibling
+    // part failed for good. Another attempt would spend a presign round-trip
+    // and 10 MB of uplink on a part nothing will ever complete.
+    if (signal.aborted) throw lastError
+    release = await budget.acquire(fileKey, signal, 'retry')
+  }
 }
 
 /**
@@ -404,16 +564,32 @@ function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
  * Uploads every part of a multipart upload and returns the part list for
  * /upload/complete. Exported for tests.
  *
- * Parts are sent by a small pool of workers rather than strictly one after the
+ * Several parts are in flight at once rather than strictly one after the
  * other. A single PUT does not saturate a connection — most of a sequential
  * upload is spent waiting on round-trips — so a handful in flight multiplies
  * throughput on exactly the long-haul links where large uploads hurt most.
+ *
+ * How many is not this upload's to decide. Every attempt at a part takes a slot
+ * from `opts.budget`, which every upload in the tab shares, before it asks for
+ * a presigned URL, and gives it back when the attempt settles; the budget also
+ * decides which file a free slot goes to (see lib/upload-budget.ts). This
+ * function keeps up to `budget.size` of its parts asking for their first slot,
+ * enough to take every slot the budget offers it at once, without queueing a
+ * request for each of the thousands of parts a large file can have.
+ *
+ * `opts.fileKey` names this run to the budget. It must be unique to the run,
+ * not just to the row -- the store uses `${rowId}:${n}`, with `n` counting runs
+ * -- so that a late call from a run that has ended can never land on a new run
+ * of the same row. The key is forgotten when this returns, for whatever reason,
+ * and not before: only once every attempt has settled and every part asleep in
+ * backoff has woken, because forgetting a key treats its slots as free, and a
+ * part still waiting on its presign is still using one.
  *
  * Ordering is preserved by writing each result to its own index: parts finish
  * out of order, but `parts` is indexed by part number, and progress counts
  * bytes sent rather than the highest number seen.
  *
- * When a part finally fails the whole upload is lost, so the other workers are
+ * When a part finally fails the whole upload is lost, so the other parts are
  * stopped rather than left to run their own retry ladders out: every error after
  * the first is discarded anyway, so cancelling them costs nothing and turns a
  * four-minute wait for an error that has already happened into an immediate one.
@@ -429,6 +605,12 @@ function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
  * heartbeat from #312, not a progress report: `onProgress` only fires when the
  * percent moves, and on a large file that can be many minutes apart, longer
  * than the window another tab gives a row before it offers Discard.
+ *
+ * `opts.onUnfinished` hears how many parts are not finished yet: waiting for a
+ * slot, in flight, or asleep in backoff. Held parts are finished. It is called
+ * once at the start and then each time a part finishes, which is every time
+ * the count changes; the queue reads it to judge how much of the budget this
+ * upload can still use.
  *
  * `opts.onAllSent` runs when the browser has handed over the file's last byte.
  * That is not the end of the transfer: each part still waits for storage to
@@ -449,30 +631,37 @@ export async function uploadAllParts(
   uploadId: string,
   controller: AbortController,
   onProgress: (percent: number) => void,
-  concurrency: number = UPLOAD_CONCURRENCY,
-  opts?: {
+  opts: {
+    budget: PartBudget
+    fileKey: string
     chunkSize?: number
     alreadyHeld?: readonly number[]
     onPartDone?: () => void
+    onUnfinished?: (n: number) => void
     onAllSent?: () => void
     onResend?: () => void
     onBytes?: (sent: number) => void
   },
 ): Promise<Array<{ PartNumber: number; ETag: string }>> {
-  const chunkSize = opts?.chunkSize ?? CHUNK_SIZE
-  const held = new Set(opts?.alreadyHeld ?? [])
+  const { budget, fileKey } = opts
+  const chunkSize = opts.chunkSize ?? CHUNK_SIZE
+  const held = new Set(opts.alreadyHeld ?? [])
   const totalChunks = Math.ceil(file.size / chunkSize)
   const parts: Array<{ PartNumber: number; ETag: string }> = new Array(totalChunks)
+  const toSend: number[] = []
+  for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
+    if (!held.has(partNumber)) toSend.push(partNumber)
+  }
 
-  // Workers run against their own signal, so a part failing for good can stop
+  // Parts run against their own signal, so a part failing for good can stop
   // its siblings without being mistaken for a user cancel: `controller` keeps
   // meaning "the user pressed Cancel", `pool` means "stop, for any reason".
+  // A part waiting for a slot is turned away by the same signal.
   const pool = new AbortController()
   const stopPool = () => pool.abort()
   if (controller.signal.aborted) stopPool()
   else controller.signal.addEventListener('abort', stopPool, { once: true })
 
-  let nextIndex = 0
   // Parts the backend already holds are done before this starts, and progress
   // has to say so: a resume that reports 0% and then jumps is indistinguishable
   // from one that is re-sending everything. They are a set, not a prefix, so
@@ -484,7 +673,6 @@ export async function uploadAllParts(
   held.forEach((partNumber) => {
     doneBytes += partLength(partNumber)
   })
-  let firstError: unknown = null
 
   // Progress is counted in bytes, so the bar moves while a part is in flight
   // rather than once per finished part, which on a slow uplink is minutes.
@@ -508,12 +696,12 @@ export async function uploadAllParts(
     // Before onBytes, so the drop is the first count a restarted meter sees.
     if (allSent && sent < file.size) {
       allSent = false
-      opts?.onResend?.()
+      opts.onResend?.()
     }
-    opts?.onBytes?.(sent)
+    opts.onBytes?.(sent)
     if (!allSent && sent >= file.size) {
       allSent = true
-      opts?.onAllSent?.()
+      opts.onAllSent?.()
     }
     const percent = Math.min(95, Math.round((sent / file.size) * 95))
     if (percent <= reported) return
@@ -522,57 +710,102 @@ export async function uploadAllParts(
   }
   if (doneBytes > 0) report()
 
-  async function worker(): Promise<void> {
-    while (true) {
-      if (controller.signal.aborted) {
-        throw new DOMException('Upload cancelled', 'AbortError')
-      }
-      if (firstError) return // another worker failed; stop taking new parts
+  let unfinished = toSend.length
+  opts.onUnfinished?.(unfinished)
 
-      const index = nextIndex++
-      if (index >= totalChunks) return
+  // The first error a part raised, and every error a part raised: a flag
+  // rather than `firstError !== null`, so a falsy rejection still counts.
+  let failed = false
+  let firstError: unknown = null
+  const raised: unknown[] = []
 
-      const partNumber = index + 1
-      if (held.has(partNumber)) continue
-      try {
-        const etag = await uploadPart(file, s3Key, uploadId, partNumber, pool, chunkSize, (sent) => {
+  let nextToSend = 0
+  /** Parts asking for their first slot. */
+  let waitingFirst = 0
+  /** Parts started and not yet settled, in any state: waiting, in flight, asleep. */
+  let running = 0
+  let allSettled!: () => void
+  const settled = new Promise<void>((resolve) => {
+    allSettled = resolve
+  })
+
+  // Tops the parts asking for a first slot back up to the budget's size, and
+  // says when there is nothing left to wait for. A part starts only here, so
+  // with none running after this, none ever will be.
+  function startParts() {
+    while (
+      !pool.signal.aborted &&
+      !failed &&
+      waitingFirst < budget.size &&
+      nextToSend < toSend.length
+    ) {
+      void sendPart(toSend[nextToSend++])
+    }
+    if (running === 0) allSettled()
+  }
+
+  async function sendPart(partNumber: number): Promise<void> {
+    running += 1
+    waitingFirst += 1
+    let granted = false
+    try {
+      const etag = await uploadPart(
+        file, s3Key, uploadId, partNumber, pool, chunkSize,
+        (sent) => {
           inFlightBytes.set(partNumber, sent)
           report()
-        })
-        parts[index] = { PartNumber: partNumber, ETag: etag }
-        inFlightBytes.delete(partNumber)
-        doneBytes += partLength(partNumber)
-        opts?.onPartDone?.()
-        report()
-      } catch (err) {
-        // Not `??=`: an error is only ever recorded once, since every worker
-        // returns immediately after, and assigning plainly means a falsy
-        // rejection can never leave `firstError` unset while a part is missing.
-        if (firstError === null) firstError = err
-        stopPool()
-        return
+        },
+        {
+          budget,
+          fileKey,
+          onFirstGrant: () => {
+            granted = true
+            waitingFirst -= 1
+            startParts()
+          },
+        },
+      )
+      parts[partNumber - 1] = { PartNumber: partNumber, ETag: etag }
+      inFlightBytes.delete(partNumber)
+      doneBytes += partLength(partNumber)
+      unfinished -= 1
+      opts.onUnfinished?.(unfinished)
+      opts.onPartDone?.()
+      report()
+    } catch (err) {
+      if (!granted) {
+        waitingFirst -= 1
+        // Turned away while it waited for its first slot, because the upload
+        // had already stopped. Nothing of it was sent, and the reason is
+        // whatever stopped the upload, not this.
+        if (isAbortError(err)) return
       }
+      raised.push(err)
+      if (!failed) {
+        failed = true
+        firstError = err
+      }
+      stopPool()
+    } finally {
+      running -= 1
+      startParts()
     }
   }
 
   try {
-    const workerCount = Math.max(1, Math.min(concurrency, totalChunks))
-    const results = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()))
+    startParts()
+    await settled
 
     // A user cancel outranks whatever errors it caused in the parts it
     // interrupted, so it is resolved before `firstError` rather than after —
     // otherwise cancelling shows the row flipping from Cancelled back to Failed.
     // The abort error a part actually raised is preferred over a synthesized
     // one, so its reason survives; the fallback covers a cancel that landed
-    // between parts, where no request was in flight to reject.
+    // while no part was in flight to reject.
     if (controller.signal.aborted) {
-      const raised = [firstError, ...results.map((r) => (r.status === 'rejected' ? r.reason : null))]
       throw raised.find(isAbortError) ?? new DOMException('Upload cancelled', 'AbortError')
     }
-    if (firstError !== null) throw firstError
-
-    const rejected = results.find((r) => r.status === 'rejected')
-    if (rejected && rejected.status === 'rejected') throw rejected.reason
+    if (failed) throw firstError
 
     // Dense, because a skipped part leaves its slot empty and a sparse array
     // serialises as nulls. On a resume this is therefore what was sent now, not
@@ -581,6 +814,16 @@ export async function uploadAllParts(
     return parts.filter(Boolean)
   } finally {
     controller.signal.removeEventListener('abort', stopPool)
+    // Every part has settled by now (`settled` waits for the last of them), so
+    // no slot of this run is still in use and no part is still asleep.
+    budget.forget(fileKey)
+    // And none will be sent: a run that stopped part-way leaves parts it never
+    // finished, but it is not going to use the budget for them. Said, so the
+    // queue does not go on counting them while the row settles.
+    if (unfinished !== 0) {
+      unfinished = 0
+      opts.onUnfinished?.(0)
+    }
   }
 }
 
@@ -657,6 +900,22 @@ if (typeof document !== 'undefined') {
 }
 
 /**
+ * Where a row stands. The queue's states (spec "Row lifecycle") are encoded as a
+ * status plus flags, so every place that already branches on status keeps
+ * working for the states it knew:
+ *
+ * - `queued`: added, never initiated, nothing on the server. In memory only:
+ *   it holds the `File`, which a reload cannot bring back. With `holdReason` it
+ *   is the hold's probe, waiting to try its initiate again.
+ * - `starting`: its turn has come and an initiate is out (no `versionId` yet),
+ *   or, with `resuming`, a resume whose turn has come and whose `/parts` call
+ *   is out.
+ * - `interrupted` with `queuedResume`: the user clicked Resume and it waits for
+ *   its turn. Saved as plain `interrupted`. With `holdReason` it is the probe.
+ * - `uploading`: sending, or with `finalizing`, waiting on storage.
+ * - `failed` with `failedBeforeStart`: refused before anything was created.
+ *   `retryable` offers Retry while this tab still holds the `File`.
+ *
  * `interrupted` is a transfer that stopped without the user asking it to.
  *
  * It is deliberately not `failed`: the multipart upload is still open and every
@@ -667,8 +926,8 @@ if (typeof document !== 'undefined') {
  * progress it is not making.
  */
 export type UploadStatus =
-  | 'pending' | 'uploading' | 'processing' | 'complete' | 'failed' | 'cancelled' | 'interrupted'
-  | 'elsewhere'
+  | 'queued' | 'starting' | 'uploading' | 'processing' | 'complete' | 'failed' | 'cancelled'
+  | 'interrupted' | 'elsewhere'
 
 export interface UploadFile {
   id: string
@@ -696,6 +955,12 @@ export interface UploadFile {
    */
   s3Key?: string
   createdAt: number // timestamp for grouping
+  /**
+   * The account that added the row: the access token's `sub` when it was
+   * added. Views and starts are scoped to it (spec goal 9); until that lands
+   * it is recorded by tests only.
+   */
+  ownerId?: string
   /** The tab that is transferring this row, see `currentTabId`. */
   ownerTab?: string
   /** When that tab last said it still is, see `HEARTBEAT_MS`. */
@@ -729,6 +994,44 @@ export interface UploadFile {
    * status, so a stale value on any other is inert.
    */
   finalizing?: boolean
+  /** One per drop or pick, and per Resume or Retry. A counter, never a time. */
+  dropSeq?: number
+  /** The row's place in the queue when it was last enqueued; orders rows within a drop. */
+  queueSeq?: number
+  /** On the hold's probe row only: why the queue is waiting. Never saved. */
+  holdReason?: 'connection' | 'storage'
+  /** An `interrupted` row the user resumed, waiting for its turn. Never saved. */
+  queuedResume?: true
+  /** A `starting` row that is a resume rather than a new upload. Never saved. */
+  resuming?: true
+  /** Refused before anything was created on the server. */
+  failedBeforeStart?: true
+  /** A `failedBeforeStart` row this tab can start again. Never saved: the `File` is not. */
+  retryable?: boolean
+  /**
+   * A Discard of this row could not finish, and the row was kept saying why.
+   * The panel then offers Dismiss as well as Discard: a Discard that keeps
+   * failing (storage down, an abort the server keeps refusing) must not leave
+   * a row that can neither be resumed nor removed. Cleared when a Resume takes
+   * the row up.
+   */
+  discardFailed?: true
+}
+
+/**
+ * A row that is on its way without another click: waiting for its turn (a new
+ * file, or a resume the user asked for), starting, sending, or being processed.
+ * The sidebar's badge counts exactly these; the panel's Active tab adds the rows
+ * another tab is sending.
+ *
+ * A resume waiting for its turn is `interrupted` as far as storage and the
+ * server are concerned, which is why it needs saying here.
+ */
+export function isOnItsWay(f: UploadFile): boolean {
+  return (
+    f.status === 'queued' || f.status === 'starting' || f.status === 'uploading' ||
+    f.status === 'processing' || (f.status === 'interrupted' && f.queuedResume === true)
+  )
 }
 
 /** POST /upload/initiate and POST /assets/{id}/versions — both answer with this.
@@ -762,6 +1065,8 @@ interface ResumeInfo {
   held_part_numbers: number[]
   /** When the upload last moved before this request; see `activeElsewhere`. */
   last_activity_at?: string | null
+  /** The server's clock as it answered; see `movedSinceClick`. Absent from an older server. */
+  server_time?: string | null
 }
 
 /**
@@ -868,6 +1173,13 @@ interface UploadStore {
    *  A counter and not a timestamp: two discards inside one millisecond are a
    *  real thing, and `Date.now()` reports them as no change at all. */
   versionsRevision: number
+  /**
+   * Bumped when a run ends and when a Discard starts or ends, and for nothing
+   * else. `canResume` reads those (the runs, the Discards in flight), which no
+   * row field mirrors, so a view that selects `canResume(id)` is only told it
+   * changed when something is set; this is that something. Never saved.
+   */
+  runsRevision: number
   panelOpen: boolean
   historyLoaded: boolean
   historyHasMore: boolean
@@ -875,12 +1187,35 @@ interface UploadStore {
   historySkip: number
   setPanelOpen: (open: boolean) => void
   togglePanel: () => void
+  /**
+   * Adds one file to the back of the upload queue as its own drop, and returns
+   * its row id. It starts at its turn, which is at once only when the start
+   * rule allows it at that moment.
+   */
   startUpload: (file: File, projectId: string, assetName: string, projectName?: string, folderId?: string | null) => string
+  /** The same for a new version of `assetId`. */
   startVersionUpload: (file: File, assetId: string, assetName: string, projectId: string, projectName?: string) => string
+  /** Adds a whole drop or pick, in order, as one drop. Returns the row ids in the order given. */
+  startUploads: (items: Array<{ file: File; assetName: string }>, projectId: string, projectName?: string, folderId?: string | null) => string[]
+  /** Queues an interrupted row to carry on with `file`, ahead of every file not yet started. */
   resumeUpload: (fileId: string, file: File) => void
   /** Resolves to a message saying why nothing was discarded, or null. */
   discardUpload: (fileId: string) => Promise<string | null>
+  /**
+   * Cancels a row by where it stands (spec, "Row lifecycle"): one not yet
+   * started leaves the list; one whose initiate is out is thrown away when it
+   * answers; a resume that has sent nothing goes back to plain `interrupted`;
+   * one already sending is aborted and discarded.
+   */
   cancelUpload: (fileId: string) => void
+  /** Cancels every row still waiting for its turn, never one whose turn has begun. */
+  cancelAllQueued: () => void
+  /** Puts a refused row back in the queue, next, while this tab still holds its `File`. */
+  retryUpload: (fileId: string) => void
+  /** Whether `retryUpload` would start this row again. */
+  canRetry: (fileId: string) => boolean
+  /** Whether `resumeUpload` would take this row up now; the panel offers Resume only then. */
+  canResume: (fileId: string) => boolean
   /** Rename the asset a row is uploading. Resolves to an error message, or
    *  null when the new name is stored. */
   renameUpload: (fileId: string, name: string) => Promise<string | null>
@@ -1032,7 +1367,7 @@ function reportDiscardFailure(
 ): string {
   const message = err instanceof Error ? err.message : 'Discard failed'
   set((s) => ({
-    files: s.files.map((f) => (f.id === fileId ? { ...f, error: message } : f)),
+    files: s.files.map((f) => (f.id === fileId ? { ...f, error: message, discardFailed: true as const } : f)),
     versionsRevision: s.versionsRevision + 1,
   }))
   return message
@@ -1056,9 +1391,837 @@ async function abortCancelled(
   set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
 }
 
+// ─── The queue ────────────────────────────────────────────────────────────────
+//
+// Every file dropped, picked or resumed in this tab waits here for its turn, and
+// a file's turn is when it may touch the server (spec goals 1-4): until then it
+// has no initiate, no heartbeat, no speed meter, no abort controller and no
+// wake lock. `lib/upload-queue.ts` decides who is next; this section owns the
+// files, the timers and the runs.
+
+/** The tab-wide queue. A `let` only so tests can start from an empty one. */
+let queue = createUploadQueue()
+
+/**
+ * One running file: from its turn (`startRun`) until its run's `finally`.
+ *
+ * This, and never a row's status, is the active set the start rule counts
+ * (`activeInfos`). A cancelled row says `cancelled` at once while its run is
+ * still settling -- an initiate still out may yet have created an upload that
+ * has to be thrown away -- and it still uses a place until it has.
+ */
+interface Runner {
+  sizeBytes: number
+  /** Parts not yet finished; 'unknown' until the initiate or `/parts` answers. */
+  unfinished: number | 'unknown'
+  /** Cancelled while its initiate was out: the row leaves the list once the run has settled. */
+  removeWhenSettled?: true
+  /** A resume cancelled while it asked `/parts`: it sends nothing and aborts nothing. */
+  stoodDown?: true
+}
+
+const runners = new Map<string, Runner>()
+
+/** The `File` behind every row that may still start: queued, held, a queued resume, or refused with Retry. */
+const fileRefs = new Map<string, File>()
+
+/** Where a new upload goes: a new asset (in a folder, or the project root), or a new version of an asset. */
+type StartTarget = { kind: 'asset'; folderId: string | null } | { kind: 'version'; assetId: string }
+const startTargets = new Map<string, StartTarget>()
+
+/**
+ * The hold probe's retry. One at a time, since there is one probe; kept here so
+ * that whatever takes the probe away (a cancel, a discard) can clear it.
+ */
+let probeTimer: ReturnType<typeof setTimeout> | null = null
+
+let dropSeqs = 0
+
+/**
+ * Rows whose Discard is waiting on the server, counted per call. A Resume of
+ * one would start sending into the upload the Discard is about to abort.
+ */
+const discarding = new Map<string, number>()
+
+/**
+ * When the user clicked Resume in this tab, for a row whose resume is waiting
+ * for its turn. Tab memory, like the `File`: a reload ends the wait anyway.
+ * `activeElsewhere` judges the tab's own grace from it; see there.
+ */
+const resumeRequestedAt = new Map<string, number>()
+
+/** A row refused before it started, whose `File` this tab still holds. */
+function retryable(row: UploadFile): boolean {
+  return row.status === 'failed' && row.failedBeforeStart === true && row.retryable === true && fileRefs.has(row.id)
+}
+
+/**
+ * Whether a Resume of this row would be taken up now: it is a stopped upload
+ * with a version to come back to, it is not already waiting for its turn, no
+ * run of it is still settling, and no Discard of it is out. The one definition
+ * `resumeUpload` refuses on and the panel's `canResume` offers on.
+ */
+function resumableNow(row: UploadFile | undefined): row is UploadFile {
+  return (
+    row !== undefined && row.status === 'interrupted' && !!row.versionId && !row.queuedResume &&
+    !runners.has(row.id) && !discarding.has(row.id)
+  )
+}
+
+/** Tells every view of `canResume` to look again; see `UploadStore.runsRevision`. */
+function noteRunsChanged(): void {
+  useUploadStore.setState((s) => ({ runsRevision: s.runsRevision + 1 }))
+}
+
+/** A row id. Two drops of the same `File` are two rows. */
+const newRowId = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+const REFUSED_MESSAGE = 'The server refused this upload.'
+
+function rowById(id: string): UploadFile | undefined {
+  return useUploadStore.getState().files.find((f) => f.id === id)
+}
+
+function patchRow(id: string, patch: Partial<UploadFile>): void {
+  useUploadStore.setState((s) => ({
+    files: s.files.map((f) => (f.id === id ? { ...f, ...patch } : f)),
+  }))
+}
+
+function activeInfos(): ActiveInfo[] {
+  return Array.from(runners.entries(), ([id, r]) => ({ id, sizeBytes: r.sizeBytes, unfinishedParts: r.unfinished }))
+}
+
+/** What kind of run a row would start now, or null when it is no longer waiting for one. */
+function turnKind(row: UploadFile | undefined): 'new' | 'resume' | null {
+  if (!row || !fileRefs.has(row.id)) return null
+  if (row.status === 'queued') return 'new'
+  if (row.status === 'interrupted' && row.queuedResume && row.versionId) return 'resume'
+  return null
+}
+
+function queueEntry(row: UploadFile, kind: 'new' | 'resume'): QueueEntry {
+  return {
+    id: row.id,
+    kind,
+    sizeBytes: fileRefs.get(row.id)?.size ?? row.fileSize,
+    ownerId: row.ownerId ?? '',
+  }
+}
+
+let pumping = false
+let pumpAgain = false
+
+/**
+ * Starts every waiting row the start rule allows now. Called on every change
+ * that can allow one (spec goal 2): a row added, a part finished, a run ended,
+ * an initiate or `/parts` answer, a hold ended.
+ *
+ * Re-entrant calls are folded into the running one, so a run that ends inside
+ * a start cannot start the same row twice.
+ */
+function pump(): void {
+  if (pumping) {
+    pumpAgain = true
+    return
+  }
+  pumping = true
+  try {
+    do {
+      pumpAgain = false
+      for (;;) {
+        const ids = queue.nextToStart(activeInfos(), partBudget.size)
+        if (ids.length === 0) break
+        let skipped = false
+        for (const id of ids) {
+          const row = rowById(id)
+          const kind = turnKind(row)
+          if (!row || !kind) {
+            // Gone, cancelled or already changed by something else: it gives up its place.
+            queue.remove(id)
+            skipped = true
+            continue
+          }
+          startRun(row, kind)
+        }
+        // A row that gave up its place may have left room for the next one.
+        if (!skipped) break
+      }
+    } while (pumpAgain)
+  } finally {
+    pumping = false
+  }
+}
+
+/** A row's turn: it leaves the waiting list, becomes active, and its run begins. */
+function startRun(row: UploadFile, kind: 'new' | 'resume'): void {
+  const rank = queue.markStarted(row.id)
+  const runKey = partRunKey(row.id)
+  const runner: Runner = { sizeBytes: fileRefs.get(row.id)?.size ?? row.fileSize, unfinished: 'unknown' }
+  runners.set(row.id, runner)
+  // On the key `uploadAllParts` will use, so this run's parts are served in turn order.
+  partBudget.setRank(runKey, rank)
+  // A run settles its own failures and always ends through `endRun`; anything
+  // still thrown is a bug, and is reported rather than left unhandled.
+  const run = kind === 'new' ? runNew(row.id, runner, runKey) : runResume(row.id, runner, runKey)
+  run.catch((err: unknown) => console.error('Upload run ended with an error', err))
+}
+
+/** What every run does as it ends, however it ends. */
+function endRun(id: string, runner: Runner, runKey: string): void {
+  // A run that never reached its parts left only its rank behind.
+  partBudget.forget(runKey)
+  if (runners.get(id) === runner) runners.delete(id)
+  noteRunsChanged()
+  // Cancelled while starting: whatever the initiate created has been thrown
+  // away by now, so there is nothing left for the row to say.
+  if (runner.removeWhenSettled) {
+    useUploadStore.setState((s) => ({ files: s.files.filter((f) => f.id !== id) }))
+  }
+  const row = rowById(id)
+  // The hold's probe ended without a turn to come back to and without passing
+  // the role on: its run threw something no branch of it settles (a refused
+  // save, say). Nothing would ever try again, and `nextToStart` starts nothing
+  // while a probe is set, so the role passes on here, to the next waiting row.
+  if (queue.hold.probeId === id && turnKind(row) === null) passOnProbe()
+  const stillWaiting = turnKind(row) !== null || queue.hold.probeId === id
+  if (!stillWaiting && !row?.retryable) {
+    fileRefs.delete(id)
+    startTargets.delete(id)
+  }
+  pump()
+}
+
+function scheduleProbe(id: string): void {
+  if (probeTimer !== null) clearTimeout(probeTimer)
+  probeTimer = setTimeout(() => {
+    probeTimer = null
+    retryProbe(id)
+  }, queue.hold.nextDelayMs())
+}
+
+function retryProbe(id: string): void {
+  if (queue.hold.probeId !== id) return
+  const row = rowById(id)
+  const kind = turnKind(row)
+  if (!row || !kind) {
+    passOnProbe()
+    return
+  }
+  startRun(row, kind)
+}
+
+/**
+ * The probe can no longer try (it was cancelled or removed): the role, and the
+ * wait it was on, pass to the next waiting row, or the hold ends when none is
+ * waiting.
+ */
+function passOnProbe(): void {
+  if (probeTimer !== null) {
+    clearTimeout(probeTimer)
+    probeTimer = null
+  }
+  const next = queue.hold.handOff()
+  if (next === null) {
+    queue.hold.end()
+    pump()
+    return
+  }
+  const reason = queue.hold.reason ?? 'connection'
+  patchRow(next, { holdReason: reason })
+  scheduleProbe(next)
+}
+
+/** A row the user no longer wants started: out of the queue, and out of the probe role if it held it. */
+function forgetQueued(id: string): void {
+  queue.remove(id)
+  if (queue.hold.probeId === id && !runners.has(id)) passOnProbe()
+}
+
+/** Any answer that is not a hold means the way to the server is open again. */
+function endHoldIfProbe(id: string): void {
+  if (queue.hold.probeId !== id) return
+  if (probeTimer !== null) {
+    clearTimeout(probeTimer)
+    probeTimer = null
+  }
+  queue.hold.end()
+}
+
+/**
+ * The connection or storage is down. The row goes back to waiting: as the
+ * probe, which alone tries again, or, when another row already is the probe,
+ * first in line behind it. A resume goes back to being a queued resume, never
+ * to `queued`: it has an upload on the server to come back to.
+ */
+function holdRow(
+  id: string,
+  kind: 'new' | 'resume',
+  reason: 'connection' | 'storage',
+  retryAfterMs: number | undefined,
+): void {
+  const row = rowById(id)
+  if (!row) return
+  const waiting: Partial<UploadFile> = kind === 'new'
+    ? { status: 'queued', progress: 0 }
+    : { status: 'interrupted', queuedResume: true, resuming: undefined, progress: 0 }
+  if (queue.hold.begin(id, reason, retryAfterMs)) {
+    patchRow(id, { ...waiting, holdReason: reason })
+    scheduleProbe(id)
+  } else {
+    queue.enqueue([queueEntry(row, kind)], 'next')
+    patchRow(id, { ...waiting, holdReason: undefined, queueSeq: queue.queueSeq(id) })
+  }
+}
+
+/** The reason a refused row shows. */
+function refusalMessage(outcome: InitiateOutcome, err: unknown): string {
+  const said =
+    outcome.kind === 'refusal' || outcome.kind === 'storage_misconfigured'
+      ? outcome.message
+      : err instanceof ApiError
+        ? err.detail
+        : ''
+  return said.trim() === '' ? REFUSED_MESSAGE : said
+}
+
+/**
+ * An initiate failed. A refusal fails this row, with Retry, and the queue goes
+ * on; a hold puts it back to wait for the connection or storage (spec goal 6).
+ * The account outcomes are refusals until owner pinning lands.
+ */
+function onInitiateFailed(id: string, err: unknown): void {
+  const row = rowById(id)
+  const wasProbe = queue.hold.probeId === id
+  // The user's cancel outranks whatever the server said; the row stays cancelled.
+  if (!row || row.status === 'cancelled') {
+    if (wasProbe) {
+      const outcome = classifyInitiateError(err)
+      if (outcome.kind === 'hold') passOnProbe()
+      else endHoldIfProbe(id)
+    }
+    return
+  }
+
+  const outcome = classifyInitiateError(err)
+  if (outcome.kind === 'hold') {
+    // Nothing on screen says what a non-API failure was; a bug here would
+    // otherwise hold the queue with no trace. Once per row, not per retry.
+    if (!(err instanceof ApiError) && !wasProbe) {
+      console.warn('Upload could not start; waiting for the connection.', err)
+    }
+    holdRow(id, 'new', outcome.reason, outcome.retryAfterMs)
+    return
+  }
+
+  endHoldIfProbe(id)
+  patchRow(id, {
+    status: 'failed',
+    failedBeforeStart: true,
+    retryable: true,
+    holdReason: undefined,
+    progress: 0,
+    error: refusalMessage(outcome, err),
+  })
+}
+
+/**
+ * A new upload's turn: initiate (or create the version), then send every part
+ * and complete. Everything that announces a transfer starts here, at the turn,
+ * and not when the row was added.
+ */
+async function runNew(id: string, runner: Runner, runKey: string): Promise<void> {
+  const file = fileRefs.get(id)!
+  const target: StartTarget = startTargets.get(id) ?? { kind: 'asset', folderId: null }
+
+  const controller = new AbortController()
+  abortControllers[id] = controller
+
+  // Track initiate response fields so catch block can call /upload/abort,
+  // and ask the server what became of the version before it does.
+  let upload_id: string | undefined
+  let s3_key: string | undefined
+  let version_id: string | undefined
+  let asset_id: string | undefined
+  let completionAttempted = false
+
+  // Everything the run takes is taken inside the `try`, so the `finally` gives
+  // it all back and ends the run whatever throws. Even the first heartbeat is a
+  // write to shared storage, which can throw (a full quota), and a run that
+  // threw before its `try` kept its place, its wake lock and, for a large file,
+  // the whole part budget for the life of the tab.
+  let stopBeat = () => {}
+  let watch: ReturnType<typeof transferWatch> | null = null
+  try {
+    retainWakeLock()
+    stopBeat = beatFor((patch) => patchRow(id, patch))
+    const runWatch = transferWatch(id, file.size, (patch) => patchRow(id, patch))
+    watch = runWatch
+    patchRow(id, { status: 'starting', holdReason: undefined, error: undefined, progress: 0 })
+
+    // What the asset will be called: the row's name now, at the turn, so a
+    // rename made while it waited is the name it is created with.
+    const startRow = rowById(id)
+    const sentName = startRow?.assetName ?? file.name
+    const projectId = startRow?.projectId ?? ''
+
+    let initRes: InitiateResponse
+    try {
+      initRes = target.kind === 'asset'
+        ? await api.post<InitiateResponse>('/upload/initiate', {
+          project_id: projectId,
+          asset_name: sentName,
+          original_filename: file.name,
+          file_size_bytes: file.size,
+          mime_type: file.type,
+          folder_id: target.folderId,
+        })
+        : await api.post<VersionInitiateResponse>(`/assets/${target.assetId}/versions`, {
+          project_id: projectId,
+          asset_name: sentName,
+          original_filename: file.name,
+          file_size_bytes: file.size,
+          mime_type: file.type,
+        })
+    } catch (err) {
+      onInitiateFailed(id, err)
+      return
+    }
+    endHoldIfProbe(id)
+
+    upload_id = initRes.upload_id
+    s3_key = initRes.s3_key
+    version_id = initRes.version_id
+    asset_id = target.kind === 'asset' ? initRes.asset_id : target.assetId
+
+    // Now the server has said how the file is cut, and the start rule can
+    // count this file by its parts instead of by the whole budget.
+    runner.unfinished = Math.ceil(file.size / initRes.chunk_size_bytes)
+    const cancelled = controller.signal.aborted
+    patchRow(id, {
+      uploadId: upload_id, s3Key: s3_key, assetId: asset_id, versionId: version_id,
+      // A cancel made while the initiate was out stands.
+      ...(cancelled ? {} : { status: 'uploading' as const }),
+    })
+    // A new version exists on the server from this answer, and a screen
+    // showing the asset's versions is told now rather than guessing at when.
+    if (target.kind === 'version') {
+      useUploadStore.setState((s) => ({ versionsRevision: s.versionsRevision + 1 }))
+    }
+    pump()
+    // Cancelled while the initiate was out: what it created is thrown away below.
+    if (cancelled) throw new DOMException('Upload cancelled', 'AbortError')
+
+    if (target.kind === 'asset') {
+      // The round trip is the window that does exist, and the only place a
+      // rename can be lost: the panel offers the pencil from the moment the
+      // row appears, so an edit during it went into the row while the request
+      // carrying the old name had already left. Now that the asset exists it
+      // can be told. Failing here must not fail the upload -- the bytes are
+      // the point.
+      //
+      // It must not be swallowed either. The row is put back to the name the
+      // asset actually has and the reason is recorded on it, the way the
+      // interactive rename path does. Keeping the refused name would leave
+      // the row disagreeing with the asset, the grid, search and the share
+      // link for the rest of the session -- and would also block the retry,
+      // since `renameUpload` returns early when the typed name equals the
+      // one already in the row.
+      const nameAfterInitiate = rowById(id)?.assetName ?? sentName
+      if (nameAfterInitiate !== sentName) {
+        try {
+          await api.patch(`/assets/${asset_id}`, { name: nameAfterInitiate })
+        } catch (err) {
+          patchRow(id, {
+            assetName: sentName,
+            renameError: err instanceof Error ? err.message : 'Rename failed',
+          })
+        }
+      }
+    }
+
+    const parts = await uploadAllParts(
+      file, s3_key, upload_id, controller,
+      (percent) => patchRow(id, { progress: percent, heartbeatAt: Date.now() }),
+      {
+        budget: partBudget,
+        fileKey: runKey,
+        chunkSize: initRes.chunk_size_bytes,
+        onPartDone: () => patchRow(id, { heartbeatAt: Date.now() }),
+        onUnfinished: (n) => {
+          runner.unfinished = n
+          pump()
+        },
+        onBytes: runWatch.onBytes,
+        onAllSent: runWatch.onAllSent,
+        onResend: runWatch.onResend,
+      },
+    )
+
+    completionAttempted = true
+    patchRow(id, { finalizing: true })
+    await api.post('/upload/complete', {
+      s3_key,
+      upload_id,
+      asset_id,
+      version_id,
+      parts,
+    })
+
+    // Upload done — backend now processes (transcode/convert).
+    // For non-processable types (or if SSE isn't wired), mark complete directly.
+    const isMedia = file.type.startsWith('video/') || file.type.startsWith('audio/') || file.type.startsWith('image/')
+    patchRow(id, isMedia
+      ? { progress: 100, status: 'processing', processingProgress: 0 }
+      : { progress: 100, status: 'complete' })
+  } catch (err) {
+    // Asking the server what happened takes a round-trip, and the row stays
+    // interactive for its duration -- the panel still offers Cancel on an
+    // `uploading` row. A cancel landing in that window is the user's decision
+    // and outranks whatever we were about to write.
+    const userCancelled = () => rowById(id)?.status === 'cancelled'
+    const applyLanded = (landed: 'processing' | 'complete') => {
+      if (userCancelled()) return
+      patchRow(id, {
+        progress: 100,
+        status: landed,
+        processingProgress: landed === 'complete' ? 100 : 0,
+      })
+    }
+
+    if (isAbortError(err)) {
+      patchRow(id, { status: 'cancelled', progress: 0 })
+    } else {
+      // A completion that threw may still have landed, with only its
+      // response lost on the way back. Writing that off would report a
+      // working upload as Failed.
+      const landed = completionAttempted && asset_id && version_id
+        ? await completedVersionStatus(asset_id, version_id)
+        : null
+      if (landed) {
+        applyLanded(landed)
+      } else if (!userCancelled()) {
+        // Nothing was destroyed, so nothing is lost: the multipart upload is
+        // still open and every part already sent is still held. `interrupted`
+        // says that, where `failed` claimed the opposite. A version that never
+        // got as far as a multipart upload has nothing to come back to and
+        // stays `failed`.
+        patchRow(id, {
+          status: upload_id && version_id ? 'interrupted' : 'failed',
+          error: err instanceof Error ? err.message : 'Upload failed',
+        })
+        // Only after a completion was attempted can the object be whole with
+        // the version still `uploading`, and only then is it worth a request
+        // to find out.
+        if (completionAttempted && version_id && await finishAssembledUpload(version_id)) {
+          applyLanded('processing')
+        }
+      }
+    }
+
+    // The one and only reason to abort. AbortMultipartUpload discards every
+    // part the backend is holding, and this used to run from the catch of
+    // *any* error -- destroying the bytes that make a resume possible at
+    // exactly the moment they became worth keeping. Everything else is left
+    // for the user to resume or for the reaper to reclaim.
+    if (userCancelled() && upload_id && s3_key && version_id) {
+      await abortCancelled(useUploadStore.setState, { s3_key, upload_id, version_id })
+    }
+  } finally {
+    watch?.stop()
+    stopBeat()
+    releaseWakeLock()
+    if (abortControllers[id] === controller) delete abortControllers[id]
+    endRun(id, runner, runKey)
+  }
+}
+
+/**
+ * A queued resume's turn: ask the server where the upload stands, check nobody
+ * else is sending it, then send what is missing and complete (spec goal 11).
+ * A `/parts` call that cannot get through holds the queue, exactly as an
+ * initiate would; the row goes back to being a queued resume.
+ */
+async function runResume(id: string, runner: Runner, runKey: string): Promise<void> {
+  const file = fileRefs.get(id)!
+  // As it stood before this run touched it: `activeElsewhere` judges its stamps.
+  const row = rowById(id)!
+  const versionId = row.versionId!
+  const updateFile = (patch: Partial<UploadFile>) => patchRow(id, patch)
+
+  const controller = new AbortController()
+  abortControllers[id] = controller
+  let info: ResumeInfo | undefined
+  let completionAttempted = false
+  let stopBeat = () => {}
+  let watch: ReturnType<typeof transferWatch> | null = null
+  try {
+    // Inside the `try`, as in `runNew`, so the `finally` always balances it.
+    retainWakeLock()
+    // A resumed row may have stopped while finalizing.
+    updateFile({
+      status: 'starting', resuming: true, queuedResume: undefined, holdReason: undefined,
+      progress: 0, error: undefined, finalizing: false,
+    })
+
+    // Everything needed to carry on comes from the server, including the key
+    // and the upload id: this row may have been rehydrated from history in a
+    // browser that never saw them.
+    const askedAt = Date.now()
+    try {
+      info = await api.get<ResumeInfo>(`/upload/${versionId}/parts`)
+    } catch (err) {
+      const outcome = isAbortError(err) || isFinalRefusal(err) ? null : classifyInitiateError(err)
+      // Cancelled while it asked: the row is already plain `interrupted` again,
+      // whatever this answer says. Only the hold has to hear it.
+      if (runner.stoodDown) {
+        if (outcome?.kind === 'hold' && queue.hold.probeId === id) passOnProbe()
+        else endHoldIfProbe(id)
+        return
+      }
+      if (outcome?.kind === 'hold' && rowById(id)?.status === 'starting') {
+        if (!(err instanceof ApiError) && queue.hold.probeId !== id) {
+          console.warn('Upload could not resume; waiting for the connection.', err)
+        }
+        holdRow(id, 'resume', outcome.reason, outcome.retryAfterMs)
+        return
+      }
+      if (outcome?.kind === 'hold' && queue.hold.probeId === id) passOnProbe()
+      else endHoldIfProbe(id)
+      throw err
+    }
+    endHoldIfProbe(id)
+    // Cancelled while it asked. Nothing has been sent and nothing is thrown
+    // away: the parts on the server are what a later Resume carries on from.
+    if (runner.stoodDown) return
+
+    // Two tabs sending the same part numbers into one multipart upload leave
+    // the completing tab with ETags that no longer match what is stored.
+    // Judged as of the click that queued it, which this turn now uses up.
+    const answeredAt = Date.now()
+    const requestedAt = resumeRequestedAt.get(id)
+    const click = requestedAt === undefined ? undefined : { requestedAt, askedAt, rtt: answeredAt - askedAt }
+    const elsewhere = activeElsewhere(row, info, answeredAt, controller, click)
+    resumeRequestedAt.delete(id)
+    if (elsewhere) {
+      const refusedAt = info.last_activity_at
+      info = undefined
+      if (rowById(id)?.status !== 'cancelled') {
+        updateFile({
+          status: 'elsewhere',
+          resuming: undefined,
+          progress: row.progress,
+          elsewhereUntil: liveUntil(refusedAt),
+        })
+      }
+      return
+    }
+    stopBeat = beatFor(updateFile)
+
+    // The upload id belongs on the row, not only in this closure. A row
+    // without one is read as a transfer that broke before initiate
+    // answered, so `standingOfStoredRow` fails it -- and a resumed row
+    // interrupted again mid-transfer came back as "Upload interrupted"
+    // with nothing but Dismiss, which is precisely the row this feature
+    // exists for: one this browser only knows from `/me/assets`, or one
+    // whose storage was cleared. It is recoverable by dismissing and
+    // reloading, and nobody would guess that.
+    //
+    // The version and asset ids go with it, for the same reason: the two
+    // fresh upload paths record all three in one call and this one
+    // recorded none of them. So does the storage key, which Discard needs
+    // to abort after `/parts` has stopped answering.
+    const held = info.state === 'resumable' ? info.held_part_numbers : []
+    runner.unfinished = info.state === 'resumable'
+      ? Math.max(0, Math.ceil(file.size / info.chunk_size_bytes) - held.length)
+      : 0
+    updateFile({
+      ...(rowById(id)?.status === 'cancelled' ? {} : { status: 'uploading' as const }),
+      resuming: undefined,
+      uploadId: info.upload_id,
+      s3Key: info.s3_key,
+      versionId: info.version_id,
+      assetId: info.asset_id,
+    })
+    pump()
+
+    // `assembled` means the object is whole and only the completion is
+    // outstanding, so the file is not needed and is not checked -- refusing
+    // it over a rename would strand an upload that has nothing left to send.
+    let parts: Array<{ PartNumber: number; ETag: string }> = []
+    if (info.state === 'resumable') {
+      // A browser cannot reopen a local file on its own, so the user picks it
+      // again -- and nothing makes them pick the same one. Name and size are
+      // what can be checked without reading the file; they guard against an
+      // accident rather than prove anything, and a mismatch here is what
+      // would silently corrupt the parts already in the bucket.
+      //
+      // The two checks report separately because they mean different things
+      // to whoever has to act on them: the wrong file is picked again, a
+      // right-named file of the wrong length is a file that changed.
+      //
+      // Both messages lead with the instruction and stay short enough for
+      // one line. The panel row truncates, and naming the file the user just
+      // picked -- the one thing they already know -- used up the whole line
+      // before reaching the part that says what to do about it.
+      if (file.name !== info.original_filename) {
+        throw new Error(`Please select ${info.original_filename}`)
+      }
+      if (file.size !== info.file_size_bytes) {
+        throw new Error('File does not match original')
+      }
+      const resumeWatch = transferWatch(id, file.size, updateFile)
+      watch = resumeWatch
+      parts = await uploadAllParts(
+        file, info.s3_key, info.upload_id, controller,
+        (percent) => updateFile({ progress: percent, heartbeatAt: Date.now() }),
+        {
+          budget: partBudget,
+          fileKey: runKey,
+          chunkSize: info.chunk_size_bytes,
+          alreadyHeld: held,
+          onPartDone: () => updateFile({ heartbeatAt: Date.now() }),
+          onUnfinished: (n) => {
+            runner.unfinished = n
+            pump()
+          },
+          onBytes: resumeWatch.onBytes,
+          onAllSent: resumeWatch.onAllSent,
+          onResend: resumeWatch.onResend,
+        },
+      )
+    }
+
+    completionAttempted = true
+    updateFile({ finalizing: true })
+    await api.post('/upload/complete', {
+      s3_key: info.s3_key,
+      upload_id: info.upload_id,
+      asset_id: info.asset_id,
+      version_id: info.version_id,
+      // Nothing when parts were skipped. This list is only read by a backend
+      // that cannot list its own parts, and a resumed upload cannot produce a
+      // complete one -- it never saw the ETags of the parts it did not send.
+      // Handing over the partial list would complete a truncated object with
+      // no error on most backends; handing over none makes that backend
+      // refuse instead, which is the failure worth having.
+      parts: held.length > 0 ? [] : parts,
+    })
+
+    const isMedia = /^(video|audio|image)\//.test(info.mime_type)
+    updateFile({
+      progress: 100,
+      status: isMedia ? 'processing' : 'complete',
+      processingProgress: 0,
+      assetId: info.asset_id,
+    })
+  } catch (err) {
+    const userCancelled = () => rowById(id)?.status === 'cancelled'
+
+    if (isAbortError(err)) {
+      updateFile({ status: 'cancelled', progress: 0, resuming: undefined })
+    } else {
+      // See runNew: the completion may have landed with only its response
+      // lost, and this is the second time round for this version.
+      //
+      // A refusal is asked the same question. `/parts` answers 409 for any
+      // status that is not `uploading`, which includes `processing` and
+      // `ready`: the upload landed and this tab is the last to hear about
+      // it. Treated as final, that put a red Failed badge reading "This
+      // upload is already ready." on a file that uploaded and transcoded
+      // perfectly. `completedVersionStatus` compares version ids, so a
+      // version that really did fail still falls through to `failed`.
+      const askAbout = info?.asset_id ?? row.assetId
+      const landed = (completionAttempted || isFinalRefusal(err)) && askAbout
+        ? await completedVersionStatus(askAbout, versionId)
+        : null
+      if (landed) {
+        if (!userCancelled()) {
+          updateFile({
+            progress: 100,
+            status: landed,
+            resuming: undefined,
+            processingProgress: landed === 'complete' ? 100 : 0,
+          })
+        }
+      } else if (!userCancelled()) {
+        updateFile({
+          // Back to resumable unless the server said this upload is over.
+          // Nothing was aborted here either, so the parts sent this time are
+          // held too and the next attempt starts from further along.
+          status: isFinalRefusal(err) ? 'failed' : 'interrupted',
+          resuming: undefined,
+          progress: 0,
+          error: err instanceof Error ? err.message : 'Upload failed',
+        })
+      }
+    }
+
+    if (userCancelled() && info) {
+      await abortCancelled(useUploadStore.setState, {
+        s3_key: info.s3_key,
+        upload_id: info.upload_id,
+        version_id: info.version_id,
+      })
+    }
+  } finally {
+    watch?.stop()
+    stopBeat()
+    releaseWakeLock()
+    if (abortControllers[id] === controller) delete abortControllers[id]
+    endRun(id, runner, runKey)
+  }
+}
+
+/**
+ * Adds new uploads to the back of the queue, as one drop, and starts whatever
+ * may start now. Returns the row ids in the order given.
+ */
+function enqueueNew(
+  set: (fn: (s: UploadStore) => Partial<UploadStore>) => void,
+  items: Array<{ file: File; assetName: string; target: StartTarget }>,
+  projectId: string,
+  projectName: string | undefined,
+): string[] {
+  if (items.length === 0) return []
+  const dropSeq = ++dropSeqs
+  const createdAt = Date.now()
+  const rows: UploadFile[] = items.map(({ file, assetName, target }) => {
+    const id = newRowId()
+    fileRefs.set(id, file)
+    startTargets.set(id, target)
+    return {
+      id,
+      fileName: file.name,
+      fileSize: file.size,
+      fileType: file.type,
+      projectId,
+      projectName,
+      assetName,
+      progress: 0,
+      processingProgress: 0,
+      status: 'queued',
+      createdAt,
+      dropSeq,
+      ...(target.kind === 'version' ? { assetId: target.assetId } : {}),
+    }
+  })
+  queue.enqueue(rows.map((r) => queueEntry(r, 'new')), 'back')
+  for (const r of rows) r.queueSeq = queue.queueSeq(r.id)
+  try {
+    // Newest first, as rows have always been listed.
+    set((s) => ({ files: [...rows.slice().reverse(), ...s.files], panelOpen: true }))
+  } finally {
+    // The rows are in state even when saving them threw: they still get their turn.
+    pump()
+  }
+  return rows.map((r) => r.id)
+}
+
 const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = (set, get) => ({
   files: [],
   versionsRevision: 0,
+  runsRevision: 0,
   panelOpen: false,
   historyLoaded: false,
   historyHasMore: true,
@@ -1068,588 +2231,214 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
   setPanelOpen: (open) => set({ panelOpen: open }),
   togglePanel: () => set((s) => ({ panelOpen: !s.panelOpen })),
 
-  startUpload: (file, projectId, assetName, projectName, folderId) => {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  startUpload: (file, projectId, assetName, projectName, folderId) =>
+    enqueueNew(set, [{ file, assetName, target: { kind: 'asset', folderId: folderId ?? null } }], projectId, projectName)[0],
 
-    const entry: UploadFile = {
-      id,
-      fileName: file.name,
-      fileSize: file.size,
-      fileType: file.type,
+  startUploads: (items, projectId, projectName, folderId) =>
+    enqueueNew(
+      set,
+      items.map(({ file, assetName }) => ({ file, assetName, target: { kind: 'asset' as const, folderId: folderId ?? null } })),
       projectId,
       projectName,
-      assetName,
-      progress: 0,
-      processingProgress: 0,
-      status: 'pending',
-      createdAt: Date.now(),
-    }
+    ),
 
-    set((s) => ({ files: [entry, ...s.files], panelOpen: true }))
-
-    const updateFile = (fileId: string, patch: Partial<UploadFile>) => {
-      set((s) => ({
-        files: s.files.map((f) => (f.id === fileId ? { ...f, ...patch } : f)),
-      }))
-    }
-
-    // Start async upload
-    ;(async () => {
-      const controller = new AbortController()
-      abortControllers[id] = controller
-
-      // Track initiate response fields so catch block can call /upload/abort,
-      // and ask the server what became of the version before it does.
-      let upload_id: string | undefined
-      let s3_key: string | undefined
-      let version_id: string | undefined
-      let asset_id: string | undefined
-      let completionAttempted = false
-
-      retainWakeLock()
-      const stopBeat = beatFor((patch) => updateFile(id, patch))
-      const watch = transferWatch(id, file.size, (patch) => updateFile(id, patch))
-      try {
-        updateFile(id, { status: 'uploading' })
-
-        // What the asset will be called. This body runs synchronously until the
-        // first await, so initiate is dispatched in the same tick as the row is
-        // created: there is no instant in between for anyone to rename it.
-        const sentName = assetName
-
-        const initRes = await api.post<InitiateResponse>(
-          '/upload/initiate',
-          {
-            project_id: projectId,
-            asset_name: sentName,
-            original_filename: file.name,
-            file_size_bytes: file.size,
-            mime_type: file.type,
-            folder_id: folderId ?? null,
-          },
-        )
-        upload_id = initRes.upload_id
-        s3_key = initRes.s3_key
-        version_id = initRes.version_id
-        asset_id = initRes.asset_id
-
-        updateFile(id, { uploadId: upload_id, s3Key: s3_key, assetId: asset_id, versionId: version_id })
-
-        // The round trip is the window that does exist, and the only place a
-        // rename can be lost: the panel offers the pencil from the moment the
-        // row appears, so an edit during it went into the row while the request
-        // carrying the old name had already left. Now that the asset exists it
-        // can be told. Failing here must not fail the upload -- the bytes are
-        // the point.
-        //
-        // It must not be swallowed either. The row is put back to the name the
-        // asset actually has and the reason is recorded on it, the way the
-        // interactive rename path does. Keeping the refused name would leave
-        // the row disagreeing with the asset, the grid, search and the share
-        // link for the rest of the session -- and would also block the retry,
-        // since `renameUpload` returns early when the typed name equals the
-        // one already in the row.
-        const nameAfterInitiate =
-          get().files.find((f) => f.id === id)?.assetName ?? sentName
-        if (nameAfterInitiate !== sentName) {
-          try {
-            await api.patch(`/assets/${asset_id}`, { name: nameAfterInitiate })
-          } catch (err) {
-            updateFile(id, {
-              assetName: sentName,
-              renameError: err instanceof Error ? err.message : 'Rename failed',
-            })
-          }
-        }
-
-        const parts = await uploadAllParts(
-          file, s3_key, upload_id, controller,
-          (percent) => updateFile(id, { progress: percent, heartbeatAt: Date.now() }),
-          UPLOAD_CONCURRENCY,
-          {
-            chunkSize: initRes.chunk_size_bytes,
-            onPartDone: () => updateFile(id, { heartbeatAt: Date.now() }),
-            onBytes: watch.onBytes,
-            onAllSent: watch.onAllSent,
-            onResend: watch.onResend,
-          },
-        )
-
-        completionAttempted = true
-        updateFile(id, { finalizing: true })
-        await api.post('/upload/complete', {
-          s3_key,
-          upload_id,
-          asset_id,
-          version_id,
-          parts,
-        })
-
-        // Upload done — backend now processes (transcode/convert).
-        // For non-processable types (or if SSE isn't wired), mark complete directly.
-        const isMedia = file.type.startsWith('video/') || file.type.startsWith('audio/') || file.type.startsWith('image/')
-        if (isMedia) {
-          updateFile(id, { progress: 100, status: 'processing', processingProgress: 0 })
-        } else {
-          updateFile(id, { progress: 100, status: 'complete' })
-        }
-      } catch (err) {
-        // Asking the server what happened takes a round-trip, and the row stays
-        // interactive for its duration -- the panel still offers Cancel on an
-        // `uploading` row. A cancel landing in that window is the user's decision
-        // and outranks whatever we were about to write.
-        const applyLanded = (landed: 'processing' | 'complete') => {
-          if (get().files.find((f) => f.id === id)?.status === 'cancelled') return
-          updateFile(id, {
-            progress: 100,
-            status: landed,
-            processingProgress: landed === 'complete' ? 100 : 0,
-          })
-        }
-
-        // Asked again after the round-trip below, not captured once: the user can
-        // cancel while it is in flight, and that decision has to reach the abort.
-        const userCancelled = () => get().files.find((f) => f.id === id)?.status === 'cancelled'
-
-        if (isAbortError(err)) {
-          updateFile(id, { status: 'cancelled', progress: 0 })
-        } else {
-          // A completion that threw may still have landed, with only its
-          // response lost on the way back. Writing that off would report a
-          // working upload as Failed.
-          const landed = completionAttempted && asset_id && version_id
-            ? await completedVersionStatus(asset_id, version_id)
-            : null
-          if (landed) {
-            applyLanded(landed)
-          } else if (!userCancelled()) {
-            // Nothing was destroyed, so nothing is lost: the multipart upload is
-            // still open and every part already sent is still held. `interrupted`
-            // says that, where `failed` claimed the opposite. A version that never
-            // got as far as a multipart upload has nothing to come back to and
-            // stays `failed`.
-            updateFile(id, {
-              status: upload_id && version_id ? 'interrupted' : 'failed',
-              error: err instanceof Error ? err.message : 'Upload failed',
-            })
-            // Only after a completion was attempted can the object be whole with
-            // the version still `uploading`, and only then is it worth a request
-            // to find out.
-            if (completionAttempted && version_id && await finishAssembledUpload(version_id)) {
-              applyLanded('processing')
-            }
-          }
-        }
-
-        // The one and only reason to abort. AbortMultipartUpload discards every
-        // part the backend is holding, and this used to run from the catch of
-        // *any* error -- destroying the bytes that make a resume possible at
-        // exactly the moment they became worth keeping. Everything else is left
-        // for the user to resume or for the reaper to reclaim.
-        if (userCancelled() && upload_id && s3_key && version_id) {
-          await abortCancelled(set, { s3_key, upload_id, version_id })
-        }
-      } finally {
-        watch.stop()
-        stopBeat()
-        releaseWakeLock()
-        delete abortControllers[id]
-      }
-    })()
-
-    return id
-  },
-
-  startVersionUpload: (file, assetId, assetName, projectId, projectName) => {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    const entry: UploadFile = {
-      id,
-      fileName: file.name,
-      fileSize: file.size,
-      fileType: file.type,
-      projectId,
-      projectName,
-      assetName,
-      progress: 0,
-      processingProgress: 0,
-      status: 'pending',
-      assetId,
-      createdAt: Date.now(),
-    }
-    set((s) => ({ files: [entry, ...s.files], panelOpen: true }))
-
-    const updateFile = (fileId: string, patch: Partial<UploadFile>) => {
-      set((s) => ({ files: s.files.map((f) => (f.id === fileId ? { ...f, ...patch } : f)) }))
-    }
-
-    ;(async () => {
-      const controller = new AbortController()
-      abortControllers[id] = controller
-      let upload_id: string | undefined
-      let s3_key: string | undefined
-      let version_id: string | undefined
-      let completionAttempted = false
-      retainWakeLock()
-      const stopBeat = beatFor((patch) => updateFile(id, patch))
-      const watch = transferWatch(id, file.size, (patch) => updateFile(id, patch))
-      try {
-        updateFile(id, { status: 'uploading' })
-        const initRes = await api.post<VersionInitiateResponse>(
-          `/assets/${assetId}/versions`,
-          {
-            project_id: projectId,
-            asset_name: assetName,
-            original_filename: file.name,
-            file_size_bytes: file.size,
-            mime_type: file.type,
-          },
-        )
-        upload_id = initRes.upload_id
-        s3_key = initRes.s3_key
-        version_id = initRes.version_id
-        updateFile(id, { uploadId: upload_id, s3Key: s3_key, versionId: version_id })
-
-        const parts = await uploadAllParts(
-          file, s3_key, upload_id, controller,
-          (percent) => updateFile(id, { progress: percent, heartbeatAt: Date.now() }),
-          UPLOAD_CONCURRENCY,
-          {
-            chunkSize: initRes.chunk_size_bytes,
-            onPartDone: () => updateFile(id, { heartbeatAt: Date.now() }),
-            onBytes: watch.onBytes,
-            onAllSent: watch.onAllSent,
-            onResend: watch.onResend,
-          },
-        )
-
-        completionAttempted = true
-        updateFile(id, { finalizing: true })
-        await api.post('/upload/complete', { s3_key, upload_id, asset_id: assetId, version_id, parts })
-        const isMedia = file.type.startsWith('video/') || file.type.startsWith('audio/') || file.type.startsWith('image/')
-        updateFile(id, { progress: 100, status: isMedia ? 'processing' : 'complete', processingProgress: 0 })
-      } catch (err) {
-        // See startUpload for why both of these exist.
-        const applyLanded = (landed: 'processing' | 'complete') => {
-          if (get().files.find((f) => f.id === id)?.status === 'cancelled') return
-          updateFile(id, {
-            progress: 100,
-            status: landed,
-            processingProgress: landed === 'complete' ? 100 : 0,
-          })
-        }
-
-        // See startUpload for why all three of these are shaped this way.
-        const userCancelled = () => get().files.find((f) => f.id === id)?.status === 'cancelled'
-
-        if (isAbortError(err)) {
-          updateFile(id, { status: 'cancelled', progress: 0 })
-        } else {
-          const landed = completionAttempted && version_id
-            ? await completedVersionStatus(assetId, version_id)
-            : null
-          if (landed) {
-            applyLanded(landed)
-          } else if (!userCancelled()) {
-            updateFile(id, {
-              status: upload_id && version_id ? 'interrupted' : 'failed',
-              error: err instanceof Error ? err.message : 'Upload failed',
-            })
-            if (completionAttempted && version_id && await finishAssembledUpload(version_id)) {
-              applyLanded('processing')
-            }
-          }
-        }
-
-        if (userCancelled() && upload_id && s3_key && version_id) {
-          await abortCancelled(set, { s3_key, upload_id, version_id })
-        }
-      } finally {
-        watch.stop()
-        stopBeat()
-        releaseWakeLock()
-        delete abortControllers[id]
-      }
-    })()
-
-    return id
-  },
+  startVersionUpload: (file, assetId, assetName, projectId, projectName) =>
+    enqueueNew(set, [{ file, assetName, target: { kind: 'version', assetId } }], projectId, projectName)[0],
 
   resumeUpload: (fileId, file) => {
     const row = get().files.find((f) => f.id === fileId)
-    if (!row || row.status !== 'interrupted' || !row.versionId) return
-    const versionId = row.versionId
-
-    const updateFile = (patch: Partial<UploadFile>) => {
-      set((s) => ({ files: s.files.map((f) => (f.id === fileId ? { ...f, ...patch } : f)) }))
-    }
-
-    ;(async () => {
-      const controller = new AbortController()
-      abortControllers[fileId] = controller
-      let info: ResumeInfo | undefined
-      let completionAttempted = false
-      let stopBeat = () => {}
-      let watch: ReturnType<typeof transferWatch> | null = null
-      retainWakeLock()
-      try {
-        // A resumed row may have stopped while finalizing.
-        updateFile({ status: 'uploading', progress: 0, error: undefined, finalizing: false })
-
-        // Everything needed to carry on comes from the server, including the key
-        // and the upload id: this row may have been rehydrated from history in a
-        // browser that never saw them.
-        info = await api.get<ResumeInfo>(`/upload/${versionId}/parts`)
-
-        // Two tabs sending the same part numbers into one multipart upload leave
-        // the completing tab with ETags that no longer match what is stored.
-        if (activeElsewhere(row, info, Date.now(), controller)) {
-          const refusedAt = info.last_activity_at
-          info = undefined
-          if (get().files.find((f) => f.id === fileId)?.status !== 'cancelled') {
-            updateFile({
-              status: 'elsewhere',
-              progress: row.progress,
-              elsewhereUntil: liveUntil(refusedAt),
-            })
+    // Not while a run of this row is still settling: a run whose transfer
+    // broke is still asking the server what became of it, and its answer
+    // would land on the row a second run is sending. Nor while a Discard of
+    // it is waiting on the server, which is about to abort what it would send.
+    if (!resumableNow(row)) return
+    fileRefs.set(fileId, file)
+    resumeRequestedAt.set(fileId, Date.now())
+    // A Resume goes ahead of every file not yet started, behind the ones
+    // already running, and takes its turn like them -- so it never sends
+    // beside three active files or outside the part budget.
+    queue.enqueue([queueEntry(row, 'resume')], 'next')
+    set((s) => ({
+      files: s.files.map((f) => (f.id === fileId
+        ? {
+            ...f,
+            queuedResume: true as const,
+            dropSeq: ++dropSeqs,
+            queueSeq: queue.queueSeq(fileId),
+            error: undefined,
+            discardFailed: undefined,
           }
-          return
-        }
-        stopBeat = beatFor(updateFile)
-
-        // The upload id belongs on the row, not only in this closure. A row
-        // without one is read as a transfer that broke before initiate
-        // answered, so `standingOfStoredRow` fails it -- and a resumed row
-        // interrupted again mid-transfer came back as "Upload interrupted"
-        // with nothing but Dismiss, which is precisely the row this feature
-        // exists for: one this browser only knows from `/me/assets`, or one
-        // whose storage was cleared. It is recoverable by dismissing and
-        // reloading, and nobody would guess that.
-        //
-        // The version and asset ids go with it, for the same reason: the two
-        // fresh upload paths record all three in one call and this one
-        // recorded none of them. So does the storage key, which Discard needs
-        // to abort after `/parts` has stopped answering.
-        updateFile({
-          uploadId: info.upload_id,
-          s3Key: info.s3_key,
-          versionId: info.version_id,
-          assetId: info.asset_id,
-        })
-
-        // `assembled` means the object is whole and only the completion is
-        // outstanding, so the file is not needed and is not checked -- refusing
-        // it over a rename would strand an upload that has nothing left to send.
-        const held = info.state === 'resumable' ? info.held_part_numbers : []
-        let parts: Array<{ PartNumber: number; ETag: string }> = []
-        if (info.state === 'resumable') {
-          // A browser cannot reopen a local file on its own, so the user picks it
-          // again -- and nothing makes them pick the same one. Name and size are
-          // what can be checked without reading the file; they guard against an
-          // accident rather than prove anything, and a mismatch here is what
-          // would silently corrupt the parts already in the bucket.
-          //
-          // The two checks report separately because they mean different things
-          // to whoever has to act on them: the wrong file is picked again, a
-          // right-named file of the wrong length is a file that changed.
-          //
-          // Both messages lead with the instruction and stay short enough for
-          // one line. The panel row truncates, and naming the file the user just
-          // picked -- the one thing they already know -- used up the whole line
-          // before reaching the part that says what to do about it.
-          if (file.name !== info.original_filename) {
-            throw new Error(`Please select ${info.original_filename}`)
-          }
-          if (file.size !== info.file_size_bytes) {
-            throw new Error('File does not match original')
-          }
-          const resumeWatch = transferWatch(fileId, file.size, updateFile)
-          watch = resumeWatch
-          parts = await uploadAllParts(
-            file, info.s3_key, info.upload_id, controller,
-            (percent) => updateFile({ progress: percent, heartbeatAt: Date.now() }),
-            UPLOAD_CONCURRENCY,
-            {
-              chunkSize: info.chunk_size_bytes,
-              alreadyHeld: held,
-              onPartDone: () => updateFile({ heartbeatAt: Date.now() }),
-              onBytes: resumeWatch.onBytes,
-              onAllSent: resumeWatch.onAllSent,
-              onResend: resumeWatch.onResend,
-            },
-          )
-        }
-
-        completionAttempted = true
-        updateFile({ finalizing: true })
-        await api.post('/upload/complete', {
-          s3_key: info.s3_key,
-          upload_id: info.upload_id,
-          asset_id: info.asset_id,
-          version_id: info.version_id,
-          // Nothing when parts were skipped. This list is only read by a backend
-          // that cannot list its own parts, and a resumed upload cannot produce a
-          // complete one -- it never saw the ETags of the parts it did not send.
-          // Handing over the partial list would complete a truncated object with
-          // no error on most backends; handing over none makes that backend
-          // refuse instead, which is the failure worth having.
-          parts: held.length > 0 ? [] : parts,
-        })
-
-        const isMedia = /^(video|audio|image)\//.test(info.mime_type)
-        updateFile({
-          progress: 100,
-          status: isMedia ? 'processing' : 'complete',
-          processingProgress: 0,
-          assetId: info.asset_id,
-        })
-      } catch (err) {
-        const userCancelled = () => get().files.find((f) => f.id === fileId)?.status === 'cancelled'
-
-        if (isAbortError(err)) {
-          updateFile({ status: 'cancelled', progress: 0 })
-        } else {
-          // See startUpload: the completion may have landed with only its
-          // response lost, and this is the second time round for this version.
-          //
-          // A refusal is asked the same question. `/parts` answers 409 for any
-          // status that is not `uploading`, which includes `processing` and
-          // `ready`: the upload landed and this tab is the last to hear about
-          // it. Treated as final, that put a red Failed badge reading "This
-          // upload is already ready." on a file that uploaded and transcoded
-          // perfectly. `completedVersionStatus` compares version ids, so a
-          // version that really did fail still falls through to `failed`.
-          const askAbout = info?.asset_id ?? row.assetId
-          const landed = (completionAttempted || isFinalRefusal(err)) && askAbout
-            ? await completedVersionStatus(askAbout, versionId)
-            : null
-          if (landed) {
-            if (!userCancelled()) {
-              updateFile({
-                progress: 100,
-                status: landed,
-                processingProgress: landed === 'complete' ? 100 : 0,
-              })
-            }
-          } else if (!userCancelled()) {
-            updateFile({
-              // Back to resumable unless the server said this upload is over.
-              // Nothing was aborted here either, so the parts sent this time are
-              // held too and the next attempt starts from further along.
-              status: isFinalRefusal(err) ? 'failed' : 'interrupted',
-              progress: 0,
-              error: err instanceof Error ? err.message : 'Upload failed',
-            })
-          }
-        }
-
-        if (userCancelled() && info) {
-          await abortCancelled(set, {
-            s3_key: info.s3_key,
-            upload_id: info.upload_id,
-            version_id: info.version_id,
-          })
-        }
-      } finally {
-        watch?.stop()
-        stopBeat()
-        releaseWakeLock()
-        delete abortControllers[fileId]
-      }
-    })()
+        : f)),
+    }))
+    pump()
   },
 
   discardUpload: async (fileId) => {
-    // The counterpart to no longer aborting on failure. Without it the only way
-    // to be rid of an upload the user does not want back is to wait for the
-    // reaper, and the row would keep offering a resume in the meantime.
-    const row = get().files.find((f) => f.id === fileId)
-    if (!row) return null
-    const drop = () => set((s) => ({ files: s.files.filter((f) => f.id !== fileId) }))
-    if (!row.versionId) {
-      drop()
-      return null
-    }
-
-    let info: ResumeInfo
+    // Counted for as long as the server is being asked: see `resumeUpload`.
+    discarding.set(fileId, (discarding.get(fileId) ?? 0) + 1)
+    noteRunsChanged()
     try {
-      info = await api.get<ResumeInfo>(`/upload/${row.versionId}/parts`)
-    } catch (err) {
-      // 404 or 409: the version is gone or no longer uploading, so the row has
-      // nothing to offer. The multipart upload behind it may still be open --
-      // `/parts` answering 404 says nothing about storage -- and leaving it to
-      // the reaper holds every part already sent until then. A row that
-      // recorded its key and upload id can abort without being told them.
-      if (isFinalRefusal(err)) {
-        if (row.s3Key && row.uploadId) {
-          try {
-            await api.post('/upload/abort', {
-              s3_key: row.s3Key,
-              upload_id: row.uploadId,
-              version_id: row.versionId,
-              discard: true,
-            })
-          } catch (abortErr) {
-            // The upload is already gone too: the same answer from the other
-            // side, and what Discard wanted to happen has happened.
-            if (!(abortErr instanceof ApiError && abortErr.status === 404)) {
-              return reportDiscardFailure(set, fileId, abortErr)
-            }
-          }
-        }
+      // The counterpart to no longer aborting on failure. Without it the only way
+      // to be rid of an upload the user does not want back is to wait for the
+      // reaper, and the row would keep offering a resume in the meantime.
+      const row = get().files.find((f) => f.id === fileId)
+      if (!row) return null
+      // A queued resume gives up its turn first, before any round trip: its turn
+      // coming while this asks the server would start sending into the upload
+      // this is about to abort.
+      if (row.queuedResume) {
+        forgetQueued(fileId)
+        fileRefs.delete(fileId)
+        resumeRequestedAt.delete(fileId)
+        set((s) => ({
+          files: s.files.map((f) => (f.id === fileId ? { ...f, queuedResume: undefined, holdReason: undefined } : f)),
+        }))
+      }
+      const drop = () => {
+        forgetQueued(fileId)
+        fileRefs.delete(fileId)
+        startTargets.delete(fileId)
+        set((s) => ({ files: s.files.filter((f) => f.id !== fileId) }))
+      }
+      if (!row.versionId) {
         drop()
-        set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
         return null
       }
-      return reportDiscardFailure(set, fileId, err)
-    }
 
-    // The server has seen this upload move within the window, and this tab is
-    // not the one moving it. Discard succeeds on every check the server can
-    // make -- the version really is still uploading -- and the tab doing the
-    // transfer gets NoSuchUpload on its next part.
-    if (activeElsewhere(row, info, Date.now())) {
-      set((s) => ({
-        files: s.files.map((f) => (f.id === fileId
-          // Held until the server's window runs out rather than for a fresh
-          // one from now: the poll then offers the row again the moment a
-          // second attempt can succeed.
-          ? { ...f, status: 'elsewhere' as const, elsewhereUntil: liveUntil(info.last_activity_at) }
-          : f)),
-      }))
-      return ELSEWHERE_MESSAGE
-    }
+      let info: ResumeInfo
+      try {
+        info = await api.get<ResumeInfo>(`/upload/${row.versionId}/parts`)
+      } catch (err) {
+        // 404 or 409: the version is gone or no longer uploading, so the row has
+        // nothing to offer. The multipart upload behind it may still be open --
+        // `/parts` answering 404 says nothing about storage -- and leaving it to
+        // the reaper holds every part already sent until then. A row that
+        // recorded its key and upload id can abort without being told them.
+        if (isFinalRefusal(err)) {
+          if (row.s3Key && row.uploadId) {
+            try {
+              await api.post('/upload/abort', {
+                s3_key: row.s3Key,
+                upload_id: row.uploadId,
+                version_id: row.versionId,
+                discard: true,
+              })
+            } catch (abortErr) {
+              // The upload is already gone too: the same answer from the other
+              // side, and what Discard wanted to happen has happened.
+              if (!(abortErr instanceof ApiError && abortErr.status === 404)) {
+                return reportDiscardFailure(set, fileId, abortErr)
+              }
+            }
+          }
+          drop()
+          set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
+          return null
+        }
+        return reportDiscardFailure(set, fileId, err)
+      }
 
-    try {
-      // `discard` and not a plain abort. A plain abort marks the version
-      // `failed`, which leaves a red badge in the version switcher for an
-      // upload somebody deliberately threw away -- and it takes its own branch
-      // when the object is already whole, promoting the version and dispatching
-      // the transcode, so the one control that exists to throw an upload away
-      // published it instead. A discard says which of the two this is, and the
-      // server disposes of it the way the reaper disposes of a stale upload:
-      // bytes gone, version gone, and the asset with it if that was its only
-      // version.
-      await api.post('/upload/abort', {
-        s3_key: info.s3_key,
-        upload_id: info.upload_id,
-        version_id: info.version_id,
-        discard: true,
-      })
-    } catch (err) {
-      return reportDiscardFailure(set, fileId, err)
+      // The server has seen this upload move within the window, and this tab is
+      // not the one moving it. Discard succeeds on every check the server can
+      // make -- the version really is still uploading -- and the tab doing the
+      // transfer gets NoSuchUpload on its next part.
+      if (activeElsewhere(row, info, Date.now())) {
+        set((s) => ({
+          files: s.files.map((f) => (f.id === fileId
+            // Held until the server's window runs out rather than for a fresh
+            // one from now: the poll then offers the row again the moment a
+            // second attempt can succeed.
+            ? { ...f, status: 'elsewhere' as const, elsewhereUntil: liveUntil(info.last_activity_at) }
+            : f)),
+        }))
+        return ELSEWHERE_MESSAGE
+      }
+
+      try {
+        // `discard` and not a plain abort. A plain abort marks the version
+        // `failed`, which leaves a red badge in the version switcher for an
+        // upload somebody deliberately threw away -- and it takes its own branch
+        // when the object is already whole, promoting the version and dispatching
+        // the transcode, so the one control that exists to throw an upload away
+        // published it instead. A discard says which of the two this is, and the
+        // server disposes of it the way the reaper disposes of a stale upload:
+        // bytes gone, version gone, and the asset with it if that was its only
+        // version.
+        await api.post('/upload/abort', {
+          s3_key: info.s3_key,
+          upload_id: info.upload_id,
+          version_id: info.version_id,
+          discard: true,
+        })
+      } catch (err) {
+        return reportDiscardFailure(set, fileId, err)
+      }
+      // Only now. The row used to leave the list before the request and every
+      // failure was swallowed, so a 503 from unreachable storage left no row, no
+      // error, and a version the reaper would not touch for a day.
+      drop()
+      // Said after the server has answered: a screen showing this asset's
+      // versions has to refetch, and refetching while the delete is in flight
+      // would fetch the version back.
+      set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
+      return null
+    } finally {
+      const left = (discarding.get(fileId) ?? 1) - 1
+      if (left > 0) discarding.set(fileId, left)
+      else discarding.delete(fileId)
+      noteRunsChanged()
     }
-    // Only now. The row used to leave the list before the request and every
-    // failure was swallowed, so a 503 from unreachable storage left no row, no
-    // error, and a version the reaper would not touch for a day.
-    drop()
-    // Said after the server has answered: a screen showing this asset's
-    // versions has to refetch, and refetching while the delete is in flight
-    // would fetch the version back.
-    set((s) => ({ versionsRevision: s.versionsRevision + 1 }))
-    return null
   },
 
   cancelUpload: (fileId) => {
+    const row = get().files.find((f) => f.id === fileId)
+    if (!row) return
+    const runner = runners.get(fileId)
+
+    // Not started, or the hold's probe between tries: nothing is on the
+    // server, so the row only leaves. A probe passes the hold on as it goes.
+    if (row.status === 'queued' && !runner) {
+      fileRefs.delete(fileId)
+      startTargets.delete(fileId)
+      set((s) => ({ files: s.files.filter((f) => f.id !== fileId) }))
+      forgetQueued(fileId)
+      return
+    }
+
+    // A queued or held resume goes back to plain `interrupted`, still
+    // resumable. Nothing is aborted: its parts on the server are the point.
+    if (row.status === 'interrupted') {
+      if (row.queuedResume) {
+        fileRefs.delete(fileId)
+        resumeRequestedAt.delete(fileId)
+        set((s) => ({
+          files: s.files.map((f) => (f.id === fileId ? { ...f, queuedResume: undefined, holdReason: undefined } : f)),
+        }))
+        forgetQueued(fileId)
+      }
+      return
+    }
+
+    // A resume whose turn has begun and that has sent nothing yet: the same.
+    // Its run keeps its place until `/parts` answers, then ends quietly.
+    if (row.status === 'starting' && row.resuming && runner) {
+      runner.stoodDown = true
+      resumeRequestedAt.delete(fileId)
+      set((s) => ({
+        files: s.files.map((f) => (f.id === fileId
+          ? { ...f, status: 'interrupted' as const, resuming: undefined, holdReason: undefined }
+          : f)),
+      }))
+      return
+    }
+
+    // Initiating: what the initiate creates is thrown away when it answers
+    // (see `runNew`), and only then does the row leave.
+    if (row.status === 'starting' && runner) runner.removeWhenSettled = true
+    if (!runner) {
+      fileRefs.delete(fileId)
+      startTargets.delete(fileId)
+    }
     abortControllers[fileId]?.abort()
     set((s) => ({
       files: s.files.map((f) =>
@@ -1657,6 +2446,45 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       ),
     }))
   },
+
+  cancelAllQueued: () => {
+    // Each row by its own rule. A held probe hands the hold down the line as
+    // it goes, and the last one out finds nobody waiting and ends it.
+    const waiting = get().files.filter(
+      (f) => (f.status === 'queued' || (f.status === 'interrupted' && f.queuedResume)) && !runners.has(f.id),
+    )
+    for (const f of waiting) get().cancelUpload(f.id)
+  },
+
+  retryUpload: (fileId) => {
+    const row = get().files.find((f) => f.id === fileId)
+    if (!row || !retryable(row) || runners.has(fileId)) return
+    // Next, like a Resume: ahead of every file not yet started, and during a
+    // hold behind the probe.
+    queue.enqueue([queueEntry(row, 'new')], 'next')
+    set((s) => ({
+      files: s.files.map((f) => (f.id === fileId
+        ? {
+            ...f,
+            status: 'queued' as const,
+            progress: 0,
+            error: undefined,
+            failedBeforeStart: undefined,
+            retryable: undefined,
+            dropSeq: ++dropSeqs,
+            queueSeq: queue.queueSeq(fileId),
+          }
+        : f)),
+    }))
+    pump()
+  },
+
+  canRetry: (fileId) => {
+    const row = get().files.find((f) => f.id === fileId)
+    return row !== undefined && retryable(row)
+  },
+
+  canResume: (fileId) => resumableNow(get().files.find((f) => f.id === fileId)),
 
   renameUpload: async (fileId, name) => {
     const row = get().files.find((f) => f.id === fileId)
@@ -1713,6 +2541,11 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
   },
 
   removeFile: (fileId) => {
+    forgetQueued(fileId)
+    if (!runners.has(fileId)) {
+      fileRefs.delete(fileId)
+      startTargets.delete(fileId)
+    }
     set((s) => ({ files: s.files.filter((f) => f.id !== fileId) }))
   },
 
@@ -1811,8 +2644,12 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
     // Interrupted rows are polled alongside processing ones. The same upload can
     // be resumed from another tab or another machine, and without this the row
     // here keeps offering a resume for a version that is already transcoding.
+    //
+    // A queued resume is not: it asks the server itself at its turn, and a
+    // poll rewriting it meanwhile would leave the queue holding a row that
+    // is no longer waiting.
     const watched = get().files.filter(
-      (f) => (f.status === 'processing' || f.status === 'interrupted') && f.assetId,
+      (f) => (f.status === 'processing' || f.status === 'interrupted') && f.assetId && !f.queuedResume,
     )
     if (!watched.length) return
     try {
@@ -1826,7 +2663,7 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
       )
       set((s) => ({
         files: s.files.map((f) => {
-          if ((f.status !== 'processing' && f.status !== 'interrupted') || !f.assetId) return f
+          if ((f.status !== 'processing' && f.status !== 'interrupted') || !f.assetId || f.queuedResume) return f
           // Matched on the version and not the asset: two rows can watch one
           // asset -- an interrupted v2 and a processing v3 -- and on the asset
           // they both read the first one's answer.
@@ -1896,6 +2733,48 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
 })
 
 /**
+ * The row as it is saved, or null when it is not saved at all.
+ *
+ * - `queued`: never. Its `File` cannot survive a reload, and there is nothing on
+ *   the server to come back to.
+ * - `starting`: a resume has its upload to come back to and is saved as plain
+ *   `interrupted`; a new upload whose initiate is still out has nothing yet
+ *   and is not saved.
+ * - `interrupted`, queued or held or not, is saved as plain `interrupted`.
+ * - `failed` before start is saved without `retryable`: after a reload there is
+ *   no `File` to retry with, so it offers Dismiss only.
+ * - `processing` and `complete` come back from history instead.
+ *
+ * The queue's in-memory markers are never saved, nor its sequence numbers: the
+ * panel lists a row that has one before any that has none, and a number from an
+ * earlier page load means nothing against this load's.
+ */
+function savedRow(f: UploadFile): UploadFile | null {
+  const kept: UploadFile = { ...f }
+  delete kept.queuedResume
+  delete kept.resuming
+  delete kept.holdReason
+  // Sequence numbers are counters of this page load: a saved one would outrank
+  // the first drop of the next load, which counts from 1 again.
+  delete kept.dropSeq
+  delete kept.queueSeq
+  switch (f.status) {
+    case 'starting':
+      return f.versionId ? { ...kept, status: 'interrupted' } : null
+    case 'failed':
+      if (f.failedBeforeStart) delete kept.retryable
+      return kept
+    case 'interrupted':
+    case 'uploading':
+    case 'elsewhere':
+    case 'cancelled':
+      return kept
+    default:
+      return null
+  }
+}
+
+/**
  * Merges what this tab is about to write with what is already in storage.
  *
  * `ff-uploads` is one key shared by every tab of the origin, and zustand's
@@ -1919,8 +2798,9 @@ const storeCreator: StateCreator<UploadStore, [['zustand/persist', unknown]]> = 
  *    answers with the display version, which skips `uploading`, so a second
  *    version's upload has no row anywhere and no offer to resume.
  *
- * A row this tab owns is always written as this tab has it: nobody else is in a
- * position to know better.
+ * A row this tab owns is written as this tab has it: nobody else is in a
+ * position to know better -- unless another tab has stamped it more recently,
+ * which means that tab took the upload up after this one stopped.
  */
 function mergeWithStored(name: string, outgoing: string): string {
   try {
@@ -1942,7 +2822,16 @@ function mergeWithStored(name: string, outgoing: string): string {
         if (row.ownerTab && row.ownerTab !== mine && beating) byId.set(row.id, row)
         continue
       }
-      if (here.ownerTab === mine) continue
+      if (here.ownerTab === mine) {
+        // Unless another tab has stamped it since this one last did: that tab
+        // took the upload up after this one stopped, and this copy is the
+        // stale one. Written back over it, the other tab's stamp would be gone
+        // by the time this tab's Resume asks who is sending it.
+        const takenUp = row.ownerTab !== undefined && row.ownerTab !== mine &&
+          (row.heartbeatAt ?? 0) > (here.heartbeatAt ?? 0)
+        if (takenUp) byId.set(row.id, row)
+        continue
+      }
       if ((row.heartbeatAt ?? 0) >= (here.heartbeatAt ?? 0)) byId.set(row.id, row)
     }
 
@@ -1983,13 +2872,14 @@ export const useUploadStore = create<UploadStore>()(
     // no offer to resume anywhere in the panel, and the parts left sitting in
     // the bucket until the reaper. The row is the only thing that knows the
     // upload happened, so it has to survive.
+    //
+    // What the queue adds is not saved, because a reload cannot keep it: the
+    // `File` of a row that has not started dies with the page. See `savedRow`.
     partialize: (state: UploadStore) => ({
-      files: state.files.filter(
-        (f: UploadFile) =>
-          f.status === 'failed' || f.status === 'cancelled' ||
-          f.status === 'interrupted' || f.status === 'uploading' ||
-          f.status === 'elsewhere',
-      ),
+      files: state.files.flatMap((f: UploadFile) => {
+        const saved = savedRow(f)
+        return saved ? [saved] : []
+      }),
     }),
     // Nothing in this tab is pushing bytes for a row that came out of storage,
     // whatever it said when it was written; `standingOfStoredRow` decides what it
@@ -2002,7 +2892,12 @@ export const useUploadStore = create<UploadStore>()(
       return {
         ...current,
         ...(persisted as object),
-        files: stored.map((f) => standingOfStoredRow(f, now)),
+        // `savedRow` again: a row written by an older build, or by another tab
+        // through `mergeWithStored`, is held to the same rules.
+        files: stored.flatMap((f) => {
+          const saved = savedRow(f)
+          return saved ? [standingOfStoredRow(saved, now)] : []
+        }),
       }
     },
   }),
@@ -2026,7 +2921,7 @@ if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
         const now = Date.now()
         useUploadStore.setState((s) => ({
           files: s.files.map((f) =>
-            f.status === 'interrupted' && f.ownerTab === inherited
+            f.status === 'interrupted' && f.ownerTab === inherited && !f.queuedResume
               ? standingOfStoredRow({ ...f, status: 'uploading' }, now)
               : f,
           ),
@@ -2037,4 +2932,29 @@ if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
   } catch {
     // No channel, no duplicate detection: the reload case still works.
   }
+}
+
+/**
+ * For tests only. The queue is tab-wide module state, so a test that leaves a
+ * run hanging would otherwise hold places in the next test's queue.
+ */
+export const __uploadQueueTesting = {
+  /** An empty queue, no runs, no hold, and a fresh part budget. Runs still in flight are forgotten, not stopped. */
+  reset(): void {
+    if (probeTimer !== null) clearTimeout(probeTimer)
+    probeTimer = null
+    queue = createUploadQueue()
+    runners.clear()
+    discarding.clear()
+    resumeRequestedAt.clear()
+    fileRefs.clear()
+    startTargets.clear()
+    for (const id of Object.keys(abortControllers)) delete abortControllers[id]
+    partBudget = createPartBudget(UPLOAD_CONCURRENCY)
+    wakeLockHolders = 0
+  },
+  hasAbortController: (id: string): boolean => abortControllers[id] !== undefined,
+  /** Rows whose run has begun and not yet ended. */
+  runningIds: (): string[] => Array.from(runners.keys()),
+  wakeLockHolders: (): number => wakeLockHolders,
 }

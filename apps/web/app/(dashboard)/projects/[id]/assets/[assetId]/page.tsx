@@ -231,6 +231,28 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     refetchVersions()
   }, [versionsRevision, refetchVersions])
 
+  // A New Version file waits for its turn behind the other uploads. Until its
+  // initiate has answered there is no version to show, so the page says what
+  // is going on instead of looking as if nothing was picked. The same counter
+  // as above is bumped when the version exists, which is when the list is
+  // refetched: no guess at how long the wait is.
+  //
+  // Only this asset's own version rows: a queued new asset has no `assetId`.
+  //
+  // The row the queue is holding on (the probe) says why instead, as it does in
+  // the panel: "waiting for other uploads" is not true of it. A string, so the
+  // selector is stable between renders.
+  const assetIdForQueue = asset?.id
+  const versionQueueLine = useUploadStore((s) => {
+    if (assetIdForQueue === undefined) return ''
+    const queued = s.files.filter((f) => f.status === 'queued' && f.assetId === assetIdForQueue)
+    if (queued.length === 0) return ''
+    const reason = queued.find((f) => f.holdReason)?.holdReason
+    if (reason === 'connection') return 'Waiting for connection'
+    if (reason === 'storage') return 'Waiting for storage'
+    return 'New version queued, waiting for other uploads.'
+  })
+
   // Deep-link to a specific comment from notification (?commentId=...)
   // Runs once after comments are loaded — seeks to timecode, focuses comment, shows annotation
   useEffect(() => {
@@ -611,10 +633,9 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
               if (!file || !asset) return
               startVersionUpload(file, asset.id, asset.name, asset.project_id, project?.name)
               e.target.value = ''
-              // Surface the newly-created version (starts as "uploading") quickly;
-              // SSE transcode events then drive it through processing → ready (#118).
-              setTimeout(() => refetchVersions(), 800)
-              setTimeout(() => refetchVersions(), 2500)
+              // The new version (it starts as "uploading") is fetched when the
+              // upload store says it exists, through `versionsRevision`; SSE
+              // transcode events then drive it through processing → ready (#118).
             }}
           />
           <VersionSwitcher versions={versions} />
@@ -685,6 +706,27 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
         <div
           className="flex-1 flex flex-col bg-bg-primary overflow-hidden min-w-0"
         >
+          {/* What a New Version is waiting for, over the media and not over the
+              comments beside it. A zero-height anchor rather than a row or a
+              `relative` column: a line that took room would change the stage's
+              size cap (`--ff-stage-max`, measured once per layout, not when
+              something appears), and positioning the column would move the
+              containing block of everything absolute inside the viewer.
+
+              The region is always mounted and only its text changes. One
+              created together with its text is not reliably announced. */}
+          <div className="relative z-10 h-0 shrink-0">
+            <div
+              role="status"
+              className="pointer-events-none absolute inset-x-0 top-2 flex justify-center px-3"
+            >
+              {versionQueueLine ? (
+                <span className="rounded-md border border-border bg-bg-secondary/95 px-3 py-1.5 text-xs text-text-secondary shadow-lg">
+                  {versionQueueLine}
+                </span>
+              ) : null}
+            </div>
+          </div>
           {/* Media viewer */}
           {renderMediaViewer()}
         </div>
