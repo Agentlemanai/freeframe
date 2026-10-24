@@ -116,7 +116,10 @@ def verify_magic_code(body: VerifyMagicCodeRequest, db: Session = Depends(get_db
     # this an invitee who used the login page got tokens and used the app while
     # still listed as pending, and Revoke Invite deleted a working account.
     # Checked after the code, so only the mailbox's owner learns of the invite.
-    if user.status == UserStatus.pending_invite:
+    # A pending row whose email is already verified is an invitee an earlier
+    # release let in by code: a working account, still signed in that way, or
+    # they would be locked out with no invite left to resend or revoke.
+    if user.status == UserStatus.pending_invite and not user.email_verified:
         raise HTTPException(status_code=403, detail=INVITE_NOT_ACCEPTED_DETAIL)
 
     # Mark email as verified

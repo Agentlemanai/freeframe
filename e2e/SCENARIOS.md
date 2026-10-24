@@ -499,7 +499,8 @@ Observations (not failures of these scenarios):
   message). With the API answering normally that window is well under a second; under the 429s above it lasted
   the whole test. The spec waits for the header's Upload button (drawn on the same condition) before dropping. The same
   window is the likely cause of the Phase 4 note that R1 in WebKit sometimes "never sees its first upload start" (not
-  re-measured there); `dropFiles` could wait for it too.
+  re-measured there); `dropFiles` could wait for it too. Fixed by #546: a drop made before the role is known is now
+  held and then started, or refused with one message, once the role is known.
 - Not run here: the manual real Safari and real Firefox pass (matrix row M), which also owes "hard reload, then drop from
   Finder without clicking, then reload". The live Chrome pass is below.
 

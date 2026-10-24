@@ -28,8 +28,9 @@ export function ShareBrandMark({
   projectLogoUrl?: string | null
 }) {
   const { orgName, loginLogoUrl, orgLogoLight, orgLogoDark } = useBranding()
-  // Logo URLs are presigned and expire, so one that fails to load falls back to
-  // the next in line. Keyed by URL so a refreshed link is tried again.
+  // A logo that fails to load falls back to the next in line: the project logo
+  // or cover is a presigned link that expires, and an instance logo whose slot
+  // was cleared answers 404. Keyed by URL so a refreshed link is tried again.
   const [failed, setFailed] = React.useState<ReadonlySet<string>>(() => new Set())
   const markFailed = (url: string) => setFailed((prev) => new Set(prev).add(url))
 

@@ -705,6 +705,25 @@ def test_verify_magic_code_checks_the_code_before_naming_an_invite(client, mock_
     assert user.status == UserStatus.pending_invite
 
 
+def test_verify_magic_code_still_signs_in_an_invitee_who_already_uses_the_app(client, mock_db):
+    """POST /auth/verify-magic-code — a pending row with a verified email is an
+    invitee an earlier release let in by code without accepting: a working
+    account. Refusing them would lock them out once their session ends, with no
+    invite to resend or revoke (#472). Only an invitee who never signed in is
+    sent to their invite link."""
+    user = _pending_invitee()
+    user.email_verified = True
+    user.password_hash = None
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)), \
+         patch("apps.api.routers.auth.redis_verify_magic_code", return_value=(True, "")):
+        resp = client.post("/auth/verify-magic-code", json={"email": user.email, "code": "123456"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["access_token"]
+
+
 def test_delete_user_refuses_an_invitee_who_signed_in(client, auth_headers, mock_db, test_user):
     """DELETE /users/{id} — a row still marked pending_invite whose owner signed
     in with a code (email_verified, from when a code still let a pending invitee

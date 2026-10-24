@@ -91,9 +91,32 @@ def test_access_log_drops_query_string_credentials():
 
     [line] = _emit_like_uvicorn("/share/abc/stream?share_session=SECRET-SESSION&version_id=1")
     assert "SECRET-SESSION" not in line
-    assert '"GET /share/abc/stream HTTP/1.1"' in line
+    # The share token in the path is redacted too (see the next test).
+    assert '"GET /share/<redacted>/stream HTTP/1.1"' in line
 
 
 def test_access_log_keeps_a_path_without_a_query_string():
     [line] = _emit_like_uvicorn("/health")
     assert line == '10.0.0.1:5555 - "GET /health HTTP/1.1" 200'
+
+
+def test_access_log_redacts_tokens_carried_in_the_path():
+    """An invite token in the path lets whoever holds it set the account's
+    password, and a share token opens the link; neither goes into the log."""
+    [line] = _emit_like_uvicorn("/auth/invite/SECRET-INVITE-TOKEN")
+    assert "SECRET-INVITE-TOKEN" not in line
+    assert '"GET /auth/invite/<redacted> HTTP/1.1"' in line
+
+    [line] = _emit_like_uvicorn("/share/SECRET-SHARE-TOKEN/assets/0b9e?share_session=S")
+    assert "SECRET-SHARE-TOKEN" not in line and "share_session" not in line
+    assert '"GET /share/<redacted>/assets/0b9e HTTP/1.1"' in line
+
+    [line] = _emit_like_uvicorn("/share/SECRET-SHARE-TOKEN")
+    assert '"GET /share/<redacted> HTTP/1.1"' in line
+
+
+def test_access_log_leaves_other_paths_alone():
+    [line] = _emit_like_uvicorn("/projects/0b9e/share-links")
+    assert '"GET /projects/0b9e/share-links HTTP/1.1"' in line
+    [line] = _emit_like_uvicorn("/auth/invite")
+    assert '"GET /auth/invite HTTP/1.1"' in line

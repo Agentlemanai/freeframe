@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -12,16 +13,24 @@ from .middleware.global_rate_limit import GlobalRateLimitMiddleware
 from .middleware.setup_guard import SetupGuardMiddleware
 
 
+# Paths whose next segment is a credential: an invite token sets the account's
+# password, and a share token opens the link.
+_TOKEN_IN_PATH = re.compile(r"^(/auth/invite/|/share/)[^/]+")
+
+
 class _DropQueryStringFilter(logging.Filter):
     """Keep credentials out of the access log. Some URLs carry them in the query
     string, because the client cannot send a header there: `?token=` on /hls
     (hls.js segment fetches) and /events (EventSource), `?share_session=` on the
-    share routes. uvicorn logs the path with its query as the third argument."""
+    share routes. Others carry one in the path (`_TOKEN_IN_PATH`), which is
+    replaced with `<redacted>`. uvicorn logs the path with its query as the
+    third argument."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
-            record.args = args[:2] + (args[2].split("?", 1)[0],) + args[3:]
+            path = _TOKEN_IN_PATH.sub(r"\1<redacted>", args[2].split("?", 1)[0])
+            record.args = args[:2] + (path,) + args[3:]
         return True
 
 
