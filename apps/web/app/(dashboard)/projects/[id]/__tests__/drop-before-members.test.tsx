@@ -15,7 +15,7 @@
  * Everything but the page, the drop region and the upload store is replaced.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, createEvent } from '@testing-library/react'
+import { render, screen, fireEvent, createEvent, waitFor } from '@testing-library/react'
 
 const project = { id: 'p1', name: 'Launch film', is_public: false }
 
@@ -88,20 +88,31 @@ vi.mock('@/lib/api', async (orig) => ({
 // The page's grid stands in as a plain box inside the drop region. It and the
 // sidebar tree each show a folder that takes a file drop only when the page
 // hands them a handler for one, the way the real folder cards and rows do.
+type Dropped = Promise<{ files: { file: File; dirs: string[] }[]; unreadable: number; unreadableFolders: number }>
 const { folderDrop } = vi.hoisted(() => ({
-  folderDrop: (label: string, onDrop?: (folderId: string, files: File[]) => void) =>
+  folderDrop: (label: string, onDrop?: (folderId: string, dropped: Dropped) => void) =>
     onDrop ? (
-      <button onClick={() => onDrop('f1', [new File([new Uint8Array(1)], `${label}.mov`)])}>{label}</button>
+      <button
+        onClick={() =>
+          onDrop('f1', Promise.resolve({
+            files: [{ file: new File([new Uint8Array(1)], `${label}.mov`), dirs: [] }],
+            unreadable: 0,
+            unreadableFolders: 0,
+          }))
+        }
+      >
+        {label}
+      </button>
     ) : null,
 }))
 vi.mock('@/components/projects/asset-grid', () => ({
-  AssetGrid: (p: { onDropFilesToFolder?: (folderId: string, files: File[]) => void }) => (
+  AssetGrid: (p: { onDropFilesToFolder?: (folderId: string, dropped: Dropped) => void }) => (
     <div data-testid="grid">{folderDrop('grid-folder', p.onDropFilesToFolder)}</div>
   ),
 }))
 vi.mock('@/components/review/comment-panel', () => ({ CommentPanel: () => null }))
 vi.mock('@/components/projects/folder-tree', () => ({
-  FolderTree: (p: { onDropFiles?: (folderId: string, files: File[]) => void }) =>
+  FolderTree: (p: { onDropFiles?: (folderId: string, dropped: Dropped) => void }) =>
     folderDrop('sidebar-folder', p.onDropFiles),
 }))
 vi.mock('@/components/projects/share-links-table', () => ({ ShareLinksTable: () => null }))
@@ -119,6 +130,7 @@ import { ApiError } from '@/lib/api'
 import { signInAs, signOutElsewhere } from '@/test/upload-session'
 
 const NO_PERMISSION = "You don't have permission to upload to this project"
+const ACCOUNT_CHANGED = 'Another account signed in, so nothing was uploaded'
 // A new element each time: `rerender` with the same one would skip the page.
 const page = () => (
   <ToastProvider>
@@ -173,7 +185,7 @@ describe('a drop before the role is known', () => {
     expect(dataTransfer.dropEffect).toBe('copy')
   })
 
-  it('holds the drop and starts it once the members say editor', () => {
+  it('holds the drop and starts it once the members say editor', async () => {
     const { rerender } = render(page())
     dropFiles(screen.getByTestId('grid'), [take()])
     expect(rowNames()).toEqual([])
@@ -181,11 +193,11 @@ describe('a drop before the role is known', () => {
     members.data = [{ user_id: 'u1', role: 'editor' }]
     rerender(page())
 
-    expect(rowNames()).toEqual(['take-1.mov'])
+    await waitFor(() => expect(rowNames()).toEqual(['take-1.mov']))
     expect(screen.queryByText(NO_PERMISSION)).toBeNull()
   })
 
-  it('holds the drop while the user is still loading, then starts it', () => {
+  it('holds the drop while the user is still loading, then starts it', async () => {
     auth.user = null
     auth.userFetched = false
     members.data = [{ user_id: 'u1', role: 'owner' }]
@@ -197,7 +209,7 @@ describe('a drop before the role is known', () => {
     auth.userFetched = true
     rerender(page())
 
-    expect(rowNames()).toEqual(['take-1.mov'])
+    await waitFor(() => expect(rowNames()).toEqual(['take-1.mov']))
   })
 
   it('answers a held drop with one toast and no rows once the members say viewer', () => {
@@ -212,14 +224,14 @@ describe('a drop before the role is known', () => {
     expect(screen.getAllByText(NO_PERMISSION)).toHaveLength(1)
   })
 
-  it('hands a held drop to the queue when the members request fails, for the server to decide', () => {
+  it('hands a held drop to the queue when the members request fails, for the server to decide', async () => {
     const { rerender } = render(page())
     dropFiles(screen.getByTestId('grid'), [take()])
 
     members.error = new Error('network')
     rerender(page())
 
-    expect(rowNames()).toEqual(['take-1.mov'])
+    await waitFor(() => expect(rowNames()).toEqual(['take-1.mov']))
     expect(screen.queryByText(NO_PERMISSION)).toBeNull()
   })
 
@@ -244,7 +256,7 @@ describe('a drop before the role is known', () => {
     expect(screen.queryByText('sidebar-folder')).toBeNull()
   })
 
-  it('answers a held drop with "Sign in to upload" when the user fetch ends with no user', () => {
+  it('answers a held drop with "Sign in to upload" when the user fetch ends with no user', async () => {
     signOutElsewhere()
     auth.user = null
     auth.userFetched = false
@@ -256,10 +268,23 @@ describe('a drop before the role is known', () => {
     rerender(page())
 
     expect(rowNames()).toEqual([])
-    expect(screen.getAllByText('Sign in to upload')).toHaveLength(1)
+    expect(await screen.findAllByText('Sign in to upload')).toHaveLength(1)
   })
 
-  it('holds drops on grid and sidebar folders too, then starts them once the members say editor', () => {
+  it('starts a held drop as the account that made it, not one signed in since', async () => {
+    const { rerender } = render(page())
+    dropFiles(screen.getByTestId('grid'), [take()])
+
+    // Another tab signs in as someone else before the role answers.
+    signInAs('u2')
+    members.data = [{ user_id: 'u1', role: 'editor' }]
+    rerender(page())
+
+    expect(await screen.findByText(ACCOUNT_CHANGED)).toBeTruthy()
+    expect(useUploadStore.getState().files).toEqual([])
+  })
+
+  it('holds drops on grid and sidebar folders too, then starts them once the members say editor', async () => {
     const { rerender } = render(page())
     fireEvent.click(screen.getByText('grid-folder'))
     fireEvent.click(screen.getByText('sidebar-folder'))
@@ -268,6 +293,6 @@ describe('a drop before the role is known', () => {
     members.data = [{ user_id: 'u1', role: 'editor' }]
     rerender(page())
 
-    expect(rowNames().sort()).toEqual(['grid-folder.mov', 'sidebar-folder.mov'])
+    await waitFor(() => expect(rowNames().sort()).toEqual(['grid-folder.mov', 'sidebar-folder.mov']))
   })
 })
