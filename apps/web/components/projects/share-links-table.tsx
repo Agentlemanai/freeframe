@@ -5,12 +5,17 @@ import * as Switch from '@radix-ui/react-switch'
 import { Search, Folder, File, Copy, Check, Eye } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { formatRelativeTime } from '@/lib/utils'
+import { withBasePath } from '@/lib/base-path'
+import { ContextMenuArea } from '@/components/shared/item-menu'
+import { ShareLinkMenuItems } from './menus/share-link-menu'
 import type { ShareLinkListItem } from '@/types'
 
 interface ShareLinksTableProps {
   shareLinks: ShareLinkListItem[]
   onSelectLink: (token: string) => void
   onToggleEnabled: (token: string, enabled: boolean) => void
+  /** With this, right-click on a row opens the link's menu, as in the sidebar. */
+  onDelete?: (token: string) => void
   onViewActivity: (token: string) => void
   frontendUrl: string
 }
@@ -19,6 +24,7 @@ export function ShareLinksTable({
   shareLinks,
   onSelectLink,
   onToggleEnabled,
+  onDelete,
   onViewActivity,
   frontendUrl,
 }: ShareLinksTableProps) {
@@ -34,7 +40,7 @@ export function ShareLinksTable({
   const handleCopy = React.useCallback(
     async (token: string, e: React.MouseEvent) => {
       e.stopPropagation()
-      const url = `${frontendUrl}/share/${token}`
+      const url = `${frontendUrl}${withBasePath(`/share/${token}`)}`
       await navigator.clipboard.writeText(url)
       setCopiedToken(token)
       setTimeout(() => setCopiedToken(null), 2000)
@@ -95,13 +101,20 @@ export function ShareLinksTable({
             </thead>
             <tbody>
               {filtered.map((link, i) => {
-                const shareUrl = `${frontendUrl}/share/${link.token}`
+                const shareUrl = `${frontendUrl}${withBasePath(`/share/${link.token}`)}`
                 const isCopied = copiedToken === link.token
                 const isLast = i === filtered.length - 1
 
                 return (
-                  <tr
+                  <ContextMenuArea
                     key={link.token}
+                    items={
+                      onDelete ? (
+                        <ShareLinkMenuItems link={link} onToggleEnabled={onToggleEnabled} onDelete={onDelete} />
+                      ) : null
+                    }
+                  >
+                  <tr
                     className={cn(
                       'group transition-colors hover:bg-bg-hover/40',
                       !isLast && 'border-b border-border',
@@ -195,6 +208,7 @@ export function ShareLinksTable({
                       </button>
                     </td>
                   </tr>
+                  </ContextMenuArea>
                 )
               })}
             </tbody>

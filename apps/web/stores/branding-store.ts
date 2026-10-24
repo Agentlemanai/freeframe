@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { logoUrlFromApi } from '@/lib/branding-logo'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -18,9 +19,13 @@ export interface InstanceBranding {
   login_logo_url: string | null
   primary_color: string | null
   powered_by_freeframe: boolean
+  default_login_mode: LoginMode
   created_at: string
   updated_at: string
 }
+
+
+export type LoginMode = 'magic_code' | 'password'
 
 /** The branding fields that decide what gets painted, with no store plumbing. */
 export interface BrandingValues {
@@ -32,11 +37,10 @@ export interface BrandingValues {
   loginLogoUrl: string | null
   poweredByFreeframe: boolean
   primaryColor: string | null
+  defaultLoginMode: LoginMode
 }
 
 interface BrandingState extends BrandingValues {
-  /** When branding was last synced from the server — used to expire persisted logo URLs. */
-  brandingFetchedAt: number | null
   loaded: boolean
   loading: boolean
 
@@ -48,6 +52,7 @@ interface BrandingState extends BrandingValues {
   setLoginLogoUrl: (url: string | null) => void
   setPoweredByFreeframe: (value: boolean) => void
   setPrimaryColor: (color: string | null) => void
+  setDefaultLoginMode: (mode: LoginMode) => void
   fetchBranding: () => Promise<void>
   syncBranding: (data: InstanceBranding) => void
 }
@@ -62,17 +67,18 @@ interface BrandingState extends BrandingValues {
 export function brandingValuesFromApi(data: InstanceBranding): BrandingValues {
   return {
     orgName: data.org_name || HARDCODED_DEFAULTS.orgName,
-    orgLogoDark: data.logo_dark_url ?? null,
-    orgLogoLight: data.logo_light_url ?? null,
-    faviconUrl: data.favicon_url ?? null,
-    appleIconUrl: data.apple_icon_url ?? null,
-    loginLogoUrl: data.login_logo_url ?? null,
+    orgLogoDark: logoUrlFromApi(data.logo_dark_url),
+    orgLogoLight: logoUrlFromApi(data.logo_light_url),
+    faviconUrl: logoUrlFromApi(data.favicon_url),
+    appleIconUrl: logoUrlFromApi(data.apple_icon_url),
+    loginLogoUrl: logoUrlFromApi(data.login_logo_url),
     poweredByFreeframe: data.powered_by_freeframe ?? true,
     // No coercion to a default here, unlike the fields above. `null` means no
     // accent was ever configured, and it has to survive as `null` so the accent
     // tokens are handed back to the stylesheet rather than repainting every
     // un-branded instance in the default colour.
     primaryColor: data.primary_color ?? null,
+    defaultLoginMode: data.default_login_mode ?? 'magic_code',
   }
 }
 
@@ -84,19 +90,16 @@ export const HARDCODED_DEFAULTS = {
   appleIconUrl: null,
   loginLogoUrl: null,
   poweredByFreeframe: true,
-  primaryColor: '#7c3aed',
+  // null, like the API's unset accent: before branding loads, or if the fetch
+  // fails, an unbranded instance must not look as if it had an accent set.
+  primaryColor: null as string | null,
+  defaultLoginMode: 'magic_code' as LoginMode,
 }
-
-// Logo URLs are presigned S3 links the API signs for an hour. They're persisted so a
-// reload doesn't flash the default brand, but a URL older than this would render as a
-// broken image, so treat anything past the margin as unusable until the refetch lands.
-const LOGO_URL_MAX_AGE_MS = 45 * 60 * 1000
 
 export const useBrandingStore = create<BrandingState>()(
   persist(
     (set, get) => ({
       ...HARDCODED_DEFAULTS,
-      brandingFetchedAt: null,
       loaded: false,
       loading: false,
 
@@ -108,11 +111,11 @@ export const useBrandingStore = create<BrandingState>()(
       setLoginLogoUrl: (url) => set({ loginLogoUrl: url }),
       setPoweredByFreeframe: (value) => set({ poweredByFreeframe: value }),
       setPrimaryColor: (color) => set({ primaryColor: color }),
+      setDefaultLoginMode: (mode) => set({ defaultLoginMode: mode }),
 
       syncBranding: (data: InstanceBranding) => {
         set({
           ...brandingValuesFromApi(data),
-          brandingFetchedAt: Date.now(),
           loaded: true,
           loading: false,
         })
@@ -132,10 +135,11 @@ export const useBrandingStore = create<BrandingState>()(
     }),
     {
       name: 'ff-branding',
-      version: 5,
+      // 7: logo URLs became stable API paths. Copies from earlier versions hold
+      // signed links that have long expired, so they are discarded.
+      version: 7,
       migrate: () => ({
         ...HARDCODED_DEFAULTS,
-        brandingFetchedAt: null,
         loaded: false,
         loading: false,
       }),
@@ -143,25 +147,13 @@ export const useBrandingStore = create<BrandingState>()(
         orgName: state.orgName,
         poweredByFreeframe: state.poweredByFreeframe,
         primaryColor: state.primaryColor,
+        defaultLoginMode: state.defaultLoginMode,
         orgLogoDark: state.orgLogoDark,
         orgLogoLight: state.orgLogoLight,
         faviconUrl: state.faviconUrl,
         appleIconUrl: state.appleIconUrl,
         loginLogoUrl: state.loginLogoUrl,
-        brandingFetchedAt: state.brandingFetchedAt,
       }),
-      onRehydrateStorage: () => (state) => {
-        if (!state) return
-        const fetchedAt = state.brandingFetchedAt
-        if (fetchedAt && Date.now() - fetchedAt < LOGO_URL_MAX_AGE_MS) return
-        // Signed too long ago (or from a build that didn't record when) — drop the
-        // URLs so the default marks render until fetchBranding() signs fresh ones.
-        state.setOrgLogoDark(null)
-        state.setOrgLogoLight(null)
-        state.setFaviconUrl(null)
-        state.setAppleIconUrl(null)
-        state.setLoginLogoUrl(null)
-      },
     },
   ),
 )

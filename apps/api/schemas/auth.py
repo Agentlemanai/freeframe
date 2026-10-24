@@ -1,8 +1,10 @@
-from pydantic import AfterValidator, BaseModel, EmailStr, field_validator, Field
-from typing import Annotated
+from pydantic import AfterValidator, BaseModel, EmailStr, model_validator, Field
+from typing import Annotated, Literal
+import string
 import uuid
 from ..models.user import UserStatus
 from ..services.auth_service import BCRYPT_MAX_PASSWORD_BYTES
+from ..services.avatar_keys import sign_avatar
 
 
 def _reject_bcrypt_overflow(v: str) -> str:
@@ -46,6 +48,19 @@ def _require_non_blank_name(v: str) -> str:
 # bound is applied before trimming, so the stored value is always within it.
 DisplayName = Annotated[str, Field(min_length=1, max_length=255), AfterValidator(_require_non_blank_name)]
 
+# A `#rrggbb` colour, stored lowercase so the same colour is always the same
+# string. Six digits only: `User.avatar_color` is String(7), and the frontend
+# colour input emits nothing else.
+HexColor = Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$"), AfterValidator(str.lower)]
+
+# The address a new user is stored under: lowercase, so new accounts never
+# differ only by case. Sign-in schemas keep plain EmailStr on purpose, since
+# get_user_by_email needs the address as typed to reach a legacy mixed-case row.
+# ASCII only: the checks fold with Postgres lower(), which str.lower() disagrees
+# with on some non-ASCII letters (İ), so non-ASCII is left as typed.
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+NewUserEmail = Annotated[EmailStr, AfterValidator(lambda v: v.strip().translate(_ASCII_LOWER))]
+
 class LoginRequest(BaseModel):
     email: EmailStr
     # No length bounds on login. A creation-side floor prevents new weak
@@ -71,6 +86,7 @@ class UserResponse(BaseModel):
     email: str
     name: str
     avatar_url: str | None
+    avatar_color: str | None = None
     status: UserStatus
     email_verified: bool = False
     is_superadmin: bool = False
@@ -78,13 +94,13 @@ class UserResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
-    @field_validator("avatar_url", mode="after")
-    @classmethod
-    def resolve_avatar_url(cls, v: str | None) -> str | None:
-        if v and not v.startswith("http"):
-            from ..services import s3_service
-            return s3_service.generate_presigned_get_url(v)
-        return v
+    @model_validator(mode="after")
+    def resolve_avatar_url(self) -> "UserResponse":
+        # The column holds a storage key. Only this user's own uploaded avatar
+        # is signed; any other value (another prefix, another user's key, a
+        # full URL) is shown as no avatar rather than handed out as a link.
+        self.avatar_url = sign_avatar(self.id, self.avatar_url)
+        return self
 
 class AdminUserResponse(UserResponse):
     """UserResponse plus the pending invite token.
@@ -95,8 +111,9 @@ class AdminUserResponse(UserResponse):
     invite_token: str | None = None
 
 class InviteRequest(BaseModel):
-    email: EmailStr
-    name: str
+    email: NewUserEmail
+    # Unbounded, a long pasted name reached the INSERT as a DataError and a 500.
+    name: DisplayName
 
 # Magic code flow
 class SendMagicCodeRequest(BaseModel):
@@ -138,7 +155,14 @@ class UpdateProfileRequest(BaseModel):
     # that trims to empty renders as a blank author everywhere it is shown.
     # Optional because this is a PATCH; a body that omits it leaves it alone.
     name: DisplayName | None = None
-    avatar_url: str | None = None
+    # No `avatar_url`. It holds a storage key that every response signs, so it
+    # is only ever set by the avatar upload confirm step, which checks the key
+    # is under the caller's own prefix. A client that still sends it gets the
+    # usual extra-field treatment: ignored.
+    #
+    # Unlike `name`, an explicit null is meaningful (back to the default
+    # colour), so the router checks `model_fields_set` rather than `is None`.
+    avatar_color: HexColor | None = None
 
 class UpdateUserRoleRequest(BaseModel):
     is_admin: bool
@@ -158,6 +182,18 @@ NotificationPreferences = Annotated[
 ]
 
 
+class ProjectsViewPreferences(BaseModel):
+    """Projects page appearance: grid or list, the grid's card size, whether
+    grid cards show their info row, and the sort order."""
+    model_config = {"extra": "forbid"}
+
+    layout: Literal["grid", "list"]
+    card_size: Literal["S", "M", "L"]
+    show_card_info: bool = True
+    sort_key: Literal["date", "name"] = "date"
+    sort_direction: Literal["asc", "desc"] = "desc"
+
+
 class PreferencesUpdate(BaseModel):
     """Schema-constrained preferences update.
 
@@ -173,4 +209,5 @@ class PreferencesUpdate(BaseModel):
 
     theme: _PreferenceString | None = None
     notifications: NotificationPreferences | None = None
+    projects_view: ProjectsViewPreferences | None = None
 

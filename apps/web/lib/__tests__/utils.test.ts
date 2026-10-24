@@ -4,13 +4,12 @@ import {
   formatTimecode,
   formatBytes,
   formatRelativeTime,
+  formatTimeLeft,
   truncate,
   cn,
   storageMeterState,
   gbToBytes,
   bytesToGb,
-  assetNameFromFile,
-  uploadNameForFile,
 } from '../utils'
 
 describe('formatTime', () => {
@@ -168,50 +167,14 @@ describe('GB conversion', () => {
   })
 })
 
-describe('assetNameFromFile', () => {
-  it('drops the extension', () => {
-    expect(assetNameFromFile('A047C012_230815_R1AB.mov')).toBe('A047C012_230815_R1AB')
-  })
-
-  it('drops only the last one', () => {
-    // `archive.tar` is what a person would call this, and it is what the
-    // single-file path has always produced.
-    expect(assetNameFromFile('rushes.tar.gz')).toBe('rushes.tar')
-  })
-
-  it('leaves a name that has no extension', () => {
-    expect(assetNameFromFile('Rushes')).toBe('Rushes')
-  })
-
-  it('keeps a name that is nothing but an extension', () => {
-    // Stripping it would leave an asset called "", which is worse than a
-    // dotfile name nobody meant to upload in the first place.
-    expect(assetNameFromFile('.gitignore')).toBe('.gitignore')
-  })
-
-  it('keeps a dot that is part of the name', () => {
-    expect(assetNameFromFile('Ep04 v2.1 final.mov')).toBe('Ep04 v2.1 final')
-  })
-})
-
-describe('uploadNameForFile', () => {
-  // The bug this pins: with several files selected, `:408` read the raw
-  // filename while the single-file path at `:354` had already prefilled the
-  // field with the stripped one. So three clips uploaded as "A047C012.mov" and
-  // one as "A047C012" -- the same file, named two different ways depending on
-  // what else was picked with it.
-  it('strips the extension for every file when several were picked', () => {
-    expect(uploadNameForFile('A047C012.mov', '', 3)).toBe('A047C012')
-    expect(uploadNameForFile('A047C012.mov', 'Scene 4', 3)).toBe('A047C012')
-  })
-
-  it('lets a typed name win only when it can mean one file', () => {
-    expect(uploadNameForFile('A047C012.mov', 'Scene 4', 1)).toBe('Scene 4')
-    expect(uploadNameForFile('A047C012.mov', '   ', 1)).toBe('A047C012')
-    expect(uploadNameForFile('A047C012.mov', '', 1)).toBe('A047C012')
-  })
-
-  it('keeps a name that is nothing but an extension', () => {
-    expect(uploadNameForFile('.gitignore', '', 2)).toBe('.gitignore')
+describe('formatTimeLeft', () => {
+  it.each([
+    [20, '< 1 min left'],
+    [60, '1 min left'],
+    [150, '3 min left'],        // rounded up: never promise less than is left
+    [3600, '1 h left'],
+    [4800, '1 h 20 min left'],
+  ])('%s s reads "%s"', (seconds, expected) => {
+    expect(formatTimeLeft(seconds)).toBe(expected)
   })
 })

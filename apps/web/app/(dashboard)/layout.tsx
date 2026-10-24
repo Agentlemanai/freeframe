@@ -7,9 +7,11 @@ import { useUploadStore } from "@/stores/upload-store";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Header } from "@/components/layout/header";
 import { CommandPalette } from "@/components/layout/command-palette";
+import { KeyboardShortcuts } from "@/components/layout/keyboard-shortcuts";
 import { UploadsPanel } from "@/components/layout/uploads-panel";
 import { UploadSSEBridge } from "@/components/layout/upload-sse-bridge";
 import { PoweredByBadge } from "@/components/shared/powered-by-badge";
+import { useUploadLeaveGuard } from "@/hooks/use-upload-leave-guard";
 import { refuseFileDrag } from "@/lib/drag";
 import { cn } from "@/lib/utils";
 
@@ -22,7 +24,10 @@ export default function DashboardLayout({
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(true);
   const [commandOpen, setCommandOpen] = React.useState(false);
   const { fetchUser } = useAuthStore();
-  const { fetchHistory } = useUploadStore();
+  const fetchHistory = useUploadStore((s) => s.fetchHistory);
+
+  // Ask the browser to confirm before the tab goes away with uploads in it.
+  useUploadLeaveGuard();
 
   // The asset viewer renders its own top bar, carrying both the header's role
   // and the attribution credit, so the shell supplies neither here.
@@ -98,6 +103,7 @@ export default function DashboardLayout({
       <UploadsPanel railCollapsed={sidebarCollapsed} />
       <UploadSSEBridge />
       <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
+      <KeyboardShortcuts standalone />
     </div>
   );
 }

@@ -1,8 +1,12 @@
+import json
 import logging
 import re
+import subprocess
 import uuid
 from collections import defaultdict
+from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Optional
 from urllib.parse import quote
 
@@ -16,7 +20,14 @@ from ..middleware.share_auth import get_share_link
 from ..services import event_service
 from ..models.asset import Asset, AssetType, AssetVersion, MediaFile, ProcessingStatus
 from ..models.project import ProjectMember, ProjectRole
-from ..models.comment import Annotation, Comment, CommentAttachment, CommentReaction
+from ..models.comment import (
+    Annotation,
+    Comment,
+    CommentAttachment,
+    CommentReaction,
+    CommentVisibility,
+    COMMENT_TREE_MAX_DEPTH,
+)
 from ..models.activity import Mention, Notification, NotificationType, ActivityLog, ActivityAction
 from ..models.user import User, GuestUser
 from ..models.share import ShareLink, ShareLinkActivity, ShareActivityAction, SharePermission
@@ -38,6 +49,7 @@ from ..services import s3_service
 from ..services import comment_export
 from ..services.permissions import (
     require_asset_access, can_access_asset, validate_share_link_with_session, validate_asset_in_share,
+    require_asset_project_live,
 )
 from ..tasks.email_tasks import send_mention_email, send_comment_email
 from ..tasks.celery_app import send_task_safe
@@ -56,6 +68,88 @@ _START_TC_RE = re.compile(r"^\d{2}[:;]\d{2}[:;]\d{2}[:;]\d{2}$")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+_DEFAULT_EDL_START_TC = "01:00:00:00"
+
+
+def _start_timecode_is_valid(start_tc: str, spec) -> bool:
+    if not _START_TC_RE.fullmatch(start_tc):
+        return False
+    hh, mm, ss, ff = (int(part) for part in re.split(r"[:;]", start_tc))
+    return hh <= 23 and mm < 60 and ss < 60 and ff < spec.timebase
+
+
+def _probe_source_timecode(media_file: Optional[MediaFile], spec) -> Optional[str]:
+    raw_key = getattr(media_file, "s3_key_raw", None)
+    if not isinstance(raw_key, str) or not raw_key:
+        return None
+
+    try:
+        source_url = s3_service.generate_internal_presigned_get_url(raw_key, expires_in=300)
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type:stream_tags=timecode:format_tags=timecode",
+                "-of",
+                "json",
+                source_url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as exc:
+        log.warning(
+            "Could not probe embedded timecode for media file %s (%s)",
+            getattr(media_file, "id", None),
+            type(exc).__name__,
+        )
+        return None
+
+    if result.returncode != 0:
+        log.warning(
+            "ffprobe exited with status %s for media file %s",
+            result.returncode,
+            getattr(media_file, "id", None),
+        )
+        return None
+
+    try:
+        probe_data = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        log.warning(
+            "ffprobe returned invalid JSON for media file %s",
+            getattr(media_file, "id", None),
+        )
+        return None
+
+    if not isinstance(probe_data, dict):
+        return None
+
+    candidates = []
+    streams = probe_data.get("streams")
+    if isinstance(streams, list):
+        for stream in streams:
+            if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+                continue
+            tags = stream.get("tags")
+            if isinstance(tags, dict) and isinstance(tags.get("timecode"), str):
+                candidates.append(tags["timecode"])
+
+    format_data = probe_data.get("format")
+    if isinstance(format_data, dict):
+        tags = format_data.get("tags")
+        if isinstance(tags, dict) and isinstance(tags.get("timecode"), str):
+            candidates.append(tags["timecode"])
+
+    return next(
+        (candidate for candidate in candidates if _start_timecode_is_valid(candidate, spec)),
+        None,
+    )
+
 
 def _get_asset(db: Session, asset_id: uuid.UUID) -> Asset:
     asset = db.query(Asset).filter(Asset.id == asset_id, Asset.deleted_at.is_(None)).first()
@@ -111,7 +205,7 @@ def _build_comment_response(
     comment: Comment,
     db: Session,
     current_user_id: uuid.UUID | None = None,
-    depth: int = 5,
+    depth: int = COMMENT_TREE_MAX_DEPTH,
 ) -> CommentResponse:
     annotation = db.query(Annotation).filter(Annotation.comment_id == comment.id).first()
     replies_raw = []
@@ -145,7 +239,10 @@ def _build_comment_response(
     if comment.author_id:
         author = db.query(User).filter(User.id == comment.author_id).first()
         if author:
-            author_info = AuthorInfo(id=author.id, name=author.name, avatar_url=author.avatar_url)
+            author_info = AuthorInfo(
+                id=author.id, name=author.name,
+                avatar_url=author.avatar_url, avatar_color=author.avatar_color,
+            )
 
     guest_author_info = None
     if comment.guest_author_id:
@@ -179,7 +276,7 @@ def _build_comment_responses_batched(
     top_level: list[Comment],
     db: Session,
     current_user_id: uuid.UUID | None = None,
-    max_depth: int = 5,
+    max_depth: int = COMMENT_TREE_MAX_DEPTH,
     exclude_internal: bool = False,
 ) -> list[CommentResponse]:
     """Build the comment tree for `top_level` with a FIXED number of queries
@@ -247,7 +344,10 @@ def _build_comment_responses_batched(
         resp = CommentResponse.model_validate(comment)
         author = authors.get(comment.author_id) if comment.author_id else None
         resp.author = (
-            AuthorInfo(id=author.id, name=author.name, avatar_url=author.avatar_url)
+            AuthorInfo(
+                id=author.id, name=author.name,
+                avatar_url=author.avatar_url, avatar_color=author.avatar_color,
+            )
             if author else None
         )
         guest = guests.get(comment.guest_author_id) if comment.guest_author_id else None
@@ -275,6 +375,29 @@ def _build_comment_responses_batched(
 def _parse_mentions(body: str) -> list[str]:
     """Extract @email mentions from comment body."""
     return re.findall(r"@([\w.+-]+@[\w.-]+\.\w+)", body)
+
+
+def _notify_parent_author_about_reply(
+    db: Session,
+    parent: Optional[Comment],
+    reply: Comment,
+    asset: Asset,
+    replier_id: Optional[uuid.UUID],
+) -> None:
+    """Notify a parent author only while they can still access the asset."""
+    if not parent or not parent.author_id or parent.author_id == replier_id:
+        return
+
+    parent_author = db.query(User).filter(User.id == parent.author_id).first()
+    if not parent_author or not can_access_asset(db, asset, parent_author):
+        return
+
+    db.add(Notification(
+        user_id=parent.author_id,
+        type=NotificationType.comment,
+        asset_id=asset.id,
+        comment_id=reply.id,
+    ))
 
 
 def _create_mentions(db: Session, comment: Comment, asset: Asset, body: str, author_name: str, mention_user_ids: list | None = None) -> None:
@@ -481,14 +604,7 @@ def reply_to_comment(
 
     _create_mentions(db, reply, asset, body.body, current_user.name, body.mention_user_ids)
 
-    # Notify parent comment author about the reply (unless they're the replier)
-    if parent.author_id and parent.author_id != current_user.id:
-        db.add(Notification(
-            user_id=parent.author_id,
-            type=NotificationType.comment,
-            asset_id=asset_id,
-            comment_id=reply.id,
-        ))
+    _notify_parent_author_about_reply(db, parent, reply, asset, current_user.id)
 
     db.commit()
     db.refresh(reply)
@@ -512,6 +628,8 @@ def update_comment(
     comment = db.query(Comment).filter(Comment.id == comment_id, Comment.deleted_at.is_(None)).first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
+    # The author gets past with no access check, so this is what closes a deleted project.
+    require_asset_project_live(db, comment.asset_id)
     # Allow comment owner or project owner to edit
     if comment.author_id != current_user.id:
         asset = _get_asset(db, comment.asset_id)
@@ -539,6 +657,8 @@ def delete_comment(
     comment = db.query(Comment).filter(Comment.id == comment_id, Comment.deleted_at.is_(None)).first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
+    # The author gets past with no access check, so this is what closes a deleted project.
+    require_asset_project_live(db, comment.asset_id)
     # Allow comment owner or project owner to delete
     if comment.author_id != current_user.id:
         asset = _get_asset(db, comment.asset_id)
@@ -647,6 +767,7 @@ def delete_attachment(
 ):
     comment = _get_comment(db, comment_id)
     asset = _get_asset(db, comment.asset_id)
+    require_asset_project_live(db, asset.id)
 
     attachment = db.query(CommentAttachment).filter(
         CommentAttachment.id == attachment_id,
@@ -777,7 +898,7 @@ def export_comments(
     format: str = Query(...),
     version_id: Optional[uuid.UUID] = Query(default=None),
     fps: Optional[float] = Query(default=None, gt=0),
-    start_tc: str = Query(default="01:00:00:00"),
+    start_tc: Optional[str] = Query(default=None),
     include_resolved: bool = Query(default=True),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -836,13 +957,40 @@ def export_comments(
                        + ", ".join(str(round(s.fps, 3)) for s in comment_export.FPS_TABLE),
             )
         if format == "edl":
-            if not _START_TC_RE.match(start_tc):
-                raise HTTPException(status_code=422, detail="start_tc must be HH:MM:SS:FF")
+            probed_start_tc = None
+            if start_tc is None:
+                probe_source = None
+                if media_file is not None:
+                    raw_key = media_file.s3_key_raw
+                    if isinstance(raw_key, str) and raw_key:
+                        probe_source = SimpleNamespace(
+                            id=media_file.id, s3_key_raw=raw_key
+                        )
+                        # Release the read transaction before the network request.
+                        db.commit()
+                probed_start_tc = _probe_source_timecode(probe_source, spec)
+                start_tc = probed_start_tc or _DEFAULT_EDL_START_TC
+            if not _START_TC_RE.fullmatch(start_tc):
+                raise HTTPException(
+                    status_code=422, detail="start_tc must be HH:MM:SS:FF"
+                )
             hh, mm, ss, ff = (int(p) for p in re.split(r"[:;]", start_tc))
             if not (hh <= 23 and mm < 60 and ss < 60 and ff < spec.timebase):
-                raise HTTPException(status_code=422, detail="start_tc out of range for the frame rate")
+                raise HTTPException(
+                    status_code=422, detail="start_tc out of range for the frame rate"
+                )
+            edl_spec = spec
+            if probed_start_tc is not None:
+                edl_spec = replace(
+                    spec,
+                    drop_frame=spec.drop_frame and probed_start_tc[-3] == ";",
+                )
 
+    # The asset filter is not redundant: a row filed under another asset with this
+    # version's id (written before guest comments validated version_id) must not
+    # be exported as one of this version's comments.
     comments = db.query(Comment).filter(
+        Comment.asset_id == asset.id,
         Comment.version_id == version.id,
         Comment.deleted_at.is_(None),
     ).order_by(Comment.created_at.asc()).all()
@@ -896,7 +1044,7 @@ def export_comments(
                     len(markers) - comment_export.EDL_MAX_EVENTS,
                 )
             content = comment_export.to_edl(
-                markers, spec, comment_export.tc_to_frames(start_tc, spec), asset.name)
+                markers, edl_spec, comment_export.tc_to_frames(start_tc, edl_spec), asset.name)
         elif format == "fcpxml":
             content = comment_export.to_fcpxml(markers, spec, asset.name, duration_frames)
         else:
@@ -995,10 +1143,41 @@ def guest_comment(
     asset = _get_asset(db, target_asset_id)
     validate_asset_in_share(db, link, asset)
 
-    # Resolve version_id: use provided or get latest ready version
+    # A reply must answer a comment a guest on this link can actually see: a live,
+    # non-internal comment on the asset the link resolved to (`asset.id`, never
+    # `body.asset_id`). `parent_id` used to be written straight through, so an
+    # unknown id hit the foreign key and answered 500, and a parent on another
+    # asset or behind `internal` was accepted. Mirrors `create_comment` and
+    # `reply_to_comment`, including the version: a reply belongs to the same
+    # version as what it answers.
+    parent = None
+    if body.parent_id:
+        parent = db.query(Comment).filter(
+            Comment.id == body.parent_id,
+            Comment.asset_id == asset.id,
+            Comment.deleted_at.is_(None),
+            Comment.visibility != "internal",
+        ).first()
+        if not parent:
+            raise HTTPException(status_code=400, detail="Parent comment not found on this asset")
+
     version_id = body.version_id
-    if not version_id:
-        from ..models.asset import AssetVersion, ProcessingStatus
+    # A supplied version has to belong to the asset the link resolved, not merely
+    # exist. Without the check the id was written straight through, and the export
+    # selects a version's comments by version_id, so a comment filed here could
+    # surface in another asset's export.
+    if version_id:
+        owned = db.query(AssetVersion).filter(
+            AssetVersion.id == version_id, AssetVersion.asset_id == asset.id,
+            AssetVersion.deleted_at.is_(None),
+        ).first()
+        if not owned:
+            raise HTTPException(status_code=400, detail="version_id does not belong to this asset")
+
+    # Resolve version_id: the parent's for a reply, else provided, else the latest ready version
+    if parent:
+        version_id = parent.version_id
+    elif not version_id:
         latest = db.query(AssetVersion).filter(
             AssetVersion.asset_id == asset.id,
             AssetVersion.deleted_at.is_(None),
@@ -1008,6 +1187,15 @@ def guest_comment(
             version_id = latest.id
         else:
             raise HTTPException(status_code=400, detail="No ready version found for this asset")
+
+    # An internal comment is team-only and the share listing never returns one,
+    # so only a caller with real access to the asset may file it here. The field
+    # used to be dropped, which stored a signed-in member's internal note as
+    # public and showed it to every link holder. Refuse rather than downgrade.
+    if body.visibility == CommentVisibility.internal and not (
+        current_user is not None and can_access_asset(db, asset, current_user)
+    ):
+        raise HTTPException(status_code=403, detail="Internal comments require access to the asset")
 
     # Determine author: logged-in user or guest
     author_id = None
@@ -1028,12 +1216,13 @@ def guest_comment(
     comment = Comment(
         asset_id=asset.id,
         version_id=version_id,
-        parent_id=body.parent_id,
+        parent_id=parent.id if parent else None,
         author_id=author_id,
         guest_author_id=guest_author_id,
         timecode_start=body.timecode_start,
         timecode_end=body.timecode_end,
         body=body.body,
+        visibility=body.visibility.value,
     )
     db.add(comment)
     db.flush()
@@ -1043,7 +1232,8 @@ def guest_comment(
     for email in set(emails):
         from ..services.auth_service import get_user_by_email
         user = get_user_by_email(db, email)
-        if user:
+        # Same rule as _create_mentions: only someone who can see the asset is told about it.
+        if user and can_access_asset(db, asset, user):
             mention = Mention(comment_id=comment.id, mentioned_user_id=user.id)
             db.add(mention)
             notif = Notification(
@@ -1053,6 +1243,8 @@ def guest_comment(
                 comment_id=comment.id,
             )
             db.add(notif)
+
+    _notify_parent_author_about_reply(db, parent, comment, asset, author_id)
 
     if body.annotation:
         annotation = Annotation(

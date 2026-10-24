@@ -59,9 +59,9 @@ class AssetVersion(Base):
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     processing_status: Mapped[ProcessingStatus] = mapped_column(Enum(ProcessingStatus), default=ProcessingStatus.uploading)
     # The S3 multipart upload backing this version while it is being uploaded.
-    # NULL for rows created before this was recorded, and for versions whose
-    # upload has been completed or aborted -- treat NULL as "unknown", never as
-    # "no upload exists".
+    # NULL for rows created before this was recorded -- treat NULL as "unknown",
+    # never as "no upload exists". It is never cleared, so a non-NULL value says
+    # nothing about whether the upload completed.
     # The storage backend's multipart UploadId. Opaque and backend-defined in length:
     # Cloudflare R2 issues 343-character IDs, so this must not be a bounded VARCHAR.
     upload_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

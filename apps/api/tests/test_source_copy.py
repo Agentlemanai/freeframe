@@ -13,6 +13,8 @@ import json
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from packages.transcoder.base import TranscodeJob
 from packages.transcoder.ffmpeg_transcoder import FFmpegTranscoder
 
@@ -29,8 +31,11 @@ def _transcode(
     keyframes: list[float] | None = None,
     open_gop: bool = False,
     idrs: int | None = None,
+    tail_open_gop: bool = False,
+    trace_silent: bool = False,
     remux_fails: bool = False,
     hls_commands: int = 1,
+    first_packet: dict | None = None,
 ):
     """Run a transcode with everything mocked; return (hls command, result).
 
@@ -59,24 +64,53 @@ def _transcode(
             if entries.startswith("packet="):
                 # Sync samples, plus one ordinary frame so the "K" filter is
                 # doing something rather than counting every packet.
-                mock.stdout = json.dumps({"packets": [
-                    *({"pts_time": f"{t:.6f}", "flags": "K_"} for t in times),
-                    {"pts_time": "0.040000", "flags": "__"},
-                ]})
-            elif selected == "v:0":
+                mock.stdout = json.dumps({
+                    "packets": (
+                        ([first_packet] if first_packet is not None else [])
+                        + [{"pts_time": f"{t:.6f}", "flags": "K_"} for t in times]
+                        + [{"pts_time": "0.040000", "flags": "__"}]
+                    ),
+                })
+            elif selected == "V:0":
                 mock.stdout = json.dumps({"streams": [stream]})
             elif selected == "a":
                 mock.stdout = json.dumps({"streams": audio_streams or []})
         elif "trace_headers" in cmd:
-            # What ffmpeg -v trace prints per NAL unit. An open-GOP master has
-            # one real IDR and marks its later entry points with a recovery
-            # point instead.
-            lines = ["nal_unit_type: 7(SPS), nal_ref_idc: 3"]
+            # What ffmpeg -v trace really prints per NAL unit. An open-GOP
+            # master has one real IDR and marks its later entry points with a
+            # recovery point instead.
+            #
+            # The prefixes are the point, not decoration. `avformat_find_stream_info`
+            # decodes enough to identify the stream and logs its own IDR line
+            # from an `[h264 @ ...]` context before trace_headers runs, so real
+            # output always carries exactly one more IDR line than there are
+            # sync samples. Emitting bare lines hid that, which is why the test
+            # below for a sync sample that is not an IDR could not fail (#377).
+            # Measured against ffmpeg 7.1.5: 15 sync samples give 15
+            # `[trace_headers @ ...]` IDR lines and 1 `[h264 @ ...]` one.
+            if trace_silent:
+                # ffmpeg exits 0 and prints nothing trace_headers shaped, which
+                # is what a future change in its log spelling would look like.
+                mock.stderr = "some other ffmpeg chatter\n"
+                return mock
+            th = "[trace_headers @ 0x7f8e0] "
+            # `_copy_probe_windows` also samples the tail of a long master, and
+            # `tail_open_gop` is how a joined source is modelled: the head looks
+            # copyable and the part after the join does not (#379). The tail pass
+            # is the one that seeks, so `-ss` identifies it.
+            if tail_open_gop and "-ss" in cmd:
+                mock.stderr = "\n".join(
+                    ["[h264 @ 0x7f8e1] nal_unit_type: 5(IDR), nal_ref_idc: 3",
+                     th + "nal_unit_type: 5(IDR), nal_ref_idc: 3"]
+                    + [th + "recovery_frame_cnt        00000 = 0"] * (len(times) - 1))
+                return mock
+            lines = ["[h264 @ 0x7f8e1] nal_unit_type: 5(IDR), nal_ref_idc: 3",
+                     th + "nal_unit_type: 7(SPS), nal_ref_idc: 3"]
             idr_units = len(times) if idrs is None else idrs
             if open_gop:
                 idr_units = 1 if idrs is None else idrs
-                lines += ["recovery_frame_cnt        00000 = 0"] * (len(times) - 1)
-            lines += ["nal_unit_type: 5(IDR), nal_ref_idc: 3"] * idr_units
+                lines += [th + "recovery_frame_cnt        00000 = 0"] * (len(times) - 1)
+            lines += [th + "nal_unit_type: 5(IDR), nal_ref_idc: 3"] * idr_units
             mock.stderr = "\n".join(lines)
         elif remux_fails and "-f" in cmd and cmd[cmd.index("-f") + 1] == "hls" \
                 and "copy" in cmd:
@@ -120,10 +154,24 @@ def _copies(cmd: list[str]) -> bool:
 # ─────────────────────────────────── what may be copied
 
 def test_a_browser_safe_source_at_the_ladder_s_size_is_remuxed():
-    cmd, result, _ = _transcode(["1080p"], source=(1920, 1080))
+    cmd, result, commands = _transcode(["1080p"], source=(1920, 1080))
 
     assert _copies(cmd)
     assert "-filter_complex" not in cmd, "a copy has nothing to filter"
+    maps = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-map"]
+    assert "0:V:0" in maps, f"the copy must map the primary video, got {maps}"
+    video_probes = [
+        c[c.index("-select_streams") + 1]
+        for c in commands
+        if c[0] == "ffprobe" and "-select_streams" in c
+        and c[c.index("-select_streams") + 1] != "a"
+    ]
+    assert video_probes and set(video_probes) == {"V:0"}
+    trace_commands = [c for c in commands if "trace_headers" in c]
+    assert trace_commands
+    trace_cmd = trace_commands[0]
+    trace_maps = [trace_cmd[i + 1] for i, arg in enumerate(trace_cmd) if arg == "-map"]
+    assert "0:V:0" in trace_maps
     assert cmd[cmd.index("-var_stream_map") + 1] == "v:0"
     assert result.success and result.hls_prefix == "hls/media-1/v1"
     assert (result.width, result.height) == (1920, 1080)
@@ -135,6 +183,20 @@ def test_a_rung_above_the_source_copies_too():
     cmd, _, _ = _transcode(["1080p"], source=(1280, 720))
 
     assert _copies(cmd)
+
+
+def test_2160p_alone_copies_a_browser_safe_source_at_any_size_up_to_4k():
+    # `TRANSCODER_QUALITIES=2160p` is the "source size" setting (#451), so a
+    # 4K master and a smaller one clamped under the rung both resolve to their
+    # own size, and both are what the copy is for.
+    for source in ((3840, 2160), (2560, 1440), (1280, 720)):
+        cmd, result, _ = _transcode(["2160p"], source=source)
+        assert _copies(cmd), f"{source[0]}x{source[1]}"
+        assert (result.width, result.height) == source
+
+    # Above 4K the rung really is a smaller rendition, so it encodes.
+    cmd, _, _ = _transcode(["2160p"], source=(7680, 4320))
+    assert not _copies(cmd)
 
 
 def test_a_source_that_is_not_16_9_copies_at_its_own_size():
@@ -152,6 +214,28 @@ def test_a_source_that_is_not_16_9_copies_at_its_own_size():
     # asked for a smaller rendition.
     cmd, _, _ = _transcode(["1080p"], source=(1998, 1080))
     assert not _copies(cmd)
+
+
+def test_an_upright_portrait_source_copies_at_its_own_size():
+    # The 1080p box was landscape, so 1080x1920 under it was a 608x1080 rung to
+    # encode and never a copy. A portrait source is sized by its short side now,
+    # and 1080x1920 is exactly what the rung asks for (#452).
+    for width, height, rung in ((1080, 1920, "1080p"), (720, 1280, "720p")):
+        cmd, result, _ = _transcode([rung], source=(width, height))
+        assert _copies(cmd), f"{width}x{height}"
+        assert (result.width, result.height) == (width, height)
+
+
+def test_a_rotated_portrait_source_is_still_encoded():
+    # The same picture stored landscape with a matrix is sized the same way,
+    # and a remux still cannot carry the matrix.
+    cmd, _, _ = _transcode(["1080p"], source=(1920, 1080), video_stream={
+        **_H264_8BIT,
+        "side_data_list": [{"side_data_type": "Display Matrix", "rotation": -90}],
+    })
+
+    assert not _copies(cmd)
+    assert "scale=1080:1920:" in cmd[cmd.index("-filter_complex") + 1]
 
 
 def test_the_copy_writes_the_master_playlist_both_routers_hand_out():
@@ -194,6 +278,20 @@ def test_a_rung_below_the_source_is_encoded():
     assert "scale=1280:720" in cmd[cmd.index("-filter_complex") + 1]
 
 
+@pytest.mark.parametrize(
+    "first_packet",
+    [
+        pytest.param({"pts_time": "-7.320000", "flags": "_D_"}, id="discard-flag"),
+        pytest.param({"pts_time": "-7.320000", "flags": "__"}, id="negative-pts"),
+    ],
+)
+def test_a_trimmed_source_is_encoded_instead_of_remuxed(first_packet):
+    cmd, _, _ = _transcode(["1080p"], first_packet=first_packet)
+
+    assert not _copies(cmd)
+    assert "-filter_complex" in cmd
+
+
 def test_ten_bit_h264_is_encoded():
     # High 10 carries codec_name "h264" and plays in no browser. Checking the
     # codec name alone would copy it and the asset would be black for everyone.
@@ -223,11 +321,42 @@ def test_an_hdr_source_is_encoded():
     assert not _copies(cmd)
 
 
+# Each HDR shape opens the filter graph with its own input label, and each one
+# has to name the primary video stream (`V:0`, which skips attached pictures).
+# A label left on `v:0` reads a cover image when an MP4's artwork comes ahead
+# of its video, and the whole ladder becomes one frame of the cover (#430).
+_PQ_8BIT = {**_H264_8BIT, "color_transfer": "smpte2084"}
+_DOLBY_VISION_5 = {
+    "codec_name": "hevc", "pix_fmt": "yuv420p10le",
+    "side_data_list": [
+        {"side_data_type": "DOVI configuration record", "dv_profile": 5},
+    ],
+}
+
+
+@pytest.mark.parametrize("backend, video_stream, opening", [
+    ("cpu", _PQ_8BIT, "[0:V:0]format=p010"),
+    ("nvenc", _PQ_8BIT, "[0:V:0]hwdownload,format=p010"),
+    ("cpu", _DOLBY_VISION_5, "[0:V:0]libplacebo="),
+], ids=["hdr-cpu", "hdr-hardware", "dolby-vision-5"])
+def test_every_hdr_graph_reads_the_primary_video_stream(
+    backend, video_stream, opening,
+):
+    with patch("packages.transcoder.ffmpeg_transcoder.get_backend",
+               return_value=backend):
+        cmd, _, _ = _transcode(["1080p"], video_stream=video_stream)
+
+    filter_complex = cmd[cmd.index("-filter_complex") + 1]
+    assert filter_complex.startswith(opening), filter_complex
+
+
 def test_a_rotated_source_is_encoded():
     # A portrait clip off a phone is H.264 8-bit 4:2:0 SDR at its own size and
     # passes every other condition. The orientation is a display matrix in the
     # container, MPEG-TS cannot carry one, and the encode path only gets it
-    # right because a filter graph makes ffmpeg autorotate -- so a copy would
+    # right because ffmpeg autorotates frames on their way into the filter
+    # graph (system-memory frames only; see test_transcoder_display_rotation)
+    # -- so a copy would
     # produce a video lying on its side beside an upright thumbnail.
     for rotation in (90, -90, 180, 270):
         cmd, _, _ = _transcode(["1080p"], video_stream={
@@ -242,6 +371,23 @@ def test_a_rotated_source_is_encoded():
     cmd, _, _ = _transcode(
         ["1080p"], video_stream={**_H264_8BIT, "tags": {"rotate": "90"}},
     )
+    assert not _copies(cmd)
+
+
+@pytest.mark.parametrize("video_stream", [
+    {**_H264_8BIT, "side_data_list": [
+        {"side_data_type": "Display Matrix", "rotation": "n/a"},
+    ]},
+    {**_H264_8BIT, "tags": {"rotate": "abc"}},
+    {**_H264_8BIT, "tags": {"rotate": "nan"}},
+    {**_H264_8BIT, "tags": {"rotate": "inf"}},
+], ids=["side-data-text", "tag-text", "tag-nan", "tag-inf"])
+def test_a_rotation_that_cannot_be_read_is_encoded(video_stream):
+    # A rotation that is there but says nothing readable is an unanswered
+    # question, and every other unanswered question in this gate encodes.
+    # Reading it as 0 copied it, the one case that fell the other way (#380).
+    cmd, _, _ = _transcode(["1080p"], video_stream=video_stream)
+
     assert not _copies(cmd)
 
 
@@ -291,6 +437,76 @@ def test_a_sync_sample_that_is_not_an_idr_is_encoded_without_a_recovery_point():
     cmd, _, _ = _transcode(["1080p"], keyframes=[0.0, 2.0, 4.0], idrs=1)
 
     assert not _copies(cmd)
+
+
+def test_exactly_one_sync_sample_that_is_not_an_idr_is_still_encoded(  # noqa: E501
+):
+    # The off-by-one (#377). Real `ffmpeg -v trace` prints one
+    # `nal_unit_type: 5(IDR)` line from its own `[h264 @ ...]` decode context
+    # before trace_headers runs, so counting every occurrence came out exactly
+    # one high and the backstop tolerated exactly one bad sync sample. The
+    # sibling test above uses a margin of two, where an off-by-one cannot show.
+    cmd, _, _ = _transcode(["1080p"], keyframes=[0.0, 2.0, 4.0], idrs=2)
+
+    assert not _copies(cmd)
+
+
+def test_keyframes_that_stop_after_the_start_are_encoded():
+    # The gap running off the end of the window (#378). Taking only the pairwise
+    # gaps measures the distance between sync samples and never the distance
+    # after the last one, so a slate spliced onto a long-GOP body reported half
+    # a second and copied into one segment as long as the file. Measured on a
+    # real 41s file built that way: the copy produced a single `#EXTINF:41`.
+    cmd, _, _ = _transcode(
+        ["1080p"], keyframes=[0.0, 0.5, 1.0],
+        video_stream={**_H264_8BIT, "duration": 41.0},
+    )
+
+    assert not _copies(cmd)
+
+
+def test_a_master_that_changes_after_the_first_window_is_encoded():
+    # The bound on the probe (#379). One window says what the first 30s look
+    # like, not what the file is, and a lossless join of clips from different
+    # encoders breaks that premise: reproduced on a real joined file whose head
+    # is closed-GOP and whose tail is not, where segments 18 onward each decode
+    # to `non-existing PPS 0 referenced` while ffmpeg exits 0.
+    # Keyframes run the length of the head window on purpose: without them the
+    # tail-gap rule above refuses first and this passes for the wrong reason.
+    cmd, _, _ = _transcode(
+        ["1080p"], tail_open_gop=True,
+        keyframes=[float(t) for t in range(0, 32, 2)],
+        video_stream={**_H264_8BIT, "duration": 55.0},
+    )
+
+    assert not _copies(cmd)
+
+
+def test_a_trace_that_says_nothing_is_encoded_and_says_why(capsys):
+    # The gate rests on parsing ffmpeg's log, which is not an interface ffmpeg
+    # promises to keep. If trace_headers says nothing at all the parse did not
+    # happen, whatever the exit code claims (#381).
+    #
+    # The refusal itself is not what this pins: with no trace output every count
+    # is zero, so the IDR backstop below already refuses. What the guard adds is
+    # the REASON, and the reason is the operator's only signal for why a copy
+    # they enabled is encoding instead. Asserting the message rather than the
+    # verdict is what makes this a test rather than a restatement of the
+    # backstop.
+    capsys.readouterr()
+    cmd, _, _ = _transcode(["1080p"], trace_silent=True)
+
+    assert not _copies(cmd)
+    assert "produced no trace output" in capsys.readouterr().out
+
+
+def test_a_short_master_is_not_refused_for_silence_past_its_end():
+    # The guard on the tail-gap fix: the window is 30s and this file is 6s, so
+    # 24s of it are past the end of the media. Clamping to the real duration is
+    # what stops that being read as a 24s stretch with no sync sample.
+    cmd, _, _ = _transcode(["1080p"], keyframes=[0.0, 2.0, 4.0])
+
+    assert _copies(cmd)
 
 
 def test_a_source_whose_keyframes_are_too_far_apart_is_encoded():

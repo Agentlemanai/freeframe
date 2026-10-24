@@ -9,6 +9,7 @@ import {
   Volume2,
   VolumeX,
   ChevronUp,
+  ChevronRight,
   Check,
   Repeat,
   MoreHorizontal,
@@ -52,7 +53,7 @@ export function VideoFrameConstraint({
   videoRef,
   children,
 }: {
-  videoRef: React.RefObject<HTMLVideoElement>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
   children: React.ReactNode;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -136,7 +137,7 @@ export function VideoPlayer({
 
   const { isDrawingMode, timeFormat, setTimeFormat, setPlayheadTime, currentVersion } =
     useReviewStore();
-  const { registerPauseHandler } = useReview();
+  const { registerPauseHandler, registerTogglePlayHandler } = useReview();
   const [timeFormatOpen, setTimeFormatOpen] = useState(false);
   // The media's own width/height ratio, used to size the stage on a portrait
   // phone. 16/9 until `loadedmetadata` lands, so nothing jumps in the common
@@ -148,8 +149,13 @@ export function VideoPlayer({
   // 44px touch target instead of 28px.
   const compact = !useMediaQuery(MEDIA_SM);
   const [overflowOpen, setOverflowOpen] = useState(false);
+  // The Quality row in the overflow menu swaps the menu's rows for the list of
+  // rungs; the menu starts on its own rows each time it opens.
+  const [qualityListOpen, setQualityListOpen] = useState(false);
   const overflowRef = useRef<HTMLDivElement>(null);
   const timeFormatRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const swallowStageClickRef = useRef(false);
 
   // Close the overflow menu on an outside press. `pointerdown`, not
   // `mousedown`: the scrubber calls preventDefault on its own pointer events,
@@ -158,10 +164,19 @@ export function VideoPlayer({
   useEffect(() => {
     if (!overflowOpen) return;
     const onDown = (e: PointerEvent) => {
-      if (!overflowRef.current?.contains(e.target as Node)) setOverflowOpen(false);
+      if (!overflowRef.current?.contains(e.target as Node)) {
+        setOverflowOpen(false);
+        if (stageRef.current?.contains(e.target as Node)) {
+          swallowStageClickRef.current = true;
+        }
+      }
     };
     document.addEventListener("pointerdown", onDown);
     return () => document.removeEventListener("pointerdown", onDown);
+  }, [overflowOpen]);
+
+  useEffect(() => {
+    if (!overflowOpen) setQualityListOpen(false);
   }, [overflowOpen]);
 
   // Close time format dropdown on outside click
@@ -171,8 +186,12 @@ export function VideoPlayer({
       if (
         timeFormatRef.current &&
         !timeFormatRef.current.contains(e.target as Node)
-      )
+      ) {
         setTimeFormatOpen(false);
+        if (stageRef.current?.contains(e.target as Node)) {
+          swallowStageClickRef.current = true;
+        }
+      }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
@@ -244,6 +263,7 @@ export function VideoPlayer({
     playbackRate,
     qualityLevels,
     currentQuality,
+    selectedQuality,
     isLoading,
     isFullscreen,
     error,
@@ -256,6 +276,12 @@ export function VideoPlayer({
     toggleMute,
     toggleFullscreen,
   } = player;
+
+  const currentQualityLabel = qualityLevels.find((level) => level.index === currentQuality)?.label;
+  const autoQualityLabel = currentQualityLabel ? "Auto (" + currentQualityLabel + ")" : "Auto";
+  const selectedQualityLabel = selectedQuality === -1
+    ? autoQualityLabel
+    : qualityLevels.find((level) => level.index === selectedQuality)?.label ?? "Auto";
 
   // A source can be vertical or 4:3, so the stage must not assume 16:9.
   // `resize` covers a version switch that changes the dimensions without
@@ -281,6 +307,10 @@ export function VideoPlayer({
   useEffect(() => {
     registerPauseHandler(pause);
   }, [registerPauseHandler, pause]);
+
+  // And the toggle, for the mobile comment sheet's play/pause button, so it
+  // gets the same first-tap retry and pause disarm as this player's own.
+  useEffect(() => registerTogglePlayHandler(togglePlay), [registerTogglePlayHandler, togglePlay]);
 
   // Sync video currentTime to review store so comment input shows same timecode
   const lastSyncRef = useRef(0);
@@ -333,6 +363,10 @@ export function VideoPlayer({
   }, [togglePlay, seek, currentTime, isDrawingMode]);
 
   const handleContainerClick = useCallback(() => {
+    if (swallowStageClickRef.current) {
+      swallowStageClickRef.current = false;
+      return;
+    }
     if (!isDrawingMode) {
       togglePlay();
     }
@@ -372,6 +406,10 @@ export function VideoPlayer({
     >
       {/* Video area — fills available space, object-contain preserves aspect ratio with letterbox */}
       <div
+        ref={stageRef}
+        onPointerDownCapture={() => {
+          swallowStageClickRef.current = false;
+        }}
         // On a portrait phone the stage used to be `flex-1` with no relationship
         // to the media, so it took every pixel the column had left and
         // `object-contain` letterboxed a 16:9 video inside a box twice its
@@ -380,7 +418,7 @@ export function VideoPlayer({
         // own ratio instead. Everywhere else it fills the column exactly as
         // before, so desktop is untouched.
         className={cn(
-          "relative min-h-0 bg-black overflow-hidden cursor-pointer",
+          "relative min-h-0 bg-black overflow-hidden cursor-pointer touch-manipulation",
           // w-full is load-bearing. With only `aspect-ratio` + `max-height`, the
           // clamped height makes the width definite via the ratio, so
           // `align-items: stretch` no longer applies and the stage ends up
@@ -536,7 +574,7 @@ export function VideoPlayer({
             />
           </button>
           {timeFormatOpen && (
-            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 w-48 rounded-xl border border-white/10 bg-[#2a2a30] shadow-2xl py-1.5 animate-in fade-in zoom-in-95 duration-100">
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 slide-in-from-left-1/2 mb-2 z-50 w-48 rounded-xl border border-white/10 bg-[#2a2a30] shadow-2xl py-1.5 animate-in fade-in zoom-in-95 duration-100">
               <div className="px-3 py-2 text-[11px] text-text-tertiary uppercase tracking-wider font-medium">
                 Time Format
               </div>
@@ -584,41 +622,78 @@ export function VideoPlayer({
               </button>
               {overflowOpen && (
                 <div className="absolute bottom-full right-0 mb-2 z-50 w-44 rounded-xl border border-border bg-bg-elevated shadow-2xl py-1.5">
-                  <button
-                    onClick={() => { setLoop((v) => !v); setOverflowOpen(false); }}
-                    className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
-                  >
-                    Loop
-                    {loop && <Check className="h-4 w-4 text-accent" />}
-                  </button>
-                  <button
-                    onClick={() => { handleSpeedCycle(); }}
-                    className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
-                  >
-                    Speed
-                    <span className="tabular-nums text-text-tertiary">{playbackRate}x</span>
-                  </button>
-                  <button
-                    onClick={() => { toggleMute(); setOverflowOpen(false); }}
-                    className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
-                  >
-                    {isMuted || volume === 0 ? 'Unmute' : 'Mute'}
-                    {isMuted || volume === 0 ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
-                  </button>
+                  {/* Quality lives here below sm rather than as an inline
+                      <select>: the select is ~69px wide, which the compact row
+                      has no room for at 360px, and its text-xs would trip
+                      iOS Safari's zoom-on-focus. Opening it replaces the rows
+                      rather than appending to them: the menu opens upward from
+                      a transport row that sits only ~190-245px below the top
+                      of the player on a portrait phone, and four rows (190px)
+                      is what fits there. Auto plus the ladder's at most three
+                      rungs is exactly four. */}
+                  {qualityListOpen ? (
+                    [{ index: -1, label: autoQualityLabel }, ...qualityLevels].map((level) => (
+                      <button
+                        key={level.index}
+                        onClick={() => { setQuality(level.index); setOverflowOpen(false); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                        aria-label={`Quality ${level.label}`}
+                      >
+                        {level.label}
+                        {selectedQuality === level.index && <Check className="h-4 w-4 text-accent" />}
+                      </button>
+                    ))
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => { setLoop((v) => !v); setOverflowOpen(false); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                      >
+                        Loop
+                        {loop && <Check className="h-4 w-4 text-accent" />}
+                      </button>
+                      <button
+                        onClick={() => { handleSpeedCycle(); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                      >
+                        Speed
+                        <span className="tabular-nums text-text-tertiary">{playbackRate}x</span>
+                      </button>
+                      <button
+                        onClick={() => { toggleMute(); setOverflowOpen(false); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                      >
+                        {isMuted || volume === 0 ? 'Unmute' : 'Mute'}
+                        {isMuted || volume === 0 ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                      </button>
+                      {qualityLevels.length > 0 && (
+                        <button
+                          onClick={() => setQualityListOpen(true)}
+                          className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                        >
+                          Quality
+                          <span className="flex items-center gap-1 text-text-tertiary">
+                            {selectedQualityLabel}
+                            <ChevronRight className="h-3 w-3" />
+                          </span>
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
             </div>
           )}
-          {/* Quality selector */}
-          {qualityLevels.length > 0 && (
+          {/* Quality selector (in the overflow menu when compact) */}
+          {!compact && qualityLevels.length > 0 && (
             <select
-              value={currentQuality}
+              value={selectedQuality}
               onChange={(e) => setQuality(parseInt(e.target.value, 10))}
               className="bg-transparent text-text-secondary text-xs border border-border rounded px-1.5 py-1 cursor-pointer shrink-0 hover:text-text-primary transition-colors"
               aria-label="Quality"
             >
               <option value={-1} className="bg-bg-secondary">
-                Auto
+                {autoQualityLabel}
               </option>
               {qualityLevels.map((level) => (
                 <option
@@ -635,7 +710,7 @@ export function VideoPlayer({
           {/* Fullscreen */}
           <button
             onClick={handleFullscreen}
-            className="flex h-7 w-7 items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
+            className={cn("flex items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors", compact ? "h-11 w-11" : "h-7 w-7")}
             aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
           >
             {isFullscreen ? (

@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render } from '@testing-library/react'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import * as React from 'react'
+import { act, render } from '@testing-library/react'
 import { BrandingHead } from '../shared/branding-head'
 import { type InstanceBranding, useBrandingStore } from '@/stores/branding-store'
 import { accentVars, ACCENT_VAR_NAMES } from '@/lib/accent'
@@ -29,6 +30,9 @@ describe('BrandingHead accent wiring', () => {
     expect(style.getPropertyValue('--accent-muted')).toBe(
       'color-mix(in srgb, #e2571f 18%, var(--bg-secondary))',
     )
+    // The secondary button's hover border (and every focus border) resolves
+    // through this; when branding skipped it those surfaces stayed stock blue.
+    expect(style.getPropertyValue('--border-focus')).toBe('#e2571f')
   })
 
   it('lightens the hover shade for a dark accent and darkens it for a light one', () => {
@@ -55,6 +59,7 @@ describe('BrandingHead accent wiring', () => {
     render(<BrandingHead />)
     expect(document.documentElement.style.getPropertyValue('--accent')).toBe('')
     expect(document.documentElement.style.getPropertyValue('--accent-hover')).toBe('')
+    expect(document.documentElement.style.getPropertyValue('--border-focus')).toBe('')
   })
 
   it('ignores a value that is not a 6-digit hex rather than writing garbage', () => {
@@ -118,14 +123,98 @@ describe('BrandingHead icons', () => {
 
 
 describe('accentVars', () => {
-  it('gives a share link the same three tokens instance branding sets', () => {
+  it('gives a share link the same tokens instance branding sets', () => {
     const vars = accentVars('#e2571f')
     expect(Object.keys(vars!).sort()).toEqual([...ACCENT_VAR_NAMES].sort())
+  })
+
+  it('paints the focus-border token with the colour, not the product default', () => {
+    const vars = accentVars('#e2571f')
+    expect(vars!['--border-focus']).toBe('#e2571f')
   })
 
   it('returns null for anything that is not a 6-digit hex', () => {
     expect(accentVars('rgb(1,2,3)')).toBeNull()
     expect(accentVars('#fff')).toBeNull()
     expect(accentVars(null)).toBeNull()
+  })
+})
+
+describe('BrandingHead tab title', () => {
+  function setServerTitle(text: string) {
+    document.head.querySelectorAll('title').forEach((el) => el.remove())
+    const el = document.createElement('title')
+    el.textContent = text
+    document.head.appendChild(el)
+  }
+
+  beforeEach(() => {
+    vi.spyOn(useBrandingStore.getState(), 'fetchBranding').mockResolvedValue(undefined)
+    useBrandingStore.setState({ loaded: false })
+  })
+
+  afterEach(() => {
+    document.head.querySelectorAll('title').forEach((el) => el.remove())
+  })
+
+  it('leaves the sign-in title alone on mount', () => {
+    // generateMetadata already rendered "Acme — Auth". A bare "Acme" here was
+    // only undone by React re-inserting its own title, which nothing guarantees.
+    setServerTitle('Acme — Auth')
+    syncBranding(null, { org_name: 'Acme' })
+    render(<BrandingHead />)
+
+    expect(document.title).toBe('Acme — Auth')
+  })
+
+  it('leaves the server-rendered org title alone on mount, also under StrictMode', () => {
+    setServerTitle('Acme')
+    syncBranding(null, { org_name: 'Acme' })
+    const writes: string[] = []
+    new MutationObserver(() => writes.push(document.title)).observe(document.head, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    })
+    render(
+      <React.StrictMode>
+        <BrandingHead />
+      </React.StrictMode>,
+    )
+
+    expect(document.title).toBe('Acme')
+    expect(writes).toEqual([])
+  })
+
+  it('swaps the org suffix of a page title when the instance is renamed', () => {
+    setServerTitle('Projects – Acme')
+    syncBranding(null, { org_name: 'Acme' })
+    render(<BrandingHead />)
+
+    act(() => syncBranding(null, { org_name: 'Globex' }))
+
+    expect(document.title).toBe('Projects – Globex')
+  })
+
+  it('sets the new org name when there is no page title', () => {
+    setServerTitle('Acme')
+    syncBranding(null, { org_name: 'Acme' })
+    render(<BrandingHead />)
+
+    act(() => syncBranding(null, { org_name: 'Globex' }))
+
+    expect(document.title).toBe('Globex')
+  })
+
+  it('keeps "— Auth" when the name arrives after mount, as when the server had no branding', () => {
+    // No server copy: the title was rendered as "FreeFrame — Auth" and the
+    // client fetch supplies the real name later.
+    setServerTitle('FreeFrame — Auth')
+    render(<BrandingHead />)
+    expect(document.title).toBe('FreeFrame — Auth')
+
+    act(() => syncBranding(null, { org_name: 'Acme' }))
+
+    expect(document.title).toBe('Acme — Auth')
   })
 })

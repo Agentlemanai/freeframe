@@ -76,7 +76,7 @@ cd freeframe
 cp .env.example .env.prod
 
 # 3. Edit .env.prod with your actual credentials
-#    At minimum: change passwords, configure S3, email, and JWT_SECRET
+#    At minimum: change passwords, set FRONTEND_URL to your https:// URL, configure S3, email, and JWT_SECRET
 nano .env.prod
 
 # 4. Build and start all services
@@ -133,6 +133,46 @@ If FreeFrame sits behind another proxy that already handles SSL:
 4. For **Cloudflare**: set SSL mode to "Full"
 5. Set `FRONTEND_URL` in `.env.prod` to your `https://` URL
 
+### Sub-path Deployments
+
+To serve FreeFrame under a path instead of the domain root — `https://example.com/freeframe/` — set the base path and rebuild the web image:
+
+```
+NEXT_PUBLIC_BASE_PATH=/freeframe
+FRONTEND_URL=https://example.com/freeframe
+```
+
+`NEXT_PUBLIC_BASE_PATH` is a **build-time** variable for the Docker image (Compose passes it as a build arg), so changing it needs `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build web`, not a restart. (`next dev` in the dev stack reads it when the server starts.) Everything the web app serves moves under the prefix: pages, links, static assets, icons and raw navigations. The API stays at the origin root (`/api`), and links built from `FRONTEND_URL` carry the path, so invite and share emails keep pointing inside the mounted app. CORS matches the bare origin, since a browser's `Origin` header never carries a path.
+
+If something sits in front of FreeFrame (a landing page, another app), forward the sub-path to FreeFrame **unchanged** — Next expects the prefix — and forward the API at the origin root as well, because that is where the browser still calls it, including the request bodies it sends. With nginx that is three `proxy_pass` locations, none with a URI part:
+
+```nginx
+# Two locations for the sub-path, not one. With trailingSlash unset, Next
+# answers /freeframe/ with a 308 to /freeframe, and a lone "location /freeframe/"
+# answers /freeframe with nginx's own 301 back, so the two would bounce forever.
+# The exact match takes /freeframe itself before that 301 can happen. The
+# slash-terminated prefix takes everything under it without also swallowing
+# siblings such as /freeframe-docs or /freeframe.html, which a bare
+# "location /freeframe" would send to FreeFrame's 404.
+location = /freeframe {
+    proxy_pass http://127.0.0.1:80;
+}
+
+location /freeframe/ {
+    proxy_pass http://127.0.0.1:80;
+}
+
+location /api/ {
+    # Project posters are the only large bodies the browser sends to the API.
+    # The API accepts 10 MB; nginx's 1 MB default would reject them with an
+    # HTML 413 the frontend cannot parse.
+    client_max_body_size 10m;
+    proxy_pass http://127.0.0.1:80;
+}
+```
+
+Traefik in the bundled Compose already routes the sub-path to the web app and `/api` to the API, so forwarding both to FreeFrame's port 80 is enough; only a proxy that terminates the sub-path itself has to name the API separately. Leave `NEXT_PUBLIC_BASE_PATH` empty for a root deployment (the default).
+
 ---
 
 ## Bring Your Own Infrastructure
@@ -167,9 +207,9 @@ Works with: **AWS ElastiCache, Upstash, Redis Cloud, DigitalOcean Managed Redis,
 
 ### External S3 Storage
 
-Works with: **AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO, or any S3-compatible service.**
+Works with: **AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, Silo, Garage, MinIO, or any S3-compatible service.**
 
-There's no S3 service in the production compose — you always provide your own. Configure in `.env.prod`:
+The production compose runs no S3 service by default — you provide your own. (`docker-compose.prod.yml` ships a commented-out block running [Silo](https://github.com/pgsty/silo), a maintained fork of MinIO, if you want to keep media on the same host; see the notes above it. The `minio/minio` and `minio/mc` images it used before can no longer be pulled from Docker Hub. Silo reads the same `MINIO_*` variables and opens an existing MinIO data volume as is.) Configure in `.env.prod`:
 
 ```
 S3_STORAGE=s3
@@ -179,6 +219,8 @@ S3_SECRET_KEY=YOUR_SECRET_KEY
 S3_REGION=us-east-1
 ```
 
+`S3_BUCKET` must be a valid S3 bucket name: 3-63 characters, lowercase letters, digits, hyphens and dots only. Underscores and capitals are rejected.
+
 For **non-AWS S3-compatible providers** (R2, B2, Spaces, MinIO, Hetzner, …), set `S3_STORAGE` to a non-`s3` value (e.g. `minio`) so `S3_ENDPOINT` is used — with `S3_STORAGE=s3` the client talks to native AWS and the endpoint is **ignored** (FreeFrame refuses to start if `s3` is combined with a non-AWS endpoint). Then set the endpoint:
 
 | Provider | S3_ENDPOINT |
@@ -186,7 +228,7 @@ For **non-AWS S3-compatible providers** (R2, B2, Spaces, MinIO, Hetzner, …), s
 | Cloudflare R2 | `https://<account-id>.r2.cloudflarestorage.com` |
 | Backblaze B2 | `https://s3.<region>.backblazeb2.com` |
 | DigitalOcean Spaces | `https://<region>.digitaloceanspaces.com` |
-| MinIO (self-hosted) | `http://your-minio-host:9000` |
+| Silo or MinIO (self-hosted) | `http://your-silo-host:9000` |
 | Garage (self-hosted) | `http://your-garage-host:3900` (or your reverse-proxy URL) |
 
 In non-AWS mode FreeFrame always uses **path-style addressing** (`endpoint/bucket/key`) with **SigV4** signatures — the compatibility baseline every S3-compatible provider accepts. No wildcard bucket DNS is needed in front of a self-hosted store.
@@ -213,7 +255,36 @@ Uploads go **directly from the browser to your bucket** via presigned URLs, so t
 
 If you allow **more than one origin**, give each origin its own rule rather than listing them all in one. Some backends (Garage) answer a multi-origin rule by joining every entry into a single comma-separated `Access-Control-Allow-Origin` header, which browsers reject — every upload and HLS segment fetch then fails CORS. FreeFrame's automatic startup config already emits one rule per origin.
 
-FreeFrame applies this automatically to **non-AWS** buckets at startup when it has permission (and logs a warning if it can't). Set it yourself for **AWS S3**, or wherever FreeFrame lacks CORS permission. **Hetzner Object Storage** exposes CORS only via API/CLI (not the Console UI), so it's easy to miss — apply the JSON above with `aws s3api put-bucket-cors`.
+FreeFrame applies this automatically to **non-AWS** buckets at startup when it has permission (and logs a warning if it can't). The rules allow `FRONTEND_URL`, `http://localhost:3000` and every origin in `CORS_ALLOW_ORIGINS`, the same origins the API accepts; `CORS_ALLOW_ORIGINS=*` becomes a single rule allowing any origin. Older MinIO releases answered this call with `NotImplemented` and allowed every origin regardless, so a browser origin missing from that list only starts failing once you move to a store that enforces bucket CORS (Silo, Garage): add it to `CORS_ALLOW_ORIGINS`. Set it yourself for **AWS S3**, or wherever FreeFrame lacks CORS permission. **Hetzner Object Storage** exposes CORS only via API/CLI (not the Console UI), so it's easy to miss — apply the JSON above with `aws s3api put-bucket-cors`.
+
+#### Abort incomplete multipart uploads — recommended
+
+Add a bucket lifecycle rule that **aborts incomplete multipart uploads after a few days**. It is a backstop: it cleans up the rare empty multipart upload left behind when a request to start an upload times out after storage had already created it. It also frees the parts of any upload that is never completed, which S3 bills for until the upload is aborted. On AWS the API's reaper also finds those empty uploads itself, since nothing in the database refers to them; the rule covers the stores where it cannot.
+
+The rule counts days from when the upload **started**, not from when it last moved. FreeFrame keeps offering Resume on an upload for as long as it keeps moving: its own reaper (`STALE_UPLOAD_TIMEOUT_HOURS`, 24 hours by default) ages an upload by its last activity. So the rule can abort an upload that someone is still resuming, and that upload is lost: its next part or its completion fails, and the file has to be sent again from the start. Pick a number of days above the longest upload you expect people to keep resuming, and above `STALE_UPLOAD_TIMEOUT_HOURS`. For scale, 600 GB at 8 Mbit/s takes about a week, and an upload resumed a little each day can run longer. The 7 days below suits most instances; raise it if yours takes very large files over slow links.
+
+On **AWS S3** (and any store that implements the S3 lifecycle API), save this as `lifecycle.json`:
+
+```json
+{
+  "Rules": [{
+    "ID": "abort-incomplete-multipart-uploads",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "" },
+    "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+  }]
+}
+```
+
+and apply it:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket YOUR_BUCKET --lifecycle-configuration file://lifecycle.json
+```
+
+That call **replaces** the bucket's whole lifecycle configuration, so if the bucket already has rules, read them first with `aws s3api get-bucket-lifecycle-configuration --bucket YOUR_BUCKET` and add this rule to them. For a store that is not AWS, add `--endpoint-url` with its S3 endpoint. The same rule can be created in the AWS console, under the bucket's **Management** tab (lifecycle rules).
+
+**MinIO and Silo** have no equivalent rule to set: `mc ilm rule add` has no option for it, and Silo's `mc ilm import` rejected a rule with `AbortIncompleteMultipartUpload` as not valid for its lifecycle schema. MinIO expires abandoned multipart uploads on its own, after about 24 hours, so there is nothing to configure there. On either, the API's own reaper (`STALE_UPLOAD_TIMEOUT_HOURS`) still reclaims the uploads it has a record of.
 
 ### External SMTP
 
@@ -257,9 +328,12 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 |----------|-------------|---------|
 | `DATABASE_URL` | PostgreSQL connection string | (required) |
 | `REDIS_URL` | Redis connection string | (required) |
-| `S3_STORAGE` | `s3` for any S3-compatible provider | `minio` |
+| `S3_STORAGE` | `s3` for native AWS S3; any other value (e.g. `minio`) for every other S3-compatible store | `minio` |
 | `S3_BUCKET` | S3 bucket name | (required) |
-| `S3_ENDPOINT` | Custom S3 endpoint (non-AWS) | (empty = AWS) |
+| `S3_ENDPOINT` | S3 endpoint the API and workers use (non-AWS); ignored when `S3_STORAGE=s3` | `http://minio:9000` |
+| `S3_PUBLIC_ENDPOINT` | Browser-reachable base URL for presigned URLs, when it differs from `S3_ENDPOINT` | (empty = `S3_ENDPOINT`) |
+| `S3_STORAGE_CLASS` | Storage class for media (uploaded originals, every transcoder output and watermarked renders), set by the server when each object is created. Avatars, logos and posters keep the bucket default. MinIO and Silo accept only `STANDARD` and `REDUCED_REDUNDANCY`; Garage ignores it; `GLACIER` and `DEEP_ARCHIVE` are refused at startup | (empty = bucket default) |
+| `CORS_ALLOW_ORIGINS` | Extra browser origins, comma-separated, allowed by the API and (non-AWS) the bucket | (empty) |
 | `JWT_SECRET` | Auth token signing key | (required, generate with `openssl rand -hex 64`) |
 | `FRONTEND_URL` | Your FreeFrame URL (with https://) | (required) |
 | `DOMAIN` | Your domain for auto SSL | (optional) |
@@ -269,12 +343,21 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `TRANSCODING_CONCURRENCY` | Parallel transcoding jobs | `2` |
 | `EMAIL_CONCURRENCY` | Parallel email jobs | `2` |
 | `MAINTENANCE_CONCURRENCY` | Parallel housekeeping jobs | `1` |
-| `NEXT_PUBLIC_UPLOAD_CONCURRENCY` | Upload parts in flight per file (browser) | `5` |
+| `CELERY_LOGLEVEL` | Log level of the Celery workers and beat. At `warning` they still log what the retention GC, stale-upload reaper and orphan sweep deleted, and any sweep that is switched off | `info` |
+| `NEXT_PUBLIC_UPLOAD_CONCURRENCY` | Upload parts in flight across the whole browser tab, shared by every file being uploaded (the earliest file first), not per file. Values above 6 only help when the storage endpoint speaks HTTP/2: over HTTP/1.1 a browser opens at most 6 connections per host, shared by all its tabs, so parts past the sixth wait for a free connection before they send anything, which with large parts on a slow uplink can be minutes. The upload leaves such a waiting part alone while other parts in the tab are sending, and gives up on it (and retries it) only after 5 minutes without a first byte. Build-time: changing it needs a web image rebuild | `5` |
 | `TRANSCODER_PIPELINE` | GPU backend: `Auto`, `NVIDIA`, `Intel`, or `Software` | `Auto` |
 | `TRANSCODER_OUTPUT` | Output codec: `h264_8` (broad compatibility) or `h265_10` (HEVC 10-bit) | `h264_8` |
 | `TRANSCODER_HDR` | `convert` (tone-map HDR to SDR) or `preserve` (keep HDR tags) | `convert` |
-| `TRANSCODER_QUALITIES` | Ladder rungs to build. Rungs above the source are dropped | `1080p,720p,360p` |
+| `TRANSCODER_QUALITIES` | Ladder rungs to build: any of `2160p`, `1080p`, `720p`, `360p`. A rung names the source's short side, so portrait video is sized like landscape (1080x1920 under `1080p` keeps its size). Rungs above the source are dropped, and if that leaves none the smallest is built at the source's own size, so `2160p` alone gives one rendition at source size for anything up to 4K | `1080p,720p,360p` |
+| `TRANSCODER_AUDIO_BITRATE` | AAC bitrate for the audio of video review streams, as `<n>k` between `64k` and `512k` (for example `320k` for music and final-mix review). Empty leaves ffmpeg's own choice, AAC-LC at about 128 kb/s for stereo. The value is the total for all channels, and ffmpeg's default for a surround source is already higher (about 341 kb/s for 5.1 and 469 kb/s for 7.1), so a stereo-sized value such as `320k` lowers surround quality. The codec is always AAC-LC, the one every browser plays over HLS. Applies to every rendition, so storage grows by the extra bitrate times the number of rungs. A source-copied upload whose audio is already AAC keeps its own audio untouched; non-AAC audio in a copy is encoded at this bitrate, or `192k` when it is empty. An unusable value is logged and ignored | *(empty)* |
 | `TRANSCODER_SOURCE_COPY` | Package an already browser-safe source into HLS without re-encoding, where the ladder above resolves to one rendition at the source's own size | `false` |
+| `TRANSCODER_CPU_LIMIT` | Cap the CPU one transcode takes: a core count (`6`) or a share of what the process may use (`50%`). Empty = unbounded. Covers the encoders and the filter graph, not decoding, so a heavy master can run over by roughly a quarter, and a low budget can push a long master past ffmpeg's 4-hour ceiling — see `.env.example`. Per ffmpeg process, so the machine-wide ceiling is this times `TRANSCODING_CONCURRENCY` | *(empty)* |
+
+Upload part size is set in the app rather than the environment: **Admin Dashboard → Instance settings → Uploads**. Automatic (the default) keeps 10 MB parts up to ~5 GB and grows them for bigger files to about 500 parts, which keeps the storage backend's assembly at the end of an upload short. Fixed cuts every upload into one size from 5 to 512 MB, and refuses a file that would need more than 10,000 parts. A completion that takes 5 seconds or more is logged by the API with where the time went (`completing upload … took …`), which is the place to look when uploads wait at "Finalizing".
+
+Uploads wait in a queue. Files dropped or picked together start in the order they were added, with up to three files active at a time, and the earliest file gets the bandwidth first, so a lost connection leaves whole finished files rather than many half-sent ones. `NEXT_PUBLIC_UPLOAD_CONCURRENCY` is the one budget of upload parts those files share: it used to apply to each file on its own, so with several files uploading at once a tab now sends no more parts than the setting says, where it used to send that many per file. If you raised it to speed up a single large file, it still does. If storage is unreachable when a file's turn comes, the queue pauses (the Uploads panel says "Waiting for storage" or "Waiting for connection") and carries on by itself when it answers again.
+
+Who may download originals is also set in the app: **Admin Dashboard → Instance settings → Downloads**. *Transcode only* (the default) gives share-link visitors, visitors to a public project and people an asset is shared with directly the transcode (a video's MP4, an audio file's MP3, an image's WebP), as earlier releases did; a video with no MP4 still downloads its original. *Original or transcode* lets them pick the original too. Project members can always pick the original one asset at a time. Bulk downloads (a selection on the project page, Download All on a share link) follow this setting for everyone: originals when it is on, transcodes when it is off. Camera masters can be many times the size of the transcode, so turning it on can raise storage egress considerably.
 
 ---
 
@@ -315,6 +398,18 @@ To enable it:
 
 > Compose-file examples for GPU device passthrough aren't included yet — that's a
 > known follow-up.
+
+If you build the `2160p` rung, a GPU is worth it: a 4K encode takes about four times
+the CPU of a 1080p one. A master that is already H.264 8-bit 4:2:0 can skip the
+encode entirely with `TRANSCODER_SOURCE_COPY=true` and a single-rung ladder, but most
+4K camera and NLE exports (HEVC, 10-bit, HDR, ProRes) cannot, and are always encoded.
+The GPU decoders don't handle ProRes, DNxHR, 10-bit H.264, or 4:2:2 H.264 or HEVC.
+For those masters, on NVIDIA and Intel, the decode stays on the CPU and the frames
+are uploaded, so scaling and encoding still run on the GPU. Expect the CPU decode
+to be the bottleneck on 4K ProRes. Video with a display rotation (most portrait
+phone footage) has to be turned upright in system memory: on NVIDIA it is still
+decoded on the GPU and passed through system memory, which costs a little CPU; on
+Intel it is decoded on the CPU.
 
 ### Email Workers
 
@@ -433,7 +528,7 @@ Your media files are already in S3. For redundancy:
 
 - **AWS S3**: Enable [versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) and [cross-region replication](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html)
 - **Cloudflare R2**: Use [Sippy](https://developers.cloudflare.com/r2/data-migration/sippy/) for incremental migration/backup
-- **Self-hosted MinIO**: Use [`mc mirror`](https://min.io/docs/minio/linux/reference/minio-mc/mc-mirror.html) to replicate to a second location
+- **Self-hosted Silo or MinIO**: Use [`mc mirror`](https://min.io/docs/minio/linux/reference/minio-mc/mc-mirror.html) to replicate to a second location
 
 ### What to Back Up
 
@@ -518,6 +613,15 @@ draining normally.
 
 If you're upgrading past the media-metadata fix ([#124](https://github.com/Techiebutler/freeframe/issues/124)), backfill missing `duration_seconds`/`width`/`height`/`fps` on already-processed files with: `docker exec freeframe-api-1 python -m apps.api.scripts.backfill_media_metadata`. The backfill runs as a Celery task on the `transcoding` queue, so it occupies one worker slot and can run long on large libraries (up to ~300s per file); new uploads keep transcoding normally on the remaining slots.
 
+### Upgrading past the storage image switch ([#461](https://github.com/Techiebutler/freeframe/issues/461))
+
+Only for deployments that run the optional self-hosted storage block in `docker-compose.prod.yml`. The `minio/minio` and `minio/mc` images can no longer be pulled from Docker Hub, so the block now runs Silo, a maintained fork of MinIO. A cached `minio/minio` image keeps working if you don't switch, but it can't be pulled again.
+
+1. In your compose file, replace `minio/minio:...` with `pgsty/silo:RELEASE.2026-09-16T00-00-00Z` and `minio/mc:latest` with `pgsty/mc:RELEASE.2026-09-16T00-00-00Z`, and delete the four `MINIO_CORS_*` lines (MinIO never read them).
+2. Keep the service name `minio` and the `miniodata` volume. Silo opens the existing data as is, and the old image can still read it if you roll back.
+3. Silo enforces the bucket CORS rules FreeFrame writes at startup, which MinIO ignored. Make sure `FRONTEND_URL` is the exact origin people browse to, and put any other browser origin in `CORS_ALLOW_ORIGINS`. If your `.env.prod` sets `MINIO_CORS_ALLOW_ORIGIN`, move that value to `CORS_ALLOW_ORIGINS`.
+4. `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d`
+
 ### Update Checklist
 
 1. **Read the changelog** — check for breaking changes or new env vars
@@ -566,6 +670,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml run --rm api sh -
 - Verify your credentials are correct in `.env.prod`
 - Ensure your bucket exists and has proper CORS configuration
 - For non-AWS providers, double-check the `S3_ENDPOINT` URL
+- **Uploads stuck at 0%, with a browser `NetworkError` / `Failed to fetch` on the part `PUT`:** on a self-hosted or S3-compatible store the bucket's CORS allows only `FRONTEND_URL`'s origin, `http://localhost:3000`/`3001` and `CORS_ALLOW_ORIGINS`. Check that `FRONTEND_URL` matches the address bar exactly (scheme, host and port), then recreate the API (`docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --force-recreate api`) so it rewrites the rules. Then check that `S3_PUBLIC_ENDPOINT` is reachable from the browser and is `https://` when FreeFrame is.
 
 ### Port 80/443 already in use
 

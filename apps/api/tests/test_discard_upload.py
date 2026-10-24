@@ -15,6 +15,7 @@ own unflushed writes cannot see that, which is how an earlier MagicMock version
 of this file stayed green with the commit replaced by `pass`.
 """
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
@@ -241,19 +242,90 @@ def test_another_users_upload_cannot_be_discarded(db, storage):
     assert _committed(db, Asset, asset.id).deleted_at is None
 
 
-def test_without_a_role_on_the_project_the_version_goes_but_the_asset_stays(db, storage):
+def _versionless_assets(db, project_id):
+    """Live assets of the project with no live version: the card that cannot be opened."""
+    db.expire_all()
+    return [
+        a for a in db.query(Asset).filter(Asset.project_id == project_id, Asset.deleted_at.is_(None))
+        if db.query(AssetVersion).filter(
+            AssetVersion.asset_id == a.id, AssetVersion.deleted_at.is_(None)
+        ).first() is None
+    ]
+
+
+def _reap_after_the_window(db, version):
+    """The reaper's pass once the upload has been idle past its window."""
+    db.query(AssetVersion).filter(AssetVersion.id == version.id).update(
+        {"last_activity_at": datetime.now(timezone.utc) - timedelta(days=30)}
+    )
+    db.commit()
+    cleanup._reap_stale_uploads(db)
+    db.commit()
+
+
+def test_without_a_role_on_the_project_the_upload_is_left_to_the_reaper(db, storage):
     """`created_by` outlives being removed from the project; the role does not.
 
     Deleting an asset needs `editor` everywhere else, so a discard does not get
-    to remove one on the strength of having started the upload. The version is
-    still theirs to throw away, and an asset left with no versions is the
-    reaper's to collect.
+    to remove one on the strength of having started the upload. Disposing of the
+    version alone would leave the asset with none, a card that cannot be opened,
+    and the reaper never collects an asset whose version it did not reap itself.
+    So the multipart is aborted now, and the version is left `uploading` for the
+    reaper, which takes the version and the asset together.
     """
-    owner, _, asset, (version,) = _seed(db, role=ProjectRole.reviewer)
+    owner, project, asset, (version,) = _seed(db, role=ProjectRole.reviewer)
+
+    _abort(db, owner, version)
+
+    kept = _committed(db, AssetVersion, version.id)
+    assert kept.deleted_at is None
+    assert kept.processing_status == ProcessingStatus.uploading
+    assert (_key(version), "u-1") in storage["aborted"]
+    assert _committed(db, Asset, asset.id).deleted_at is None
+    assert _versionless_assets(db, project.id) == []
+
+    _reap_after_the_window(db, version)
+    assert _committed(db, AssetVersion, version.id).deleted_at is not None
+    assert _committed(db, Asset, asset.id).deleted_at is not None
+
+
+def test_a_discard_in_a_trashed_project_leaves_no_versionless_asset_after_restore(db, storage):
+    """#510: Discard of an interrupted upload whose project is in the trash.
+
+    The live-project check refuses the asset strip in a deleted project. With the
+    version disposed of and the asset kept, restoring the project brought back a
+    card with no versions. The upload is left to the reaper instead, its
+    multipart aborted now, and the trash is restored as it was.
+    """
+    owner, project, asset, (version,) = _seed(db)
+    project.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+
+    _abort(db, owner, version)
+
+    assert (_key(version), "u-1") in storage["aborted"]
+    assert _committed(db, AssetVersion, version.id).deleted_at is None
+
+    project = db.get(Project, project.id)
+    project.deleted_at = None
+    db.commit()
+
+    assert _versionless_assets(db, project.id) == []
+
+    _reap_after_the_window(db, version)
+    assert _committed(db, AssetVersion, version.id).deleted_at is not None
+    assert _committed(db, Asset, asset.id).deleted_at is not None
+    assert _versionless_assets(db, project.id) == []
+
+
+def test_without_a_role_an_asset_with_another_live_version_loses_only_this_one(db, storage):
+    owner, _, asset, (landed, version) = _seed(
+        db, statuses=(ProcessingStatus.ready, ProcessingStatus.uploading), role=ProjectRole.reviewer)
 
     _abort(db, owner, version)
 
     assert _committed(db, AssetVersion, version.id).deleted_at is not None
+    assert _committed(db, AssetVersion, landed.id).deleted_at is None
     assert _committed(db, Asset, asset.id).deleted_at is None
 
 
@@ -287,3 +359,48 @@ def test_a_discarded_first_upload_is_not_offered_in_the_trash(db, storage):
     with pytest.raises(HTTPException) as refused:
         folders_module.restore_asset(discarded.id, db=db, current_user=owner)
     assert refused.value.status_code == 404
+
+
+def test_a_deleted_asset_whose_transcode_failed_is_still_in_the_trash(db, storage):
+    """A failed transcode landed. It is deleted work and has to be restorable.
+
+    `_was_ever_usable` is named and documented for "ever got as far as
+    `processing`", and it exists to hide an upload that was discarded or
+    reclaimed before it landed. A version that finished uploading, dispatched a
+    transcode and then failed is not that: it is a real asset carrying a red
+    Failed badge, and someone who deletes it from the grid is deleting something
+    they made. Filtering on the CURRENT status rather than on how far it ever
+    got took it out of the trash and made restore answer 404.
+    """
+    from datetime import datetime, timezone
+
+    owner, project, asset, _ = _seed(db, statuses=(ProcessingStatus.failed,))
+    asset.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+
+    listed = folders_module.list_trash(project.id, skip=0, limit=50, db=db, current_user=owner)
+
+    assert str(asset.id) in {a["id"] for a in listed["assets"]}
+
+    # and it can actually be brought back, which is the point of being listed
+    folders_module.restore_asset(asset.id, db=db, current_user=owner)
+    db.refresh(asset)
+    assert asset.deleted_at is None
+
+
+def test_an_upload_that_never_landed_is_still_kept_out_of_the_trash(db, storage):
+    """The guard the other way: widening the predicate must not undo #312.
+
+    `uploading` is the status the helper actually exists to exclude, and it stays
+    excluded. Without this, adding `failed` could be 'fixed' by dropping the
+    filter entirely and nothing would notice.
+    """
+    from datetime import datetime, timezone
+
+    owner, project, asset, _ = _seed(db, statuses=(ProcessingStatus.uploading,))
+    asset.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+
+    listed = folders_module.list_trash(project.id, skip=0, limit=50, db=db, current_user=owner)
+
+    assert str(asset.id) not in {a["id"] for a in listed["assets"]}

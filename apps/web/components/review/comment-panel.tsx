@@ -38,6 +38,7 @@ import {
   type ExportFormat,
 } from "@/lib/export-comments";
 import { FpsPromptDialog } from "@/components/review/fps-prompt-dialog";
+import { Avatar } from "@/components/shared/avatar";
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -78,6 +79,13 @@ interface CommentPanelProps {
    * present and guaranteed to fail.
    */
   canExport?: boolean;
+  /**
+   * Whether the viewer may delete other people's comments. Defaults to false.
+   *
+   * Mirrors `delete_comment`, which lets a project owner delete any comment on
+   * the project, guests' included. Delete only: editing stays with the author.
+   */
+  canModerate?: boolean;
   className?: string;
 }
 
@@ -123,12 +131,6 @@ function getAvatarColor(name: string): string {
     hash = name.charCodeAt(i) + ((hash << 5) - hash);
   }
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-}
-
-function getInitials(name: string): string {
-  const parts = name.trim().split(/\s+/);
-  if (parts.length === 1) return parts[0].charAt(0).toUpperCase();
-  return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
 }
 
 // ─── useClickOutside ─────────────────────────────────────────────────────────
@@ -186,12 +188,14 @@ function Dropdown({
 
 function CommentMenu({
   isOwn,
+  canModerate,
   commentId,
   assetId,
   onEdit,
   onDelete,
 }: {
   isOwn: boolean;
+  canModerate?: boolean;
   commentId: string;
   assetId?: string;
   onEdit: () => void;
@@ -199,13 +203,14 @@ function CommentMenu({
 }) {
   const [open, setOpen] = React.useState(false);
 
-  // Only show menu for own comments — others only get emoji reactions
-  if (!isOwn) return null;
+  // Own comments, or any comment for a moderator. Everyone else only gets emoji reactions.
+  if (!isOwn && !canModerate) return null;
 
   return (
     <div className="relative">
       <button
         onClick={() => setOpen((p) => !p)}
+        aria-label="Comment actions"
         className="h-7 w-7 flex items-center justify-center rounded-full text-text-tertiary hover:text-text-secondary hover:bg-bg-tertiary transition-colors"
       >
         <MoreHorizontal className="h-4 w-4" />
@@ -216,13 +221,15 @@ function CommentMenu({
         align="right"
         className="w-44"
       >
-        <button
-          className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
-          onClick={() => { onEdit(); setOpen(false) }}
-        >
-          <Pencil className="h-3.5 w-3.5" />
-          Edit
-        </button>
+        {isOwn && (
+          <button
+            className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
+            onClick={() => { onEdit(); setOpen(false) }}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+            Edit
+          </button>
+        )}
         <button
           className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
           onClick={() => {
@@ -268,6 +275,7 @@ function InlineReplyInput({
 }) {
   const [body, setBody] = React.useState("");
   const [submitting, setSubmitting] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
   const [emojiOpen, setEmojiOpen] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
   const emojiRef = React.useRef<HTMLDivElement>(null);
@@ -292,12 +300,17 @@ function InlineReplyInput({
     const trimmed = body.trim();
     if (!trimmed || submitting) return;
     setSubmitting(true);
+    setError(null);
     try {
       await onSubmit(parentId, trimmed);
       setBody("");
       onCancel();
-    } catch {
-      // error handled upstream
+    } catch (e) {
+      // Keep the typed reply and say why. Nothing upstream reported a failed
+      // reply, so it looked sent. An Error with an empty message is a
+      // deliberate quiet abort (e.g. the guest dismissed the name prompt).
+      const message = e instanceof Error ? e.message : "Couldn't send the reply";
+      setError(message || null);
     } finally {
       setSubmitting(false);
     }
@@ -320,6 +333,11 @@ function InlineReplyInput({
           if (e.key === "Escape") onCancel();
         }}
       />
+      {error && (
+        <p role="alert" className="mt-1.5 text-[12px] text-status-error">
+          {error}
+        </p>
+      )}
       <div className="flex items-center justify-between mt-2">
         <div className="flex items-center gap-1">
           <button className="h-7 w-7 flex items-center justify-center rounded-md text-text-tertiary hover:bg-bg-tertiary hover:text-text-secondary transition-colors">
@@ -334,7 +352,7 @@ function InlineReplyInput({
               <Smile className="h-4 w-4" />
             </button>
             {emojiOpen && (
-              <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 rounded-lg border border-border bg-bg-elevated shadow-2xl p-1.5 animate-in fade-in zoom-in-95 duration-100 w-[200px]">
+              <div className="absolute bottom-full left-1/2 -translate-x-1/2 slide-in-from-left-1/2 mb-2 z-50 rounded-lg border border-border bg-bg-elevated shadow-2xl p-1.5 animate-in fade-in zoom-in-95 duration-100 w-[200px]">
                 <div className="grid grid-cols-8 gap-px">
                   {REPLY_EMOJIS.map((e) => (
                     <button
@@ -381,6 +399,7 @@ interface CommentItemProps {
   commentNumber?: number;
   depth?: number;
   currentUserId?: string;
+  canModerate?: boolean;
   replyingTo?: string | null;
   isFocused?: boolean;
   onResolve: (commentId: string) => Promise<void>;
@@ -399,6 +418,7 @@ function CommentItem({
   commentNumber,
   depth = 0,
   currentUserId,
+  canModerate,
   replyingTo,
   isFocused,
   onResolve,
@@ -502,15 +522,13 @@ function CommentItem({
       }}
     >
       <div className="flex gap-2.5 py-3">
-        {/* Colored avatar */}
-        <div
-          className={cn(
-            "h-8 w-8 rounded-full flex items-center justify-center text-[11px] font-bold text-text-inverse shrink-0 mt-0.5",
-            avatarColor,
-          )}
-        >
-          {getInitials(authorName)}
-        </div>
+        {/* Profile picture, else initials on the author's colour */}
+        <Avatar
+          src={comment.author?.avatar_url}
+          name={authorName}
+          color={comment.author?.avatar_color}
+          className={cn("text-[11px] font-bold text-text-inverse mt-0.5", avatarColor)}
+        />
 
         <div className="flex-1 min-w-0">
           {/* Header row */}
@@ -642,7 +660,9 @@ function CommentItem({
 
           {/* Action row: Reply text + hover icons */}
           <div className="mt-1.5 flex items-center gap-2">
-            {depth === 0 && (
+            {/* No submit handler means nowhere to send a reply (a view-only
+                share link), so don't offer one. */}
+            {depth === 0 && onSubmitReply && (
               <button
                 className="text-[13px] font-medium text-text-tertiary hover:text-text-secondary transition-colors"
                 onClick={() => onReply(comment.id)}
@@ -680,6 +700,7 @@ function CommentItem({
               <div className="opacity-0 group-hover/comment:opacity-100 transition-opacity">
                 <CommentMenu
                   isOwn={isOwn}
+                  canModerate={canModerate}
                   commentId={comment.id}
                   assetId={comment.asset_id}
                   onEdit={() => { setEditing(true); setEditBody(comment.body); }}
@@ -744,6 +765,7 @@ function CommentItem({
                   comment={reply}
                   depth={depth + 1}
                   currentUserId={currentUserId}
+                  canModerate={canModerate}
                   replyingTo={replyingTo}
                   onResolve={onResolve}
                   onDelete={onDelete}
@@ -804,6 +826,7 @@ export function CommentPanel({
   exportVersionId,
   exportAsset,
   canExport = true,
+  canModerate = false,
   className,
 }: CommentPanelProps) {
   const focusedCommentId = useReviewStore((s) => s.focusedCommentId);
@@ -1360,6 +1383,7 @@ export function CommentPanel({
                 comment={comment}
                 commentNumber={index + 1}
                 currentUserId={currentUserId}
+                canModerate={canModerate}
                 replyingTo={replyingTo}
                 isFocused={focusedCommentId === comment.id}
                 onResolve={onResolve}

@@ -18,7 +18,7 @@ import { useResolvedTheme } from '@/hooks/use-resolved-theme'
 import { PoweredByBadge } from '@/components/shared/powered-by-badge'
 import { ThemedDefaultLogo } from '@/components/shared/themed-default-logo'
 
-import type { Asset, SharePermission, ProjectBranding, ShareLinkAppearance } from '@/types'
+import type { Asset, SharePermission, ShareBranding, ShareLinkAppearance } from '@/types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,7 +44,10 @@ interface ShareValidateResponse {
   created_by_name?: string | null
   viewer_name?: string | null
   viewer_email?: string | null
-  branding?: ProjectBranding | null
+  viewer_avatar_url?: string | null
+  viewer_avatar_color?: string | null
+  /** The project's branding, for every link type. */
+  branding?: ShareBranding | null
   error?: string
 }
 
@@ -170,7 +173,7 @@ function PasswordGate({ onSubmit, error, loading }: PasswordGateProps) {
             onChange={(e) => setPassword(e.target.value)}
             placeholder="Enter password…"
             autoFocus
-            className="flex h-9 w-full rounded-md border border-border bg-bg-tertiary px-3 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-border-focus"
+            className="flex h-9 w-full rounded-md border border-border bg-bg-tertiary px-3 text-[16px] [@media(hover:hover)]:text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-border-focus"
           />
           {error && <p className="text-xs text-status-error">{error}</p>}
           <Button type="submit" size="sm" className="w-full" loading={loading}>
@@ -243,9 +246,9 @@ function ErrorState({ expired }: ErrorStateProps) {
 export default function SharePage({
   params,
 }: {
-  params: { token: string }
+  params: Promise<{ token: string }>
 }) {
-  const { token } = params
+  const { token } = React.use(params)
 
   type PageState =
     | { stage: 'loading' }
@@ -260,7 +263,7 @@ export default function SharePage({
         allowDownload: boolean
         showVersions: boolean
         appearance: ShareLinkAppearance | null
-        branding: ProjectBranding | null
+        branding: ShareBranding | null
       }
     | {
         stage: 'folder_ready'
@@ -269,11 +272,13 @@ export default function SharePage({
         description: string | null
         createdByName: string | null
         viewerName: string | null
+        viewerAvatarUrl: string | null
+        viewerAvatarColor: string | null
         permission: SharePermission
         allowDownload: boolean
         showVersions: boolean
         appearance: ShareLinkAppearance
-        branding: any
+        branding: ShareBranding | null
       }
 
   const [state, setState] = React.useState<PageState>({ stage: 'loading' })
@@ -339,6 +344,8 @@ export default function SharePage({
           description: data.description ?? null,
           createdByName: data.created_by_name ?? null,
           viewerName: data.viewer_name ?? null,
+          viewerAvatarUrl: data.viewer_avatar_url ?? null,
+          viewerAvatarColor: data.viewer_avatar_color ?? null,
           permission: data.permission,
           allowDownload: data.allow_download ?? false,
           showVersions: data.show_versions ?? true,
@@ -431,6 +438,8 @@ export default function SharePage({
         description={state.description}
         createdByName={state.createdByName}
         viewerName={state.viewerName}
+        viewerAvatarUrl={state.viewerAvatarUrl}
+        viewerAvatarColor={state.viewerAvatarColor}
         permission={state.permission}
         allowDownload={state.allowDownload}
         showVersions={state.showVersions}
@@ -463,6 +472,9 @@ export default function SharePage({
  * shared on its own or inside a folder (#117, #123). This is a thin wrapper:
  * it resolves the link's appearance, which the grid does for the folder path,
  * and then defers entirely.
+ *
+ * The project's logo and colour apply here as on the grid. Its footer text does
+ * not: the review screen is all player and comments, with no footer region.
  */
 function SingleAssetShareViewer({
   token, asset, permission, allowDownload, showVersions, appearance, branding, shareSession,
@@ -473,14 +485,15 @@ function SingleAssetShareViewer({
   allowDownload: boolean
   showVersions: boolean
   appearance?: ShareLinkAppearance | null
-  branding?: { primary_color?: string | null } | null
+  branding?: ShareBranding | null
   shareSession?: string | null
 }) {
   // Same resolution the folder grid uses: the link's own accent wins over the
   // project's, which wins over the built-in. No fallback, so a link with no
   // accent keeps the stylesheet's rather than being repainted.
   const accentColor = appearance?.accent_color ?? branding?.primary_color
-  useShareAppearance(accentColor, appearance?.theme !== 'light')
+  const isDark = appearance?.theme !== 'light'
+  useShareAppearance(accentColor, isDark)
 
   return (
     <div className="fixed inset-0 z-50">
@@ -492,6 +505,8 @@ function SingleAssetShareViewer({
         permission={permission}
         allowDownload={allowDownload}
         showVersions={showVersions}
+        theme={isDark ? 'dark' : 'light'}
+        projectLogoUrl={branding?.logo_url ?? null}
       />
     </div>
   )

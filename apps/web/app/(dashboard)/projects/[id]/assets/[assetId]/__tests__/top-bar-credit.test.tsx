@@ -15,11 +15,11 @@
  * counter -- not merely that the two "share a parent", since the counter's
  * parent is the inner navigator div rather than the group.
  *
- * The credit is hidden below `lg`. In flow it is 147px that neither the middle
- * group nor the block on the right can give back, so the surplus leaves the bar
- * past its right edge, where the page root's `overflow-hidden` clips it and
- * nothing scrolls to it -- taking the sidebar toggle with it from about 744px
- * down, which is an iPad in portrait.
+ * The credit is hidden below `lg`. In flow it is 147px the controls need there,
+ * and before the centre group could shrink the surplus left the bar past its
+ * right edge, where the page root's `overflow-hidden` clips it and nothing
+ * scrolls to it -- taking the sidebar toggle with it from about 744px down,
+ * which is an iPad in portrait. From `lg` up the credit is what gives way.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
@@ -29,9 +29,15 @@ const asset = {
   name: 'Episode 4 — rough cut.mov',
   project_id: 'p1',
   asset_type: 'video',
+  folder_id: null as string | null,
   latest_version: { id: 'v1', version_number: 1, processing_status: 'ready' },
 }
-const allAssets = [{ id: 'a1' }, asset, { id: 'a3' }]
+/** What GET /projects/p1/assets?folder_id=… returns, per folder. */
+const { assetsByFolder, swrKeys, viewState } = vi.hoisted(() => ({
+  assetsByFolder: {} as Record<string, unknown[]>,
+  swrKeys: [] as string[],
+  viewState: { sortKey: 'custom', sortDirection: 'asc' } as Record<string, unknown>,
+}))
 
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
@@ -39,9 +45,17 @@ vi.mock('next/navigation', () => ({
   useSearchParams: () => new URLSearchParams(),
 }))
 vi.mock('swr', () => ({
-  default: (key: string) => ({
-    data: typeof key === 'string' && key.endsWith('/assets') ? allAssets : undefined,
-  }),
+  default: (key: string) => {
+    if (typeof key === 'string') swrKeys.push(key)
+    const folder = typeof key === 'string' ? key.match(/\/assets\?folder_id=(.+)$/)?.[1] : undefined
+    return {
+    data: typeof key !== 'string' ? undefined
+      : folder ? assetsByFolder[folder]
+      // An editor, so the page renders its composer.
+      : key.endsWith('/members') ? [{ user_id: 'u1', role: 'editor' }]
+      : undefined,
+    }
+  },
 }))
 vi.mock('@/components/review/review-provider', () => ({
   ReviewProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
@@ -92,8 +106,11 @@ vi.mock('@/stores/review-store', () => ({
   }),
 }))
 vi.mock('@/stores/upload-store', () => ({
-  useUploadStore: storeHook({ startVersionUpload: vi.fn() }),
+  // `files` is read by the page to say a new version is queued; none are.
+  useUploadStore: storeHook({ startVersionUpload: vi.fn(), files: [], versionsRevision: 0 }),
+  visibleFiles: (s: { files: unknown[] }) => s.files,
 }))
+vi.mock('@/stores/view-store', () => ({ useViewStore: storeHook(viewState) }))
 vi.mock('@/stores/breadcrumb-store', () => ({
   useBreadcrumbStore: storeHook({ setExtraCrumbs: vi.fn(), setLabel: vi.fn() }),
 }))
@@ -105,8 +122,15 @@ vi.mock('@/components/review/annotation-canvas', () => ({ AnnotationCanvas: () =
 vi.mock('@/components/review/annotation-overlay', () => ({ AnnotationOverlay: () => null }))
 vi.mock('@/components/review/comment-panel', () => ({ CommentPanel: () => null }))
 vi.mock('@/components/review/comment-input', () => ({ CommentInput: () => null }))
+/** useMediaQuery is false here, so the page hands its composer to the sheet. */
+const { sheetComposers } = vi.hoisted(() => ({
+  sheetComposers: [] as Array<{ props: Record<string, unknown> } | undefined>,
+}))
 vi.mock('@/components/review/mobile-comment-sheet', () => ({
-  MobileCommentSheet: () => null,
+  MobileCommentSheet: ({ composer }: { composer?: { props: Record<string, unknown> } }) => {
+    sheetComposers.push(composer)
+    return null
+  },
   PEEK_PX: 56,
 }))
 vi.mock('@/components/review/version-switcher', () => ({ VersionSwitcher: () => null }))
@@ -114,10 +138,39 @@ vi.mock('@/components/review/share-dialog', () => ({ ShareDialog: () => null }))
 vi.mock('@/components/review/compare/compare-overlay', () => ({ CompareOverlay: () => null }))
 
 import ReviewPage from '../page'
+import { ToastProvider } from '@/components/shared/toast'
+
+// Next 16 hands route params to the page as a promise that it unwraps with
+// `use()`. A promise that already carries `status` and `value` is read
+// synchronously, so the assertions below do not need a Suspense wrapper.
+const routeParams = { id: 'p1', assetId: 'a2' }
+const fulfilledParams = Object.assign(Promise.resolve(routeParams), {
+  status: 'fulfilled' as const,
+  value: routeParams,
+})
 
 function renderPage() {
-  return render(<ReviewPage params={{ id: 'p1', assetId: 'a2' }} />)
+  // The page tells the user through a toast when a version cannot be added.
+  return render(
+    <ToastProvider>
+      <ReviewPage params={fulfilledParams} />
+    </ToastProvider>,
+  )
 }
+
+/** Whole classes, so `min-w-0` is not satisfied by `min-w-0.5` or the like. */
+const classes = (el: Element) => el.className.split(/\s+/)
+
+const defaultRootAssets = [{ id: 'a1' }, asset, { id: 'a3' }]
+
+beforeEach(() => {
+  asset.folder_id = null
+  for (const k of Object.keys(assetsByFolder)) delete assetsByFolder[k]
+  assetsByFolder.root = defaultRootAssets
+  swrKeys.length = 0
+  viewState.sortKey = 'custom'
+  viewState.sortDirection = 'asc'
+})
 
 describe('the credit and the asset navigator in the top bar', () => {
   beforeEach(() => {
@@ -137,21 +190,48 @@ describe('the credit and the asset navigator in the top bar', () => {
     expect(credit.parentElement!.contains(counter)).toBe(true)
   })
 
-  it('puts the navigator first and keeps the group from shrinking', () => {
+  it('puts the navigator first and keeps it from shrinking', () => {
     renderPage()
 
     const credit = screen.getByTitle('FreeFrame on GitHub')
     const counter = screen.getByText('2 of 3')
-    const group = credit.parentElement!
 
     // Order decides which of the two sits on the bar's centre line. The
     // navigator is the control; the credit is what stands beside it.
     expect(
       counter.compareDocumentPosition(credit) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy()
-    // Without shrink-0 the group is what yields when the bar runs out of room,
-    // and the navigator's chevrons are 28px targets that have nothing to give.
-    expect(group.className).toContain('shrink-0')
+    // The navigator's chevrons are 28px targets that have nothing to give.
+    expect(counter.parentElement!.className.split(/\s+/)).toContain('shrink-0')
+  })
+
+  // #384. Neither the centre group nor the block on the right could shrink, so
+  // once the asset name was down to nothing every further pixel left the bar
+  // past its clipped right edge, sidebar toggle first. Measured at 1024px with
+  // the rail expanded, Compare and the navigator showing: 57px of name left at
+  // the default text size, and the toggle off-screen at a 20px one -- the
+  // `lg` gate is a px media query and does not move when rems grow.
+  it('lets the credit, and only the credit, give way when the bar runs out', () => {
+    renderPage()
+
+    const credit = screen.getByTitle('FreeFrame on GitHub')
+    const group = credit.parentElement!
+
+    // The group yields rather than holding its width against the controls.
+    expect(classes(group)).not.toContain('shrink-0')
+    expect(classes(group)).toContain('min-w-0')
+    // And within it, the credit is what yields, truncating its text.
+    expect(classes(credit)).toContain('min-w-0')
+    expect(classes(credit)).toContain('[&>span]:truncate')
+  })
+
+  it('keeps the back arrow inside the block it belongs to', () => {
+    renderPage()
+
+    // The left block is squeezed first; at zero width the back arrow spilled
+    // into the centre group and the navigator was drawn over it.
+    const back = screen.getByRole('link', { name: 'Back to project' })
+    expect(classes(back.parentElement!)).toContain('min-w-7')
   })
 
   it('positions neither of them absolutely', () => {
@@ -179,5 +259,103 @@ describe('the credit and the asset navigator in the top bar', () => {
     // this test still green.
     expect(credit.className.split(/\s+/)).toContain('hidden')
     expect(credit.className.split(/\s+/)).toContain('lg:inline-flex')
+  })
+})
+
+// Rides on this file's page harness. Share pages hide the Public / Internal
+// toggle because a share link never shows an internal comment back; the
+// project review page is where the team files them, so it must keep it.
+describe('the review page composer', () => {
+  beforeEach(() => {
+    sheetComposers.length = 0
+  })
+
+  it('keeps the Public / Internal toggle', () => {
+    renderPage()
+
+    const composer = sheetComposers.at(-1)
+    expect(composer).toBeDefined()
+    expect(composer!.props.allowInternal).not.toBe(false)
+  })
+})
+
+// Prev/next used to walk every asset in the project, in whatever order the API
+// returned them, so from inside a folder it jumped out into other folders.
+describe('prev/next in the top bar', () => {
+  function sortable(id: string, name: string, updated_at: string) {
+    return { id, name, updated_at, status: 'in_review', asset_type: 'video' }
+  }
+
+  it('stays inside the asset\'s folder', () => {
+    asset.folder_id = 'f1'
+    assetsByFolder.f1 = [{ id: 'f1-a' }, asset]
+    assetsByFolder.root = [{ id: 'r1' }, { id: 'r2' }, { id: 'r3' }, { id: 'r4' }]
+
+    renderPage()
+
+    expect(swrKeys).toContain('/projects/p1/assets?folder_id=f1')
+    expect(swrKeys.some((k) => k.endsWith('/assets'))).toBe(false)
+    expect(screen.getByText('2 of 2')).toBeTruthy()
+  })
+
+  it('uses the root level for an asset outside any folder', () => {
+    renderPage()
+
+    expect(swrKeys).toContain('/projects/p1/assets?folder_id=root')
+    expect(screen.getByText('2 of 3')).toBeTruthy()
+  })
+
+  it('follows the view\'s date sort, newest first', () => {
+    Object.assign(asset, { name: 'b', updated_at: '2026-01-09T00:00:00Z', status: 'in_review' })
+    assetsByFolder.root = [
+      sortable('a', 'a', '2026-01-01T00:00:00Z'),
+      sortable('c', 'c', '2026-01-03T00:00:00Z'),
+      asset,
+    ]
+    viewState.sortKey = 'date'
+    viewState.sortDirection = 'desc'
+
+    renderPage()
+
+    // Last in API order, but the newest, so first in the view.
+    expect(screen.getByText('1 of 3')).toBeTruthy()
+  })
+
+  it('counts from the view\'s order, not the order the API sent', () => {
+    Object.assign(asset, { name: 'b', updated_at: '2026-01-02T00:00:00Z', status: 'in_review' })
+    assetsByFolder.root = [
+      asset,
+      sortable('c', 'c', '2026-01-03T00:00:00Z'),
+      sortable('a', 'a', '2026-01-01T00:00:00Z'),
+    ]
+    viewState.sortKey = 'name'
+    viewState.sortDirection = 'asc'
+
+    renderPage()
+
+    // API order puts "b" first; by name ascending (a, b, c) it is second.
+    expect(screen.getByText('2 of 3')).toBeTruthy()
+  })
+})
+
+// The back arrow went to the project root from anywhere, so leaving an asset
+// in a folder dropped you out of that folder. A share link's back arrow already
+// returned to the folder the asset was opened from.
+describe('the back arrow', () => {
+  it('returns to the folder the asset is in', () => {
+    asset.folder_id = 'f1'
+    assetsByFolder.f1 = [asset]
+
+    renderPage()
+
+    expect(screen.getByRole('link', { name: 'Back to folder' }).getAttribute('href'))
+      .toBe('/projects/p1?folder=f1')
+  })
+
+  it('returns to the project root for an asset outside any folder', () => {
+    renderPage()
+
+    expect(screen.getByRole('link', { name: 'Back to project' }).getAttribute('href'))
+      .toBe('/projects/p1')
   })
 })

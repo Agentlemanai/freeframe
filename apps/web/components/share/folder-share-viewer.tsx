@@ -24,15 +24,21 @@ import { useShareAppearance } from '@/hooks/use-share-appearance'
 import { withBasePath } from '@/lib/base-path'
 import { useReview, type CreateCommentPayload } from '@/components/review/review-provider'
 import { useReviewStore } from '@/stores/review-store'
-import { fetchDownloadUrl, handleDownload, triggerDownload } from './share-download'
+import { fetchDownloadUrl, fetchShareDownloadOptions, handleDownload, triggerDownload } from './share-download'
+import { DownloadMenu } from '@/components/shared/download-menu'
+import { CommentCountBadge } from '@/components/shared/comment-count-badge'
 import { ShareReviewScreen } from './share-review-screen'
-import { useBranding } from '@/components/shared/branding-provider'
+import { ShareBrandMark } from './share-brand-mark'
+import { usePageTitle } from '@/hooks/use-page-title'
+import { SHARE_ASSETS_PAGE_SIZE } from '@/lib/share-page'
+import { Avatar } from '@/components/shared/avatar'
 import type {
   SharePermission,
   ShareLinkAppearance,
   FolderShareAssetsResponse,
   FolderShareAssetItem,
   FolderShareSubfolder,
+  ShareBranding,
 } from '@/types'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -53,16 +59,14 @@ interface FolderShareViewerProps {
   description: string | null
   createdByName?: string | null
   viewerName?: string | null
+  viewerAvatarUrl?: string | null
+  viewerAvatarColor?: string | null
   permission: SharePermission
   allowDownload: boolean
   showVersions: boolean
   appearance: ShareLinkAppearance
-  branding: {
-    logo_url?: string
-    primary_color?: string
-    custom_title?: string
-    custom_footer?: string
-  } | null
+  /** The project's, sent for every link type: header logo, accent and footer. */
+  branding: ShareBranding | null
   onAssetClick?: (assetId: string) => void
 }
 
@@ -152,10 +156,12 @@ async function handleDownloadAll(
 ) {
   // Recursively collect all assets (including those in subfolders),
   // pre-fetch presigned URLs in parallel, then trigger downloads
-  // sequentially with a delay so the browser doesn't block them.
+  // sequentially with a delay so the browser doesn't block them. Same rule as
+  // bulk download on the project page: originals when the instance allows them,
+  // transcodes otherwise.
   const allAssets = await collectAllAssetsRecursive(token, folderId, shareSession)
   const urls = await Promise.all(
-    allAssets.map((a) => fetchDownloadUrl(token, a.id, shareSession)),
+    allAssets.map((a) => fetchDownloadUrl(token, a.id, shareSession, undefined, true)),
   )
   for (const url of urls) {
     if (!url) continue
@@ -301,12 +307,7 @@ function AssetGridCard({ asset, allowDownload, token, shareSession, isSelected, 
         )}
 
         {/* Comment count badge — bottom left */}
-        {asset.comment_count > 0 && (
-          <div className="absolute bottom-2 left-2 flex items-center gap-1 bg-bg-primary/80 backdrop-blur-sm rounded-md px-1.5 py-0.5">
-            <MessageSquare className="h-3 w-3 text-text-primary" />
-            <span className="text-[10px] font-medium text-text-primary">{asset.comment_count}</span>
-          </div>
-        )}
+        <CommentCountBadge count={asset.comment_count} />
 
         {/* Duration badge — bottom right (video/audio) */}
         {asset.duration_seconds != null && asset.duration_seconds > 0 && (
@@ -319,16 +320,18 @@ function AssetGridCard({ asset, allowDownload, token, shareSession, isSelected, 
 
         {/* Download button overlay */}
         {allowDownload && (
-          <button
-            className="absolute top-2 right-2 flex items-center justify-center h-6 w-6 rounded-md bg-bg-primary/70 [@media(hover:hover)]:hover:bg-bg-primary/90 text-text-primary backdrop-blur-sm opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 transition-opacity"
-            onClick={(e) => {
-              e.stopPropagation()
-              handleDownload(token, asset.id, shareSession)
-            }}
-            title="Download"
+          <DownloadMenu
+            load={() => fetchShareDownloadOptions(token, asset.id, shareSession)}
+            onPick={(rendition) => handleDownload(token, asset.id, shareSession, rendition)}
           >
-            <Download className="h-3 w-3" />
-          </button>
+            <button
+              className="absolute top-2 right-2 flex items-center justify-center h-6 w-6 rounded-md bg-bg-primary/70 [@media(hover:hover)]:hover:bg-bg-primary/90 text-text-primary backdrop-blur-sm opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 data-[state=open]:opacity-100 transition-opacity"
+              onClick={(e) => e.stopPropagation()}
+              title="Download"
+            >
+              <Download className="h-3 w-3" />
+            </button>
+          </DownloadMenu>
         )}
       </div>
 
@@ -383,13 +386,13 @@ interface RightPanelProps {
   onOpenAsset?: (asset: FolderShareAssetItem) => void
 }
 
-interface GuestComment {
+export interface GuestComment {
   id: string
   body: string
   guest_name: string
   guest_email: string
   author_name?: string
-  author?: { id: string; name: string; avatar_url?: string | null } | null
+  author?: { id: string; name: string; avatar_url?: string | null; avatar_color?: string | null } | null
   guest_author?: { id: string; name: string; email: string } | null
   created_at: string
   timecode_start?: number | null
@@ -470,7 +473,8 @@ interface ShareCommentListProps {
   onReply?: (commentId: string) => void
 }
 
-function ShareCommentList({ comments, loading, canComment, onReply }: ShareCommentListProps) {
+/** Exported for tests. */
+export function ShareCommentList({ comments, loading, canComment, onReply }: ShareCommentListProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -498,9 +502,12 @@ function ShareCommentList({ comments, loading, canComment, onReply }: ShareComme
           <div key={comment.id} className="py-3 border-b border-border last:border-0">
             {/* Comment header */}
             <div className="flex items-start gap-3">
-              <div className={cn('h-8 w-8 rounded-full flex items-center justify-center text-xs font-bold text-text-primary shrink-0', color)}>
-                {name.charAt(0).toUpperCase()}
-              </div>
+              <Avatar
+                src={comment.author?.avatar_url}
+                name={name}
+                color={comment.author?.avatar_color}
+                className={cn('font-bold', color)}
+              />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-text-primary">{name}</span>
@@ -529,9 +536,13 @@ function ShareCommentList({ comments, loading, canComment, onReply }: ShareComme
                   const rColor = getAvatarColor(rName)
                   return (
                     <div key={r.id} className="flex items-start gap-2.5 py-1">
-                      <div className={cn('h-6 w-6 rounded-full flex items-center justify-center text-[10px] font-bold text-text-primary shrink-0', rColor)}>
-                        {rName.charAt(0).toUpperCase()}
-                      </div>
+                      <Avatar
+                        src={r.author?.avatar_url}
+                        name={rName}
+                        color={r.author?.avatar_color}
+                        size="sm"
+                        className={cn('text-[10px] font-bold', rColor)}
+                      />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-xs font-medium text-text-primary">{rName}</span>
@@ -551,105 +562,6 @@ function ShareCommentList({ comments, loading, canComment, onReply }: ShareComme
   )
 }
 
-// ─── Share Comment Input ─────────────────────────────────────────────────────
-
-interface ShareCommentInputProps {
-  token: string
-  assetId: string
-  onCommentPosted: () => void
-}
-
-function ShareCommentInput({ token, assetId, onCommentPosted }: ShareCommentInputProps) {
-  const [body, setBody] = React.useState('')
-  const [guestName, setGuestName] = React.useState('')
-  const [guestEmail, setGuestEmail] = React.useState('')
-  const [submitting, setSubmitting] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
-
-  // Check if user is logged in
-  const isLoggedIn = typeof window !== 'undefined' && !!localStorage.getItem('ff_access_token')
-
-  async function handleSubmit() {
-    if (!body.trim()) return
-    if (!isLoggedIn && (!guestName.trim() || !guestEmail.trim())) {
-      setError('Please enter your name and email')
-      return
-    }
-
-    setSubmitting(true)
-    setError(null)
-    try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-      const accessToken = localStorage.getItem('ff_access_token')
-      if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`
-
-      const payload: Record<string, unknown> = { body: body.trim(), asset_id: assetId }
-      if (!isLoggedIn) {
-        payload.guest_name = guestName.trim()
-        payload.guest_email = guestEmail.trim()
-      }
-
-      const res = await fetch(`${API_URL}/share/${token}/comment`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-      })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.detail || 'Failed to post comment')
-      }
-      setBody('')
-      onCommentPosted()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to post')
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  return (
-    <div className="border-t border-border p-3 shrink-0 space-y-2">
-      {!isLoggedIn && (
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={guestName}
-            onChange={(e) => setGuestName(e.target.value)}
-            placeholder="Your name"
-            className="flex-1 h-8 rounded-md border border-border bg-bg-hover px-2.5 text-xs text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent/50"
-          />
-          <input
-            type="email"
-            value={guestEmail}
-            onChange={(e) => setGuestEmail(e.target.value)}
-            placeholder="Email"
-            className="flex-1 h-8 rounded-md border border-border bg-bg-hover px-2.5 text-xs text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent/50"
-          />
-        </div>
-      )}
-      <div className="flex gap-2">
-        <input
-          type="text"
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit() } }}
-          placeholder="Leave a comment…"
-          disabled={submitting}
-          className="flex-1 h-8 rounded-md border border-border bg-bg-hover px-2.5 text-sm text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent/50"
-        />
-        <button
-          onClick={handleSubmit}
-          disabled={submitting || !body.trim()}
-          className="h-8 px-3 rounded-md bg-accent text-text-primary text-xs font-medium hover:bg-accent/90 disabled:opacity-50 transition-colors shrink-0"
-        >
-          {submitting ? '...' : 'Post'}
-        </button>
-      </div>
-      {error && <p className="text-2xs text-red-400">{error}</p>}
-    </div>
-  )
-}
-
 // ─── Asset Viewer (full-screen media viewer for shared assets) ───────────────
 
 interface AssetViewerProps {
@@ -659,6 +571,8 @@ interface AssetViewerProps {
   permission: SharePermission
   allowDownload: boolean
   showVersions: boolean
+  theme: 'dark' | 'light'
+  projectLogoUrl: string | null
   onBack: () => void
 }
 
@@ -692,7 +606,7 @@ function HlsVideo({ src, className }: { src: string; className?: string }) {
   return <video ref={videoRef} controls className={className} />
 }
 
-function AssetViewer({ token, shareSession, asset, permission, allowDownload, showVersions, onBack }: AssetViewerProps) {
+function AssetViewer({ token, shareSession, asset, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack }: AssetViewerProps) {
   // Use the same ReviewProvider as the project review page, but with shareToken
   // This gives us the same video player, image viewer, comment panel, etc.
   return (
@@ -705,6 +619,8 @@ function AssetViewer({ token, shareSession, asset, permission, allowDownload, sh
         permission={permission}
         allowDownload={allowDownload}
         showVersions={showVersions}
+        theme={theme}
+        projectLogoUrl={projectLogoUrl}
         onBack={onBack}
       />
     </div>
@@ -724,6 +640,8 @@ export function FolderShareViewer({
   description,
   createdByName,
   viewerName,
+  viewerAvatarUrl,
+  viewerAvatarColor,
   permission,
   allowDownload,
   showVersions,
@@ -738,15 +656,16 @@ export function FolderShareViewer({
   const [searchQuery, setSearchQuery] = React.useState('')
   const [foldersExpanded, setFoldersExpanded] = React.useState(true)
   const [assetsExpanded, setAssetsExpanded] = React.useState(true)
-  const [panelOpen, setPanelOpen] = React.useState(() => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches)
+  // The comments pane starts closed. A guest following a link came to look at
+  // the media, and on a laptop the pane took a third of the grid before they
+  // had picked anything — it showed "Select an asset to view comments". The
+  // panel belongs to the asset viewer, where ShareReviewScreen opens its own
+  // sidebar by default; here it stays behind the header toggle.
+  const [panelOpen, setPanelOpen] = React.useState(false)
   const [viewingAsset, setViewingAsset] = React.useState<FolderShareAssetItem | null>(null)
 
-  // Set page title — subscribe to orgName so the title updates once branding loads
-  const orgName = useBranding().orgName || 'FreeFrame'
-  React.useEffect(() => {
-    document.title = title ? `${title} – ${orgName}` : orgName
-    return () => { document.title = orgName }
-  }, [title, orgName])
+  // Page title; the hook re-applies it once branding loads and when React remounts the metadata title
+  usePageTitle(title)
   const [selectedAsset, setSelectedAsset] = React.useState<FolderShareAssetItem | null>(null)
 
   const [assets, setAssets] = React.useState<FolderShareAssetItem[]>([])
@@ -767,7 +686,7 @@ export function FolderShareViewer({
   const thumbnailScale = appearance.thumbnail_scale ?? 'fill'
   const showCardInfo = appearance.show_card_info !== false
   const isGridLayout = appearance.layout !== 'list'
-  const perPage = 24
+  const perPage = SHARE_ASSETS_PAGE_SIZE
 
   // Grid column classes based on card_size
   const gridCols = cardSize === 's'
@@ -919,6 +838,8 @@ export function FolderShareViewer({
         permission={permission}
         allowDownload={allowDownload}
         showVersions={showVersions}
+        theme={isDark ? 'dark' : 'light'}
+        projectLogoUrl={branding?.logo_url ?? null}
         onBack={() => setViewingAsset(null)}
       />
     )
@@ -934,8 +855,14 @@ export function FolderShareViewer({
           {viewerName ? (
             <DropdownMenu.Root>
               <DropdownMenu.Trigger asChild>
-                <button className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-bold text-text-primary bg-green-600 [@media(hover:hover)]:hover:ring-2 [@media(hover:hover)]:hover:ring-green-400/50 transition-all outline-none">
-                  {viewerName.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase()}
+                <button className="shrink-0 rounded-full [@media(hover:hover)]:hover:ring-2 [@media(hover:hover)]:hover:ring-green-400/50 transition-all outline-none">
+                  {/* Their picture, else initials on their own circle colour */}
+                  <Avatar
+                    src={viewerAvatarUrl}
+                    name={viewerName}
+                    color={viewerAvatarColor}
+                    className="h-7 w-7 text-[10px] font-bold bg-green-600"
+                  />
                 </button>
               </DropdownMenu.Trigger>
               <DropdownMenu.Portal>
@@ -978,20 +905,9 @@ export function FolderShareViewer({
                 </DropdownMenu.Content>
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
-          ) : branding?.logo_url ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={branding.logo_url}
-              alt=""
-              className="h-7 w-7 rounded-full object-cover shrink-0"
-            />
           ) : (
-            <div
-              className="flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-bold text-text-primary shrink-0"
-              style={{ backgroundColor: accentColor }}
-            >
-              {(branding?.custom_title ?? folderName ?? 'FF').substring(0, 2).toUpperCase()}
-            </div>
+            // The same mark the asset view shows once one is opened (#308).
+            <ShareBrandMark theme={isDark ? 'dark' : 'light'} projectLogoUrl={branding?.logo_url} />
           )}
 
           {/* Breadcrumb */}
@@ -1072,7 +988,7 @@ export function FolderShareViewer({
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search assets…"
-                  className="h-8 w-52 pl-8 pr-3 rounded-md text-sm border bg-bg-tertiary border-border text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-border-focus"
+                  className="h-8 w-52 pl-8 pr-3 rounded-md text-[16px] [@media(hover:hover)]:text-sm border bg-bg-tertiary border-border text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-border-focus"
                 />
               </div>
             </div>
@@ -1195,13 +1111,18 @@ export function FolderShareViewer({
                                   </span>
                                   {/* Download */}
                                   {allowDownload && (
-                                    <button
-                                      className="w-7 shrink-0 flex items-center justify-center h-7 rounded text-text-tertiary opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:hover:text-text-primary transition-all"
-                                      onClick={(e) => { e.stopPropagation(); handleDownload(token, asset.id, shareSession) }}
-                                      title="Download"
+                                    <DownloadMenu
+                                      load={() => fetchShareDownloadOptions(token, asset.id, shareSession)}
+                                      onPick={(rendition) => handleDownload(token, asset.id, shareSession, rendition)}
                                     >
-                                      <Download className="h-4 w-4" />
-                                    </button>
+                                      <button
+                                        className="w-7 shrink-0 flex items-center justify-center h-7 rounded text-text-tertiary opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:hover:text-text-primary data-[state=open]:opacity-100 transition-all"
+                                        onClick={(e) => e.stopPropagation()}
+                                        title="Download"
+                                      >
+                                        <Download className="h-4 w-4" />
+                                      </button>
+                                    </DownloadMenu>
                                   )}
                                 </div>
                               )

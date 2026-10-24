@@ -45,7 +45,7 @@ maintenance_worker, beat, web.
 | Frontend (Next.js)  | http://localhost:3000        | hot reload                              |
 | API (FastAPI)       | http://localhost:8000        |                                         |
 | API docs (Swagger)  | http://localhost:8000/docs   | the fastest way to find an endpoint     |
-| MinIO console       | http://localhost:9001        | S3 API is on :9000                      |
+| Silo console        | http://localhost:9001        | S3 API is on :9000 (Silo, a MinIO fork) |
 | Postgres            | `localhost:5433` (dev only)  | host mapping `5433:5432`; in-container and prod it's `5432` |
 | Redis               | `localhost:6379`             |                                         |
 
@@ -68,7 +68,7 @@ freeframe/
 │   │   ├── middleware/     # auth deps, share-link auth, rate limiting, setup guard
 │   │   ├── alembic/        # database migrations
 │   │   └── tests/          # pytest suite (mock-DB based — see Gotchas)
-│   └── web/                # Next.js 14 App Router frontend
+│   └── web/                # Next.js 16 App Router frontend
 │       ├── app/            # routes/pages
 │       ├── components/     # React components
 │       ├── hooks/          # React hooks
@@ -103,6 +103,10 @@ pnpm --filter web test
 pnpm --filter web exec tsc --noEmit   # type check
 pnpm --filter web lint
 ```
+
+> **Use the Node version in [`.nvmrc`](.nvmrc).** CI reads it, and so do `nvm use` and `fnm`.
+> A different system Node can fail tests that pass in CI. CI also checks that npm, which
+> `docker-compose.dev.yml` installs `apps/web` with, can still resolve `apps/web/package.json`.
 
 > CI ignores changes limited to `*.md`, `docs/**`, `LICENSE`, and the issue/PR templates,
 > so a docs-only PR (like editing this file) will not trigger the test/build jobs.

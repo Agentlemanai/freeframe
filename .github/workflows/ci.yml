@@ -69,10 +69,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: apps/api/requirements.txt
+          cache-dependency-path: apps/api/requirements-dev.txt
 
       - name: Install dependencies
-        run: pip install -r apps/api/requirements.txt
+        run: pip install -r apps/api/requirements-dev.txt
 
       - name: Verify test files exist
         run: |
@@ -147,7 +147,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version-file: .nvmrc
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
@@ -170,12 +170,31 @@ jobs:
           done
           echo "All critical frontend files present"
 
+      # docker-compose.dev.yml runs `npm install` on this manifest while every
+      # other install path is pnpm, so an override npm rejects outright
+      # (EOVERRIDE, #366) would otherwise go green. Resolution only, so
+      # --ignore-scripts. A clean dir, because npm 10.x also crashes
+      # ('edgesOut') next to a pnpm node_modules and a stray lockfile would hide
+      # a real failure. npm 11 is pinned so the resolve does not run on the npm
+      # bundled with whatever Node .nvmrc names: npm 10.9.8 crashes from scratch
+      # on any manifest (#417). Drop the pin once the .nvmrc Node bundles an npm
+      # other than 10.9.8. The outer `npx` is still that bundled npm, and it also
+      # parses the package.json in this dir, so the pin narrows the dependency on
+      # the bundled npm rather than removing it.
+      - name: npm can still resolve apps/web
+        run: |
+          dir="$RUNNER_TEMP/npm-resolve"
+          rm -rf "$dir" && mkdir -p "$dir"
+          cp package.json "$dir/"
+          cd "$dir"
+          npx -y npm@11 --version
+          npx -y npm@11 install --package-lock-only --ignore-scripts
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Type check
         run: pnpm exec tsc --noEmit
-        continue-on-error: true
 
       - name: Run tests
         run: pnpm test
@@ -223,7 +242,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version-file: .nvmrc
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
@@ -235,7 +254,36 @@ jobs:
       - name: Lint frontend
         run: pnpm lint
         working-directory: apps/web
-        continue-on-error: true
+
+  # ─── E2E type check ───────────────────────────────────────────────────────────
+  # The Playwright suite in e2e/ drives a running stack, so CI does not run it,
+  # but it must keep compiling. A standalone package with its own lockfile;
+  # nothing here installs a browser.
+  e2e-typecheck:
+    name: E2E Type Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: e2e
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+
+      - name: Type check
+        run: pnpm typecheck
 
   # ─── Docker Build ─────────────────────────────────────────────────────────────
   docker-build:
@@ -250,6 +298,19 @@ jobs:
 
       - name: Build API image (prod)
         run: docker build -t freeframe-api:prod -f apps/api/Dockerfile.prod .
+
+      - name: Test tooling is in the dev image and not the prod one
+        run: |
+          # The dev image is what every documented way of running the suite goes
+          # through, and the prod image is where pytest must never ship. Both
+          # directions are asserted, because a change that fixes one by breaking
+          # the other looks green otherwise.
+          docker run --rm freeframe-api:test python -m pytest --version
+          if docker run --rm freeframe-api:prod python -m pytest --version 2>/dev/null; then
+            echo "::error::pytest is installed in the production image"
+            exit 1
+          fi
+          echo "dev has pytest, prod does not"
 
       - name: Build Web image (dev)
         run: docker build -t freeframe-web:test -f apps/web/Dockerfile apps/web/

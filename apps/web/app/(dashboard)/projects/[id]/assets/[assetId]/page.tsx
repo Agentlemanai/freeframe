@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { use, useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useRouter, usePathname, useSearchParams } from 'next/navigation'
 import useSWR from 'swr'
 import { ReviewProvider, useReview } from '@/components/review/review-provider'
@@ -23,8 +23,12 @@ import { useAuthStore } from '@/stores/auth-store'
 import { useComments } from '@/hooks/use-comments'
 import { useSSE } from '@/hooks/use-sse'
 import { api } from '@/lib/api'
-import { useUploadStore } from '@/stores/upload-store'
+import { projectFolderHref } from '@/lib/project-links'
+import { useUploadStore, visibleFiles } from '@/stores/upload-store'
+import { useToast } from '@/components/shared/toast'
 import { useBreadcrumbStore } from '@/stores/breadcrumb-store'
+import { useViewStore } from '@/stores/view-store'
+import { sortAssets } from '@/lib/sort-assets'
 import { canCompare } from '@/lib/compare-time'
 import {
   ArrowLeft,
@@ -53,10 +57,11 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
-  const { asset, versions, isLoading, refetchComments, refetchVersions } = useReview()
+  const { asset, versions, isLoading, refetchComments, refetchVersions, togglePlayback } = useReview()
   const { currentVersion, isDrawingMode, focusedCommentId, playheadTime, seekTo, setFocusedCommentId, setActiveAnnotation } = useReviewStore()
   const { user } = useAuthStore()
   const startVersionUpload = useUploadStore((s) => s.startVersionUpload)
+  const toast = useToast()
   const versionFileInputRef = useRef<HTMLInputElement>(null)
   const setExtraCrumbs = useBreadcrumbStore((s) => s.setExtraCrumbs)
   const setLabel = useBreadcrumbStore((s) => s.setLabel)
@@ -79,7 +84,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const useSheet = !isWide && !isLandscape
   const [sheetState, setSheetState] = useState<SheetState>('peek')
   const [sheetHeight, setSheetHeight] = useState(PEEK_PX)
-  const { isPlaying, togglePlay } = useMediaTransport()
+  const { isPlaying, togglePlay, mediaRootRef } = useMediaTransport({ toggleVideo: togglePlayback })
   const reviewRootRef = useRef<HTMLDivElement>(null)
 
   // MUST be stable: MobileCommentSheet lists it as an effect dependency, so an
@@ -150,7 +155,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
       : []
 
     setExtraCrumbs([
-      ...folderPath.map((f) => ({ label: f.name, href: `/projects/${projectId}?folder=${f.id}` })),
+      ...folderPath.map((f) => ({ label: f.name, href: projectFolderHref(projectId, f.id) })),
       { label: asset.name }, // asset name — no href (current page)
     ])
   }, [asset?.id, asset?.name, asset?.folder_id, folderTree, setExtraCrumbs])
@@ -172,11 +177,21 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const currentMember = members?.find((m) => m.user_id === user?.id)
   const currentRole = currentMember?.role ?? 'viewer'
   const canComment = currentRole !== 'viewer'
+  // delete_comment lets a project owner remove anyone's comment.
+  const canModerate = currentRole === 'owner'
 
-  // Fetch all assets for navigation (1 of N)
-  const { data: allAssets } = useSWR<AssetResponse[]>(
-    `/projects/${projectId}/assets`,
-    () => api.get<AssetResponse[]>(`/projects/${projectId}/assets`),
+  // Prev/next walks the asset's own folder in the order the project view shows
+  // it, not the whole project. Same key as the project page, so the list is
+  // usually already cached.
+  const { data: folderAssets } = useSWR<AssetResponse[]>(
+    asset ? `/projects/${projectId}/assets?folder_id=${asset.folder_id ?? 'root'}` : null,
+    (key: string) => api.get<AssetResponse[]>(key),
+  )
+  const sortKey = useViewStore((s) => s.sortKey)
+  const sortDirection = useViewStore((s) => s.sortDirection)
+  const navAssets = useMemo(
+    () => (folderAssets ? sortAssets(folderAssets, sortKey, sortDirection) : undefined),
+    [folderAssets, sortKey, sortDirection],
   )
 
   const {
@@ -220,6 +235,28 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     refetchVersions()
   }, [versionsRevision, refetchVersions])
 
+  // A New Version file waits for its turn behind the other uploads. Until its
+  // initiate has answered there is no version to show, so the page says what
+  // is going on instead of looking as if nothing was picked. The same counter
+  // as above is bumped when the version exists, which is when the list is
+  // refetched: no guess at how long the wait is.
+  //
+  // Only this asset's own version rows: a queued new asset has no `assetId`.
+  //
+  // The row the queue is holding on (the probe) says why instead, as it does in
+  // the panel: "waiting for other uploads" is not true of it. A string, so the
+  // selector is stable between renders.
+  const assetIdForQueue = asset?.id
+  const versionQueueLine = useUploadStore((s) => {
+    if (assetIdForQueue === undefined) return ''
+    const queued = visibleFiles(s).filter((f) => f.status === 'queued' && f.assetId === assetIdForQueue)
+    if (queued.length === 0) return ''
+    const reason = queued.find((f) => f.holdReason)?.holdReason
+    if (reason === 'connection') return 'Waiting for connection'
+    if (reason === 'storage') return 'Waiting for storage'
+    return 'New version queued, waiting for other uploads'
+  })
+
   // Deep-link to a specific comment from notification (?commentId=...)
   // Runs once after comments are loaded — seeks to timecode, focuses comment, shows annotation
   useEffect(() => {
@@ -239,19 +276,20 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   }, [comments, searchParams, seekTo, setFocusedCommentId, setActiveAnnotation])
 
   // Version-compare overlay: driven entirely by the ?compare= URL param so it
-  // survives refresh/deep-link. closeCompare strips all four compare params.
+  // survives refresh/deep-link (?right= names the right pane, see ReviewPage).
+  // closeCompare strips all the compare params.
   const compareOpen = Boolean(searchParams.get('compare'))
   const closeCompare = useCallback(() => {
     const p = new URLSearchParams(searchParams.toString())
-    p.delete('compare'); p.delete('mode'); p.delete('offA'); p.delete('offB')
+    p.delete('compare'); p.delete('right'); p.delete('mode'); p.delete('offA'); p.delete('offB'); p.delete('offFor')
     router.replace(`${pathname}?${p.toString()}`, { scroll: false })
   }, [router, pathname, searchParams])
 
   // Asset navigation
-  const currentIndex = allAssets?.findIndex((a) => a.id === asset?.id) ?? -1
-  const totalAssets = allAssets?.length ?? 0
-  const prevAsset = currentIndex > 0 ? allAssets?.[currentIndex - 1] : null
-  const nextAsset = currentIndex < totalAssets - 1 ? allAssets?.[currentIndex + 1] : null
+  const currentIndex = navAssets?.findIndex((a) => a.id === asset?.id) ?? -1
+  const totalAssets = navAssets?.length ?? 0
+  const prevAsset = currentIndex > 0 ? navAssets?.[currentIndex - 1] : null
+  const nextAsset = currentIndex < totalAssets - 1 ? navAssets?.[currentIndex + 1] : null
 
   const navigateAsset = (assetId: string) => {
     router.push(`/projects/${projectId}/assets/${assetId}`)
@@ -456,6 +494,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     <CommentPanel
       comments={comments as any}
       currentUserId={user?.id}
+      canModerate={canModerate}
       onResolve={resolveComment}
       onDelete={deleteComment}
       onAddReaction={addReaction}
@@ -515,10 +554,16 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     <div className="absolute inset-0 flex flex-col overflow-hidden">
       {/* ─── Top bar (Frame.io style) ──────────────────────────────────── */}
       <div className="flex items-center justify-between border-b border-border px-3 h-12 bg-bg-secondary shrink-0">
-        {/* Left: back + breadcrumb */}
-        <div className="flex items-center gap-1 min-w-0 flex-1">
+        {/* Left: back + breadcrumb. The name is the first thing the bar gives
+            up; `min-w-7` keeps the back arrow, which at zero width spilled out
+            into the centre group and had the navigator drawn over it. */}
+        <div className="flex items-center gap-1 min-w-7 flex-1">
+          {/* Back to the folder the asset is in, as a share link's back arrow
+              does; it used to go to the project root from anywhere. */}
           <Link
-            href={`/projects/${asset.project_id}`}
+            href={projectFolderHref(asset.project_id, asset.folder_id)}
+            aria-label={asset.folder_id ? 'Back to folder' : 'Back to project'}
+            title={asset.folder_id ? 'Back to folder' : 'Back to project'}
             className="flex items-center justify-center h-7 w-7 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors shrink-0"
           >
             <ArrowLeft className="h-4 w-4" />
@@ -548,15 +593,24 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             navigator is not rendered and the credit is centred alone, exactly
             as before.
 
-            The credit is `hidden` below `lg` because in flow it is 147px that
-            nothing can reclaim: the middle group does not shrink, and neither
-            does the block on the right, so the surplus leaves the bar past its
-            right edge, where the page root's `overflow-hidden` clips it and no
-            scroll reaches it. That costs the sidebar toggle from about 744px
-            down -- an iPad in portrait, or two windows side by side. Out of
-            flow below `lg`, the thresholds are the ones this page had before
-            the credit joined the bar at all. */}
-        <div className="flex items-center gap-3 shrink-0">
+            The block on the right does not shrink, and anything that leaves
+            the bar past its right edge is clipped by the page root's
+            `overflow-hidden`, where no scroll reaches it -- the sidebar toggle
+            first. So once the asset name is down to nothing, the credit is
+            what gives way: this group can shrink (`min-w-0`, no `shrink-0`),
+            the navigator inside it cannot, and the credit truncates its text.
+            Gating the credit on viewport width alone did not cover it: the bar
+            is also 168px narrower with the rail expanded, and a raised browser
+            text size grows every rem while the `lg` media query stays put. At
+            1024px, rail expanded, Compare and the navigator showing, 57px of
+            name was all that was left, and at a 20px text size the toggle was
+            off-screen.
+
+            The credit is still `hidden` below `lg`, where the room it would
+            take is room the controls need at every width. Out of flow there,
+            the thresholds are the ones this page had before the credit joined
+            the bar at all. */}
+        <div className="flex items-center gap-3 min-w-0">
           {totalAssets > 1 && (
             <div className="flex items-center gap-1 shrink-0">
               <button
@@ -580,7 +634,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
               </button>
             </div>
           )}
-          <PoweredByBadge showIcon className="hidden lg:inline-flex" />
+          <PoweredByBadge showIcon className="hidden lg:inline-flex min-w-0 [&>span]:truncate" />
         </div>
 
         {/* Right: version, share, sidebar toggle */}
@@ -594,12 +648,14 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             onChange={async (e) => {
               const file = e.target.files?.[0]
               if (!file || !asset) return
-              startVersionUpload(file, asset.id, asset.name, asset.project_id, project?.name)
+              // No row without a session: the upload would belong to nobody.
+              if (startVersionUpload(file, asset.id, asset.name, asset.project_id, project?.name) === null) {
+                toast.error('Sign in to upload')
+              }
               e.target.value = ''
-              // Surface the newly-created version (starts as "uploading") quickly;
-              // SSE transcode events then drive it through processing → ready (#118).
-              setTimeout(() => refetchVersions(), 800)
-              setTimeout(() => refetchVersions(), 2500)
+              // The new version (it starts as "uploading") is fetched when the
+              // upload store says it exists, through `versionsRevision`; SSE
+              // transcode events then drive it through processing → ready (#118).
             }}
           />
           <VersionSwitcher versions={versions} />
@@ -615,6 +671,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
                 if (!prev) return
                 const p = new URLSearchParams(searchParams.toString())
                 p.set('compare', prev.id)
+                p.set('right', cur.id)
                 router.replace(`${pathname}?${p.toString()}`, { scroll: false })
               }}
               className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors"
@@ -655,7 +712,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
 
       {/* ─── Main content: viewer + sidebar ────────────────────────────── */}
       {compareOpen && asset && currentVersion && canCompare(asset.asset_type, versions) ? (
-        <CompareOverlay asset={asset} versions={versions} rightVersion={currentVersion} onClose={closeCompare} canComment={canComment} />
+        <CompareOverlay asset={asset} versions={versions} rightVersion={currentVersion} onClose={closeCompare} canComment={canComment} canModerate={canModerate} />
       ) : (
       <>
       {/* pb-14 (3.5rem = PEEK_PX) reserves the sheet's peek band so the
@@ -668,8 +725,30 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
       >
         {/* Left: viewer column */}
         <div
+          ref={mediaRootRef}
           className="flex-1 flex flex-col bg-bg-primary overflow-hidden min-w-0"
         >
+          {/* What a New Version is waiting for, over the media and not over the
+              comments beside it. A zero-height anchor rather than a row or a
+              `relative` column: a line that took room would change the stage's
+              size cap (`--ff-stage-max`, measured once per layout, not when
+              something appears), and positioning the column would move the
+              containing block of everything absolute inside the viewer.
+
+              The region is always mounted and only its text changes. One
+              created together with its text is not reliably announced. */}
+          <div className="relative z-10 h-0 shrink-0">
+            <div
+              role="status"
+              className="pointer-events-none absolute inset-x-0 top-2 flex justify-center px-3"
+            >
+              {versionQueueLine ? (
+                <span className="rounded-md border border-border bg-bg-secondary/95 px-3 py-1.5 text-xs text-text-secondary shadow-lg">
+                  {versionQueueLine}
+                </span>
+              ) : null}
+            </div>
+          </div>
           {/* Media viewer */}
           {renderMediaViewer()}
         </div>
@@ -726,12 +805,16 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
 export default function ReviewPage({
   params,
 }: {
-  params: { id: string; assetId: string }
+  params: Promise<{ id: string; assetId: string }>
 }) {
-  const { id: projectId, assetId } = params
+  const { id: projectId, assetId } = use(params)
+  // The right compare pane is the store's current version, which a reload does
+  // not keep, so a compare URL names it and the provider opens on it (#299).
+  const searchParams = useSearchParams()
+  const initialVersionId = searchParams.get('compare') ? searchParams.get('right') : null
 
   return (
-    <ReviewProvider assetId={assetId}>
+    <ReviewProvider assetId={assetId} initialVersionId={initialVersionId}>
       <ReviewScreenInner projectId={projectId} />
     </ReviewProvider>
   )

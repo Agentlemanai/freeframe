@@ -81,6 +81,10 @@ Frontend receives  ◀────────── SSE: transcode_complete
 transcode_complete             (or transcode_failed)
 ```
 
+Each upload is cut into parts of one size, chosen at initiate from the instance's part size
+setting (automatic sizing aims for about 500 parts) and pinned to the version, so a resume
+and a later change to the setting never disagree about where a part's bytes start.
+
 A transfer that stops part-way leaves the multipart upload open and its parts in
 the bucket. `AbortMultipartUpload` is only ever called for an explicit user
 cancel (or by the stale-upload reaper), so the version stays `uploading` and the
@@ -118,14 +122,18 @@ Reviewer approves / rejects ──▶ SSE: approval_updated
 2. Celery worker reads directly from S3 presigned URL (no full download)
 3. `ffprobe` extracts metadata (duration, resolution, FPS)
 4. FFmpeg generates multi-bitrate HLS:
-   - 1080p (CRF 20), 720p (CRF 22), 360p (CRF 26)
+   - 1080p (CRF 20), 720p (CRF 22), 360p (CRF 26) by default; 2160p (CRF 20) is available
+     through `TRANSCODER_QUALITIES` but not built unless configured
    - 2-second segments with forced keyframes
    - The ladder is trimmed against the source resolution, so a small source never gets
      upscaled renditions. If every rung is above the source, the smallest is kept.
    - An optional NVENC/VAAPI hardware backend is selected at runtime when available, using
-     `-global_quality` in place of `-crf`, and falls back to software on failure. HDR and
+     `-global_quality` in place of `-crf`, and falls back to software on failure. A source
+     the GPU can't decode (ProRes, 4:2:2, 10-bit H.264) is decoded on the CPU and uploaded,
+     so the scale and encode stay on the GPU. HDR and
      Dolby Vision sources are tone-mapped to Rec.709, with the CRF adjusted either way.
-5. One thumbnail generated (`-vf thumbnail`, a single representative frame)
+5. One thumbnail generated (`-vf thumbnail`, a single representative frame), scaled to square
+   pixels so anamorphic sources aren't squeezed, and fit within 1280x1280 keeping its shape
 6. All outputs uploaded to S3 under `processed/{project_id}/{asset_id}/{version_id}/`
 7. `AssetVersion.processing_status` set to `ready`, `transcode_complete` published
 
@@ -185,6 +193,8 @@ a folder, a project, or an explicit set of items, and may be password-protected;
 links apply transitively to the folder's contents. Guests commenting through a share link are
 recorded in the `GuestUser` table with email and name only, no account required.
 
+**Everything requires a live project.** A deleted project (one with `deleted_at` set) is treated as gone on every path: `require_project_role` and the project listings answer 404 *Project not found*, `can_access_asset` refuses its assets, and a share link resolves only while its project, its asset or folder, and every folder above that are live, answering 404 *Share link not found* like an unknown token otherwise. Deleting a folder or asset leaves its share links in place, so restoring it brings them back. See [GHSA-w8vh-2j74-m3hw](https://github.com/Techiebutler/freeframe/security/advisories/GHSA-w8vh-2j74-m3hw).
+
 > **Note:** `AssetShare.shared_with_team_id` is still written by the two `share/team` endpoints
 > but is never read when resolving access, so a team share currently grants access to nobody.
 > Tracked separately; do not rely on it.
@@ -216,8 +226,22 @@ All six are published through `event_service.publish_sync`, which is the single 
 is best-effort: every call site publishes after its commit, and a broker that is down or slow
 degrades to "no live update" rather than failing the request that produced it.
 
-Clients reconnect automatically on disconnect. SSE was chosen over WebSockets because it's
-simpler, works through most proxies, and is sufficient for an async review workflow.
+Access is checked when a stream connects and again for as long as it stays open, with the same
+rule both times: an active, undeleted account, an unexpired access token whose `ver` matches
+`users.token_version`, and a live project the user is a member of or that is public. An open
+stream re-checks before it delivers an event once its last check is older than
+`SSE_AUTH_MAX_AGE_SECONDS` (default 1), and every `SSE_AUTH_RECHECK_SECONDS` (default 15) while
+idle. Token expiry is exact rather than gated: the token's `exp` is compared before every write,
+and an idle stream wakes at `exp` to close. An idle stream is sent a keepalive at the recheck
+interval or every 30 seconds, whichever is shorter. Each check is one indexed query on its own
+short-lived session, so an open stream holds no database connection. When a check fails, the
+stream sends a final `revoked` event with `{reason}` (`access_revoked`, `token_expired` or
+`token_revoked`) and closes; a connection that fails the check is refused with 403.
+
+Clients reconnect automatically on disconnect. After `revoked`, `hooks/use-sse.ts` refreshes the
+token and reconnects for the two token reasons, and stops for `access_revoked`. SSE was chosen
+over WebSockets because it's simpler, works through most proxies, and is sufficient for an async
+review workflow.
 
 ---
 

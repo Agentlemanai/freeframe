@@ -23,8 +23,20 @@ vi.mock('@/lib/api', () => ({
 }))
 
 import { api, ApiError } from '@/lib/api'
-import { useUploadStore, uploadAllParts } from '../upload-store'
+import { useUploadStore, uploadAllParts, __uploadQueueTesting } from '../upload-store'
 import type { UploadFile } from '../upload-store'
+import { installXhrFake, ok, fail, type PartHandler } from '@/test/xhr-fake'
+import { createPartBudget } from '@/lib/upload-budget'
+import { signInAs } from '@/test/upload-session'
+import { answerBatch, batchIds } from '@/test/assets-batch'
+
+// The upload queue is tab-wide module state: start every test from an empty one.
+beforeEach(() => __uploadQueueTesting.reset())
+// Rows belong to the account that added them, and only it can resume them.
+beforeEach(() => signInAs('u1'))
+
+/** A budget of `n` slots for one file, which is what the old `concurrency` argument was. */
+const slots = (n: number) => ({ budget: createPartBudget(n), fileKey: 'f' })
 
 const MB = 1024 * 1024
 const CHUNK = 10 * MB
@@ -69,6 +81,7 @@ function seedInterrupted() {
       assetId: ASSET_ID,
       versionId: VERSION_ID,
       createdAt: Date.now(),
+      ownerId: 'u1',
     }],
   })
 }
@@ -77,7 +90,7 @@ function rowOf(id: string) {
   return useUploadStore.getState().files.find((f) => f.id === id)!
 }
 
-/** The part number a presigned URL names, so a fetch mock can tell parts apart. */
+/** The part number a presigned URL names, so a PUT mock can tell parts apart. */
 function mockPresignPerPart() {
   return vi.mocked(api.post).mockImplementation((path: string, body?: unknown) => {
     if (path === '/upload/presign-part') {
@@ -89,8 +102,15 @@ function mockPresignPerPart() {
   })
 }
 
-function partsSentTo(fetchMock: ReturnType<typeof vi.fn>): number[] {
-  return fetchMock.mock.calls
+/** Plays the storage backend for every part PUT; each part succeeds by default. */
+let put = vi.fn<PartHandler>()
+function mockPut(handler: PartHandler = () => ok('"etag"')) {
+  put = vi.fn(handler)
+  installXhrFake(put)
+}
+
+function partsSentTo(putMock: typeof put): number[] {
+  return putMock.mock.calls
     .map(([url]) => Number(String(url).split('-').pop()))
     .sort((a, b) => a - b)
 }
@@ -106,18 +126,16 @@ describe('uploadAllParts with parts already held', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockPresignPerPart()
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true, headers: { get: () => '"etag"' },
-    }) as never
+    mockPut()
   })
 
   it('does not send a part the backend already holds', async () => {
     await uploadAllParts(
-      makeFile(), 'key', 'u1', new AbortController(), () => {}, 5,
-      { chunkSize: CHUNK, alreadyHeld: [1, 2] },
+      makeFile(), 'key', 'u1', new AbortController(), () => {},
+      { ...slots(5), chunkSize: CHUNK, alreadyHeld: [1, 2] },
     )
 
-    expect(partsSentTo(global.fetch as never)).toEqual([3])
+    expect(partsSentTo(put)).toEqual([3])
   })
 
   it('counts the held parts as progress instead of starting again at zero', async () => {
@@ -126,40 +144,54 @@ describe('uploadAllParts with parts already held', () => {
     const onProgress = vi.fn()
 
     await uploadAllParts(
-      makeFile(), 'key', 'u1', new AbortController(), onProgress, 5,
-      { chunkSize: CHUNK, alreadyHeld: [1, 2] },
+      makeFile(), 'key', 'u1', new AbortController(), onProgress,
+      { ...slots(5), chunkSize: CHUNK, alreadyHeld: [1, 2] },
     )
 
-    expect(onProgress.mock.calls[0][0]).toBe(Math.round((2 / 3) * 95))
+    // 20 of 23 MB, in bytes rather than in parts.
+    expect(onProgress.mock.calls[0][0]).toBe(Math.round((20 / 23) * 95))
+  })
+
+  it('counts a held last part at its own length, not a full chunk', async () => {
+    // What is held is a set, so the short tail can be in it while earlier parts
+    // are not. Counting it as a whole chunk would start this resume at 41%.
+    const onProgress = vi.fn()
+
+    await uploadAllParts(
+      makeFile(), 'key', 'u1', new AbortController(), onProgress,
+      { ...slots(5), chunkSize: CHUNK, alreadyHeld: [3] },
+    )
+
+    expect(onProgress.mock.calls[0][0]).toBe(Math.round((3 / 23) * 95))
   })
 
   it('sends the parts that are missing from the middle, not just the tail', async () => {
     // Parts finish out of order once several are in flight, so what is held is a
     // set. Treating it as a prefix would re-send everything after the first hole.
     await uploadAllParts(
-      makeFile(), 'key', 'u1', new AbortController(), () => {}, 5,
-      { chunkSize: CHUNK, alreadyHeld: [1, 3] },
+      makeFile(), 'key', 'u1', new AbortController(), () => {},
+      { ...slots(5), chunkSize: CHUNK, alreadyHeld: [1, 3] },
     )
 
-    expect(partsSentTo(global.fetch as never)).toEqual([2])
+    expect(partsSentTo(put)).toEqual([2])
   })
 
   it('cuts the file on the chunk size it is given, not on its own constant', async () => {
     // A release that changes CHUNK_SIZE must not move the byte ranges of an
     // upload whose earlier parts are already in the bucket.
     await uploadAllParts(
-      makeFile(TOTAL), 'key', 'u1', new AbortController(), () => {}, 5,
-      { chunkSize: 5 * MB },
+      makeFile(TOTAL), 'key', 'u1', new AbortController(), () => {},
+      { ...slots(5), chunkSize: 5 * MB },
     )
 
     // 23 MB at 5 MB per part is five parts, not three.
-    expect(partsSentTo(global.fetch as never)).toEqual([1, 2, 3, 4, 5])
+    expect(partsSentTo(put)).toEqual([1, 2, 3, 4, 5])
   })
 
   it('returns only the parts it actually sent', async () => {
     const parts = await uploadAllParts(
-      makeFile(), 'key', 'u1', new AbortController(), () => {}, 5,
-      { chunkSize: CHUNK, alreadyHeld: [1, 2] },
+      makeFile(), 'key', 'u1', new AbortController(), () => {},
+      { ...slots(5), chunkSize: CHUNK, alreadyHeld: [1, 2] },
     )
 
     // Not a sparse array with holes where the skipped parts would be: that
@@ -175,9 +207,7 @@ describe('resumeUpload', () => {
     vi.clearAllMocks()
     seedInterrupted()
     mockPresignPerPart()
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true, headers: { get: () => '"etag"' },
-    }) as never
+    mockPut()
     vi.mocked(api.get).mockResolvedValue(resumeInfo({ held_part_numbers: [1, 2] }) as never)
   })
 
@@ -185,7 +215,7 @@ describe('resumeUpload', () => {
     useUploadStore.getState().resumeUpload('row-1', makeFile())
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('processing'))
 
-    expect(partsSentTo(global.fetch as never)).toEqual([3])
+    expect(partsSentTo(put)).toEqual([3])
     expect(completionBody().version_id).toBe(VERSION_ID)
   })
 
@@ -195,7 +225,7 @@ describe('resumeUpload', () => {
     useUploadStore.getState().resumeUpload('row-1', makeFile())
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('processing'))
 
-    expect(api.get).toHaveBeenCalledWith(`/upload/${VERSION_ID}/parts`)
+    expect(api.get).toHaveBeenCalledWith(`/upload/${VERSION_ID}/parts`, { pinSubject: 'u1' })
     expect(completionBody().s3_key).toBe('raw/p/a/v/original.mp4')
     expect(completionBody().upload_id).toBe('u1')
   })
@@ -260,7 +290,7 @@ describe('resumeUpload', () => {
     useUploadStore.getState().resumeUpload('row-1', makeFile(TOTAL - 1))
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('interrupted'))
 
-    expect(global.fetch).not.toHaveBeenCalled()
+    expect(put).not.toHaveBeenCalled()
     // Short enough to survive the panel row's truncation, and it says what is
     // wrong rather than repeating the name of the file just picked.
     expect(rowOf('row-1').error).toBe('File does not match original')
@@ -270,7 +300,7 @@ describe('resumeUpload', () => {
     useUploadStore.getState().resumeUpload('row-1', makeFile(TOTAL, 'other.mp4'))
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('interrupted'))
 
-    expect(global.fetch).not.toHaveBeenCalled()
+    expect(put).not.toHaveBeenCalled()
     expect(rowOf('row-1').error).toBe('Please select clip.mp4')
   })
 
@@ -283,16 +313,14 @@ describe('resumeUpload', () => {
     useUploadStore.getState().resumeUpload('row-1', makeFile(1, 'renamed.mp4'))
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('processing'))
 
-    expect(global.fetch).not.toHaveBeenCalled()
+    expect(put).not.toHaveBeenCalled()
     expect(completionBody().parts).toEqual([])
   })
 
   it('stays resumable when the transfer breaks again', async () => {
     // A 403 rather than a dropped connection, so this does not spend the part
     // retry ladder's four minutes reaching the same place.
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: false, status: 403, statusText: 'Forbidden', headers: { get: () => null },
-    }) as never
+    mockPut(() => fail(403, 'Forbidden'))
 
     useUploadStore.getState().resumeUpload('row-1', makeFile())
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('interrupted'))
@@ -387,7 +415,7 @@ describe('discardUpload', () => {
       upload_id: 'u1',
       version_id: VERSION_ID,
       discard: true,
-    })
+    }, { pinSubject: 'u1' })
     expect(useUploadStore.getState().files).toEqual([])
   })
 
@@ -472,9 +500,7 @@ describe('a fresh upload and the pinned chunk size', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     useUploadStore.setState({ files: [] })
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true, headers: { get: () => '"etag"' },
-    }) as never
+    mockPut()
   })
 
   /** Initiate answers with `pinned`; everything after it succeeds. */
@@ -506,7 +532,7 @@ describe('a fresh upload and the pinned chunk size', () => {
 
     // 23 MB at 5 MB a part is five parts; at the client's own 10 MB it is three.
     await vi.waitFor(() =>
-      expect(partsSentTo(global.fetch as never)).toEqual([1, 2, 3, 4, 5]),
+      expect(partsSentTo(put)).toEqual([1, 2, 3, 4, 5]),
     )
   })
 
@@ -516,7 +542,7 @@ describe('a fresh upload and the pinned chunk size', () => {
     useUploadStore.getState().startVersionUpload(makeFile(), ASSET_ID, 'clip', 'project-1')
 
     await vi.waitFor(() =>
-      expect(partsSentTo(global.fetch as never)).toEqual([1, 2, 3, 4, 5]),
+      expect(partsSentTo(put)).toEqual([1, 2, 3, 4, 5]),
     )
   })
 })
@@ -533,7 +559,7 @@ describe('refreshProcessingItems', () => {
       id: 'row-1', fileName: 'clip.mp4', fileSize: TOTAL, fileType: 'video/mp4',
       projectId: 'project-1', assetName: 'clip', progress: 0, processingProgress: 0,
       status: 'interrupted', assetId: ASSET_ID, versionId: VERSION_ID,
-      createdAt: Date.now(), ...over,
+      createdAt: Date.now(), ownerId: 'u1', ...over,
     }
   }
 
@@ -548,7 +574,7 @@ describe('refreshProcessingItems', () => {
     // disappeared, the user was told the upload landed, and the parts sat in
     // the bucket until the reaper.
     useUploadStore.setState({ files: [seedRow({})] as never })
-    vi.mocked(api.get).mockResolvedValue(assetWith('an-older-version', 'ready') as never)
+    vi.mocked(api.get).mockImplementation(answerBatch([assetWith('an-older-version', 'ready')]) as never)
 
     await useUploadStore.getState().refreshProcessingItems()
 
@@ -559,29 +585,29 @@ describe('refreshProcessingItems', () => {
     // The reason interrupted rows are polled at all: the same upload can be
     // resumed from another tab or another machine.
     useUploadStore.setState({ files: [seedRow({})] as never })
-    vi.mocked(api.get).mockResolvedValue(assetWith(VERSION_ID, 'processing') as never)
+    vi.mocked(api.get).mockImplementation(answerBatch([assetWith(VERSION_ID, 'processing')]) as never)
 
     await useUploadStore.getState().refreshProcessingItems()
 
     expect(rowOf('row-1').status).toBe('processing')
   })
 
-  it('gives two rows on one asset their own answers', async () => {
-    // An interrupted v2 and a processing v3 read the same result when the
-    // lookup is keyed on the asset.
+  it('applies the one answer two rows on one asset share only to the version it is about', async () => {
+    // An interrupted v2 and a processing v3. The asset is asked about once, and
+    // its answer names one version: the other row is left as it was rather
+    // than being rewritten from an answer about someone else's version.
     useUploadStore.setState({
       files: [
         seedRow({ id: 'row-1', versionId: 'v2', status: 'interrupted' }),
         seedRow({ id: 'row-2', versionId: 'v3', status: 'processing' }),
       ] as never,
     })
-    vi.mocked(api.get)
-      .mockResolvedValueOnce(assetWith('v2', 'ready') as never)
-      .mockResolvedValueOnce(assetWith('v3', 'ready') as never)
+    vi.mocked(api.get).mockImplementation(answerBatch([assetWith('v3', 'ready')]) as never)
 
     await useUploadStore.getState().refreshProcessingItems()
 
-    expect(rowOf('row-1').status).toBe('complete')
+    expect(vi.mocked(api.get).mock.calls.map(([path]) => batchIds(path))).toEqual([[ASSET_ID]])
+    expect(rowOf('row-1').status).toBe('interrupted')
     expect(rowOf('row-2').status).toBe('complete')
   })
 })
@@ -601,7 +627,7 @@ describe('a row that was uploading when the tab reloaded', () => {
     id: 'row-1', fileName: 'clip.mp4', fileSize: TOTAL, fileType: 'video/mp4',
     projectId: 'project-1', assetName: 'clip', progress: 41, processingProgress: 0,
     status: 'uploading', assetId: ASSET_ID, versionId: VERSION_ID, uploadId: 'u1',
-    createdAt: Date.now(),
+    createdAt: Date.now(), ownerId: 'u1',
   }
 
   it('comes back as interrupted rather than not at all', () => {

@@ -18,9 +18,13 @@ from ..models.project import Project, ProjectMember
 from ..models.folder import Folder
 from ..models.metadata import MetadataField, AssetMetadata, Collection, CollectionShare
 from ..models.branding import ProjectBranding, WatermarkSettings
+from ..models.instance_branding import InstanceBranding
+from ..models.user import User
 from ..models.activity import Mention, ActivityLog, Notification
+from ..services.owned_keys import is_project_logo_key
 from ..services.s3_service import (
     list_stale_multipart_uploads, abort_multipart_upload, delete_object, delete_prefix, list_keys,
+    head_object_size,
 )
 
 log = logging.getLogger("celery.cleanup")
@@ -39,12 +43,20 @@ def _retention_days() -> int:
     return days
 
 
-def _safe(fn, *args):
-    """Run a best-effort S3 op; log and swallow any error so the sweep never aborts."""
+def _safe(fn, *args) -> bool:
+    """Run a best-effort S3 op; log and swallow any error so the sweep never aborts.
+
+    Returns whether it actually ran. Swallowing is still the right behaviour -- one
+    unreachable key must not abort a sweep -- but a caller that reports how much it
+    reclaimed has to be able to tell a success from a logged failure, or it reports
+    storage as freed that is still being paid for.
+    """
     try:
         fn(*args)
+        return True
     except Exception as exc:  # noqa: BLE001 - best-effort cleanup
         log.warning("reaper: %s%r failed: %s", fn.__name__, args, exc)
+        return False
 
 
 @dataclass
@@ -211,7 +223,10 @@ def _purge_project(db, project_id, counts: PurgeCounts) -> None:
     db.query(Collection).filter(Collection.project_id == project_id).delete(synchronize_session=False)
     branding = db.query(ProjectBranding).filter(ProjectBranding.project_id == project_id).first()
     if branding is not None:
-        if branding.logo_s3_key:
+        # Only a logo this project's upload step issued. A row written before
+        # that was checked can name any object in the bucket, another project's
+        # media included, and purging this project must not take it with it.
+        if is_project_logo_key(project_id, branding.logo_s3_key):
             _safe(delete_object, branding.logo_s3_key)
             counts.s3_deletes += 1
         db.query(ProjectBranding).filter(ProjectBranding.project_id == project_id).delete(synchronize_session=False)
@@ -262,7 +277,7 @@ def _dispose_version_files(db: Session, v: AssetVersion) -> None:
     # Driven off our own row rather than off a bucket listing. A listing pass
     # was wrong twice over: it aborted uploads that were still transferring,
     # because it aged them by when the multipart was initiated rather than by
-    # whether anything was still happening; and on MinIO, the default backend,
+    # whether anything was still happening; and on MinIO, then the default backend,
     # it found nothing at all after a restart, because ListMultipartUploads
     # there is served from a node-local in-memory cache -- measured 3 open
     # uploads before a restart and 0 after, with the parts still present.
@@ -281,6 +296,31 @@ def _dispose_version_files(db: Session, v: AssetVersion) -> None:
     v.deleted_at = datetime.now(timezone.utc)
 
 
+def _holds_a_master(db: Session, v: AssetVersion) -> bool:
+    """Whether storage may still hold a `failed` version's uploaded master.
+
+    `failed` means two things. /upload/abort writes it for an upload that never
+    assembled an object, which is the reaper's to reclaim. The transcoder writes it
+    for a master that uploaded completely and then failed to transcode on every
+    attempt, and that master is the user's only copy of the original: nothing
+    re-queues a failed version, so deleting it leaves nothing for a later fix to run
+    against. The status cannot tell the two apart; storage can.
+
+    Only a confirmed absence lets the reaper go ahead. Any object at the key is one
+    CompleteMultipartUpload assembled, whatever size was declared for it, and a
+    lookup that fails is not evidence that nothing is there.
+    """
+    for mf in db.query(MediaFile).filter(MediaFile.version_id == v.id).all():
+        try:
+            if head_object_size(mf.s3_key_raw) is not None:
+                return True
+        except Exception:  # noqa: BLE001 - an unanswered lookup must keep the master
+            log.warning("reaper: could not check the master of failed version %s; keeping it",
+                        v.id, exc_info=True)
+            return True
+    return False
+
+
 def _reap_stale_uploads(db) -> int:
     """Reclaim upload orphans. Mutates `db` (soft-deletes versions) but does NOT commit —
     the caller owns the transaction. Returns the number of versions soft-deleted."""
@@ -289,7 +329,7 @@ def _reap_stale_uploads(db) -> int:
         # 0 (or negative) DISABLES the reaper — matching the 0 = unlimited/disabled convention
         # of MAX_UPLOAD_BYTES / storage_limit_bytes. Without this guard, cutoff would be `now()`
         # and the sweep would destroy every in-progress upload on the next run.
-        log.info("reaper: disabled (stale_upload_timeout_hours=%s)", hours)
+        log.warning("reaper: disabled (stale_upload_timeout_hours=%s)", hours)
         return 0
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
@@ -298,11 +338,18 @@ def _reap_stale_uploads(db) -> int:
     # recorded. A large upload on a slow line can legitimately outlive the window
     # -- 90 GB at 8 Mbit/s takes longer than a day -- and reclaiming it by start
     # time destroys an upload that is still making progress.
-    versions = db.query(AssetVersion).filter(
+    candidates = db.query(AssetVersion).filter(
         AssetVersion.processing_status.in_([ProcessingStatus.uploading, ProcessingStatus.failed]),
         AssetVersion.deleted_at.is_(None),
         func.coalesce(AssetVersion.last_activity_at, AssetVersion.created_at) < cutoff,
     ).all()
+    # A `failed` version whose master is still in storage is kept: it stays until
+    # someone deletes it, and then goes through the soft-delete retention like
+    # anything else.
+    versions = [
+        v for v in candidates
+        if v.processing_status != ProcessingStatus.failed or not _holds_a_master(db, v)
+    ]
     for v in versions:
         _dispose_version_files(db, v)
     db.flush()
@@ -341,10 +388,13 @@ def _reap_stale_uploads(db) -> int:
     except Exception as exc:  # noqa: BLE001 - a listing this backend cannot do is not fatal
         log.warning("reaper: could not list in-progress uploads: %s", exc)
 
-    log.info(
+    # Each reclaimed version had its S3 objects deleted: WARNING when anything was
+    # reclaimed, so it survives a quiet worker log level, as the GC result does.
+    log.log(
+        logging.WARNING if (versions or orphans) else logging.INFO,
         "reaper: soft-deleted %d stale version(s), %d asset(s) left with none, "
-        "%d unreferenced upload(s) aborted",
-        len(versions), stripped, orphans,
+        "%d unreferenced upload(s) aborted, %d failed version(s) kept for their master",
+        len(versions), stripped, orphans, len(candidates) - len(versions),
     )
     return len(versions)
 
@@ -376,7 +426,8 @@ def _lock_if_still_purgeable(db, model, obj_id, cutoff):
     is no longer aged, or is already gone — in which case the caller must skip it. This closes the
     purge-vs-restore TOCTOU: a restore that commits before this runs is filtered out; a restore
     in-flight blocks on the lock and is then seen as deleted_at IS NULL; a restore after this locks
-    the row blocks until the purge deletes+commits (the restore then no-ops)."""
+    the row blocks until the purge deletes+commits, and its guarded UPDATE then matches no row, so
+    it answers 404."""
     return db.query(model).filter(
         model.id == obj_id,
         model.deleted_at.isnot(None),
@@ -394,7 +445,7 @@ def _purge_soft_deleted(db, counts: PurgeCounts) -> None:
     if days <= 0:
         # 0/negative DISABLES the purge — guard BEFORE computing a cutoff so a misconfigured 0
         # can never make cutoff == now() and hard-delete every soft-deleted row.
-        log.info("cleanup: disabled (soft_delete_retention_days=%s)", days)
+        # (The task reports "disabled" from `_run_cleanup`, which stops before this.)
         return
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -439,7 +490,10 @@ def _run_cleanup(db) -> PurgeCounts:
     days = _retention_days()
     counts = PurgeCounts(retention_days=days)  # report the clamped window actually used
     if days <= 0:
-        return counts  # disabled; skip the advisory lock and all work
+        # Disabled; skip the advisory lock and all work. WARNING so an operator
+        # running the worker at a quiet level still learns the GC is off.
+        log.warning("cleanup: disabled (soft_delete_retention_days=%s)", days)
+        return counts
     got_lock = db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _PURGE_ADVISORY_LOCK_KEY}).scalar()
     if not got_lock:
         log.info("cleanup: another purge holds the advisory lock; skipping this run")
@@ -462,13 +516,13 @@ def requeue_stuck_processing():
 
     This re-dispatches rather than condemning. Marking such a version `failed`
     would be worse than leaving it: CompleteMultipartUpload has already run by
-    then, so the raw object is fully assembled, and the reaper deletes
-    `s3_key_raw` for `failed` and `uploading` alike -- a twenty-second broker
-    restart after a large upload would schedule that master for deletion.
+    then, so the raw object is fully assembled, and nothing ever re-queues a
+    `failed` version -- a twenty-second broker restart after a large upload would
+    leave that master untranscoded for good.
     """
     hours = settings.stuck_processing_timeout_hours
     if hours <= 0:
-        log.info("requeue: disabled (stuck_processing_timeout_hours=%s)", hours)
+        log.warning("requeue: disabled (stuck_processing_timeout_hours=%s)", hours)
         return 0
 
     # The cutoff must clear the transcoder's own 4-hour ceiling, or a legitimately
@@ -518,13 +572,28 @@ def cleanup_soft_deleted():
     try:
         counts = _run_cleanup(db)
         db.commit()
-        log.info("cleanup: %s", asdict(counts))
-        return asdict(counts)
+        result = asdict(counts)
+        # The only record of what an irreversible purge removed: WARNING so it
+        # survives a quiet worker log level. A run that removed nothing stays INFO.
+        did_work = any(v for k, v in result.items() if k != "retention_days")
+        log.log(logging.WARNING if did_work else logging.INFO, "cleanup: %s", result)
+        return result
     finally:
         db.close()
 
 
-_ORPHAN_SWEEP_PREFIXES = ("raw/", "processed/")
+_ORPHAN_SWEEP_PREFIXES = (
+    "raw/", "processed/", "posters/", "avatars/", "comment-attachments/",
+    "branding/", "watermarked/",
+)
+
+# `branding/{project_id}/watermark/` is written by an upload endpoint that returns
+# the key and stores it nowhere: `WatermarkSettings` has no column for it and
+# `WatermarkContent` has no image variant, so the feature is half-built and no row
+# can vouch for these objects. Sweeping the prefix would delete them along with
+# anything an instance uploaded by driving the API directly, and the sweep cannot
+# tell those apart, so it is excluded until the feature is finished or removed.
+_ORPHAN_SWEEP_EXCLUDED = ("branding/", "/watermark/")
 
 
 @dataclass
@@ -535,6 +604,7 @@ class OrphanSweepCounts:
     orphans: int = 0
     orphan_bytes: int = 0
     deleted: int = 0
+    deleted_bytes: int = 0
 
 
 def _sweep_orphan_s3(db) -> OrphanSweepCounts:
@@ -551,7 +621,7 @@ def _sweep_orphan_s3(db) -> OrphanSweepCounts:
     grace = settings.orphan_sweep_grace_hours
     counts = OrphanSweepCounts(grace_hours=grace, delete_enabled=settings.orphan_sweep_delete)
     if grace <= 0:
-        log.info("orphan-sweep: disabled (orphan_sweep_grace_hours=%s)", grace)
+        log.warning("orphan-sweep: disabled (orphan_sweep_grace_hours=%s)", grace)
         return counts
     cutoff = datetime.now(timezone.utc) - timedelta(hours=grace)
 
@@ -570,6 +640,36 @@ def _sweep_orphan_s3(db) -> OrphanSweepCounts:
         if download:
             exact_live.add(download)
 
+    # The prefixes outside raw/ and processed/ each have exactly one owning column,
+    # and every one of them is queried UNFILTERED for the same reason MediaFile is:
+    # a soft-deleted-but-not-yet-purged row still owns its object, and reclaiming it
+    # belongs to the retention GC rather than here.
+    #
+    # `watermarked/` deliberately contributes nothing. `apply_watermark` writes
+    # `watermarked/{asset_id}/output.*` and nothing in the codebase ever reads it
+    # back, so every object under it is dead weight rather than something with a
+    # missing owner (#247).
+    for (poster,) in db.query(Project.poster_s3_key).filter(Project.poster_s3_key.isnot(None)):
+        exact_live.add(poster)
+    # Named `avatar_url`, holds an S3 key: `users.py` passes it straight to
+    # `delete_object`. Trusting the name here would have swept every avatar.
+    for (avatar,) in db.query(User.avatar_url).filter(User.avatar_url.isnot(None)):
+        exact_live.add(avatar)
+    for (att,) in db.query(CommentAttachment.s3_key).filter(CommentAttachment.s3_key.isnot(None)):
+        exact_live.add(att)
+    for (logo,) in db.query(ProjectBranding.logo_s3_key).filter(ProjectBranding.logo_s3_key.isnot(None)):
+        exact_live.add(logo)
+    for row in db.query(
+        InstanceBranding.logo_light_key, InstanceBranding.logo_dark_key,
+        InstanceBranding.favicon_key, InstanceBranding.apple_icon_key,
+        InstanceBranding.login_logo_key,
+    ).all():
+        exact_live.update(k for k in row if k)
+
+    def _excluded(key):
+        head, tail = _ORPHAN_SWEEP_EXCLUDED
+        return key.startswith(head) and tail in key
+
     def _is_live(key):
         return key in exact_live or any(key.startswith(root) for root in processed_roots)
 
@@ -577,6 +677,8 @@ def _sweep_orphan_s3(db) -> OrphanSweepCounts:
     for prefix in _ORPHAN_SWEEP_PREFIXES:
         for key, last_modified, size in list_keys(prefix):
             counts.scanned += 1
+            if _excluded(key):
+                continue  # see _ORPHAN_SWEEP_EXCLUDED
             if last_modified >= cutoff:
                 continue  # too recent — may be an in-flight / just-committed upload
             if _is_live(key):
@@ -586,17 +688,37 @@ def _sweep_orphan_s3(db) -> OrphanSweepCounts:
     counts.orphans = len(orphans)
     counts.orphan_bytes = sum(s for _, s in orphans)
 
-    # Safety floor: a degenerate (empty) live-set — e.g. DATABASE_URL pointed at the wrong/empty DB —
-    # must never be allowed to mass-delete every scanned key as "orphaned". Report-only in that case.
+    # Safety floor. The failure this guards against is a database that does not describe the bucket
+    # it is pointed at -- wrong DATABASE_URL, an empty instance, a half-run migration -- because then
+    # every key is unowned and the sweep reclassifies the whole bucket as garbage. That shape is a
+    # HIGH ORPHAN RATIO, and an empty live-set is only its most extreme form: one surviving MediaFile
+    # row against a full bucket is the same accident and passes an is-it-empty check.
     live_set_empty = not exact_live and not processed_roots
-    if counts.delete_enabled and live_set_empty and orphans:
-        log.error("orphan-sweep: SAFETY ABORT — live-set is EMPTY (0 MediaFile rows) but %d key(s) scanned; "
-                  "refusing to delete (likely a wrong/empty DATABASE_URL). Reporting only.", counts.orphans)
-    if counts.delete_enabled and not (live_set_empty and orphans):
-        for key, _ in orphans:
-            _safe(delete_object, key)
-            counts.deleted += 1
-        log.info("orphan-sweep: deleted %d/%d orphan key(s), %d bytes", counts.deleted, counts.orphans, counts.orphan_bytes)
+    ratio = (counts.orphans / counts.scanned) if counts.scanned else 0.0
+    ceiling = settings.orphan_sweep_max_orphan_ratio
+    over_ceiling = bool(orphans) and ratio > ceiling
+    refuse = bool(orphans) and (live_set_empty or over_ceiling)
+
+    if counts.delete_enabled and refuse:
+        if live_set_empty:
+            log.error("orphan-sweep: SAFETY ABORT — live-set is EMPTY (0 MediaFile rows) but %d key(s) scanned; "
+                      "refusing to delete (likely a wrong/empty DATABASE_URL). Reporting only.", counts.orphans)
+        else:
+            log.error("orphan-sweep: SAFETY ABORT — %d of %d scanned key(s) look orphaned (%.0f%%), over the %.0f%% "
+                      "ceiling; refusing to delete. Either the database does not describe this bucket, or the bucket "
+                      "really is this dirty — read the sample below and raise ORPHAN_SWEEP_MAX_ORPHAN_RATIO if so.",
+                      counts.orphans, counts.scanned, ratio * 100, ceiling * 100)
+    if counts.delete_enabled and not refuse:
+        for key, size in orphans:
+            if _safe(delete_object, key):
+                counts.deleted += 1
+                # Bytes follow the deletes, not the findings. Printing the full
+                # orphan total here would report storage as freed that is still
+                # being paid for, which is the same defect as counting attempts.
+                counts.deleted_bytes += size
+        log.log(logging.WARNING if counts.deleted else logging.INFO,
+                "orphan-sweep: deleted %d/%d orphan key(s), %d of %d bytes",
+                counts.deleted, counts.orphans, counts.deleted_bytes, counts.orphan_bytes)
     else:
         log.info("orphan-sweep: REPORT-ONLY — %d orphan key(s) under %s, %d bytes "
                  "(set ORPHAN_SWEEP_DELETE=true to reclaim). sample=%s",

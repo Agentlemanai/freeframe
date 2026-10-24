@@ -30,8 +30,16 @@ vi.mock('@/lib/api', () => ({
 }))
 
 import { api } from '@/lib/api'
-import { useUploadStore, currentTabId, LIVE_WINDOW_MS } from '../upload-store'
+import { useUploadStore, currentTabId, LIVE_WINDOW_MS, RESUME_CLAIM_PREFIX, resumeClaimKey, __uploadQueueTesting } from '../upload-store'
 import type { UploadFile } from '../upload-store'
+import { installXhrFake, ok, type PartHandler } from '@/test/xhr-fake'
+import { signInAs } from '@/test/upload-session'
+import { answerBatch } from '@/test/assets-batch'
+
+// The upload queue is tab-wide module state: start every test from an empty one.
+beforeEach(() => __uploadQueueTesting.reset())
+// Rows belong to the account that added them, and only its rows are shown and polled.
+beforeEach(() => signInAs('u1'))
 
 const MB = 1024 * 1024
 const VERSION_ID = 'version-1'
@@ -44,6 +52,7 @@ function row(overrides: Partial<UploadFile> = {}): UploadFile {
     projectId: 'project-1', assetName: 'clip', progress: 41, processingProgress: 0,
     status: 'uploading', assetId: ASSET_ID, versionId: VERSION_ID, uploadId: 'u1',
     createdAt: Date.now(),
+    ownerId: 'u1',
     ...overrides,
   }
 }
@@ -131,6 +140,7 @@ describe('a row sent from elsewhere, while this tab watches', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     window.localStorage.clear()
+    signInAs('u1')
     vi.mocked(api.get).mockResolvedValue(null as never)
   })
 
@@ -180,10 +190,13 @@ describe('a row sent from elsewhere, while this tab watches', () => {
 // ---------------------------------------------------------- refusing to touch it
 
 describe('discarding or resuming an upload that is still moving somewhere else', () => {
+  let put = vi.fn<PartHandler>()
+
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(api.post).mockResolvedValue({} as never)
-    global.fetch = vi.fn().mockResolvedValue({ ok: true, headers: { get: () => '"e"' } }) as never
+    put = vi.fn<PartHandler>(() => ok('"e"'))
+    installXhrFake(put)
   })
 
   it('does not discard a row this tab did not start when the server saw it move just now', async () => {
@@ -205,7 +218,7 @@ describe('discarding or resuming an upload that is still moving somewhere else',
 
     await useUploadStore.getState().discardUpload('row-1')
 
-    expect(api.post).toHaveBeenCalledWith('/upload/abort', expect.objectContaining({ discard: true }))
+    expect(api.post).toHaveBeenCalledWith('/upload/abort', expect.objectContaining({ discard: true }), { pinSubject: 'u1' })
     expect(useUploadStore.getState().files).toEqual([])
   })
 
@@ -221,7 +234,7 @@ describe('discarding or resuming an upload that is still moving somewhere else',
 
     await useUploadStore.getState().discardUpload('row-1')
 
-    expect(api.post).toHaveBeenCalledWith('/upload/abort', expect.objectContaining({ discard: true }))
+    expect(api.post).toHaveBeenCalledWith('/upload/abort', expect.objectContaining({ discard: true }), { pinSubject: 'u1' })
   })
 
   it('refuses to discard an upload another device has taken over', async () => {
@@ -248,6 +261,33 @@ describe('discarding or resuming an upload that is still moving somewhere else',
     expect(rowOf('row-1').status).toBe('elsewhere')
   })
 
+  it('refuses to discard while a cancelled resume of it is still waiting for /parts', async () => {
+    // Cancel puts the resume back to plain `interrupted`, which offers Discard,
+    // but its run keeps its controller until `/parts` answers. That controller
+    // sends nothing, and counting it as this tab sending let the Discard abort
+    // an upload the server had just seen another device move.
+    useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: undefined })] })
+    let answerResume: (info: unknown) => void = () => {}
+    vi.mocked(api.get)
+      .mockImplementationOnce(() => new Promise((resolve) => { answerResume = resolve }) as never)
+      .mockResolvedValue(resumeInfo(secondsAgo(2)) as never)
+
+    useUploadStore.getState().resumeUpload('row-1', new File([new Uint8Array(10)], 'clip.mp4'))
+    await vi.waitFor(() => expect(api.get).toHaveBeenCalledTimes(1))
+    useUploadStore.getState().cancelUpload('row-1')
+    expect(rowOf('row-1').status).toBe('interrupted')
+    expect(__uploadQueueTesting.hasAbortController('row-1')).toBe(true)
+
+    const refused = await useUploadStore.getState().discardUpload('row-1')
+
+    expect(refused).toMatch(/another tab or on another device/)
+    expect(vi.mocked(api.post).mock.calls.map(([path]) => path)).not.toContain('/upload/abort')
+    expect(rowOf('row-1').status).toBe('elsewhere')
+    answerResume(resumeInfo(secondsAgo(2)))
+    await vi.waitFor(() => expect(__uploadQueueTesting.runningIds()).toEqual([]))
+    expect(put).not.toHaveBeenCalled()
+  })
+
   it('does not resume into an upload another tab is still sending parts into', async () => {
     // Two tabs PUTting the same part numbers leave the completing tab with
     // ETags that no longer match what is stored.
@@ -258,7 +298,7 @@ describe('discarding or resuming an upload that is still moving somewhere else',
     await vi.waitFor(() => expect(rowOf('row-1').status).toBe('elsewhere'))
 
     expect(api.post).not.toHaveBeenCalledWith('/upload/presign-part', expect.anything())
-    expect(global.fetch).not.toHaveBeenCalled()
+    expect(put).not.toHaveBeenCalled()
   })
 })
 
@@ -331,16 +371,44 @@ describe('a tab that is sending', () => {
     useUploadStore.setState({ files: [] })
   })
 
-  it('stamps the row with every finished part, not only on its timer', async () => {
-    // A hidden tab's timers run about once a minute and its requests do not,
-    // so on the timer alone the stamp fell behind the transfer.
+  // A hidden tab's timers run about once a minute and its requests do not, so
+  // on the timer alone the stamp fell behind the transfer. Every finished part
+  // stamps the row too. Many parts, because progress also stamps and reports
+  // at most 96 times: with one part, a stamp per percent and a stamp per part
+  // are the same thing, and a test of one part cannot tell them apart.
+  const PARTS = 201
+  const PART = 1000
+  const SIZE = (PARTS - 1) * PART + 500
+
+  const ways: Array<[string, () => string]> = [
+    ['a new upload', () => useUploadStore.getState().startUpload(
+      new File([new Uint8Array(SIZE)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
+    )!],
+    ['a new version', () => useUploadStore.getState().startVersionUpload(
+      new File([new Uint8Array(SIZE)], 'clip.mp4', { type: 'video/mp4' }), ASSET_ID, 'clip', 'project-1',
+    )!],
+    ['a resume', () => {
+      useUploadStore.setState({
+        files: [row({ status: 'interrupted', fileSize: SIZE, ownerTab: undefined, heartbeatAt: undefined })],
+      })
+      vi.mocked(api.get).mockResolvedValue({
+        ...resumeInfo(null), chunk_size_bytes: PART, file_size_bytes: SIZE,
+      } as never)
+      useUploadStore.getState().resumeUpload(
+        'row-1', new File([new Uint8Array(SIZE)], 'clip.mp4', { type: 'video/mp4' }),
+      )
+      return 'row-1'
+    }],
+  ]
+
+  it.each(ways)('stamps the row with every finished part of %s, not only when the percent moves', async (_, start) => {
     let clock = 1_000_000
     const now = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000))
     vi.mocked(api.post).mockImplementation((path: string) => {
-      if (path === '/upload/initiate') {
+      if (path === '/upload/initiate' || path.endsWith('/versions')) {
         return Promise.resolve({
           upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID,
-          version_id: VERSION_ID, chunk_size_bytes: 10 * MB,
+          version_id: VERSION_ID, chunk_size_bytes: PART,
         }) as never
       }
       if (path === '/upload/presign-part') {
@@ -348,36 +416,117 @@ describe('a tab that is sending', () => {
       }
       return new Promise(() => {}) as never // completion never answers
     })
-    global.fetch = vi.fn().mockResolvedValue({ ok: true, headers: { get: () => '"e"' } }) as never
+    installXhrFake(() => ok('"e"'))
 
-    const id = useUploadStore.getState().startUpload(
-      new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
-    )
+    const stamps = new Set<number>()
+    const unsubscribe = useUploadStore.subscribe((state) => {
+      for (const f of state.files) if (f.heartbeatAt !== undefined) stamps.add(f.heartbeatAt)
+    })
     try {
-      const claimed = rowOf(id).heartbeatAt!
-      await vi.waitFor(() => expect(rowOf(id).progress).toBeGreaterThan(0))
+      start()
+      await vi.waitFor(() =>
+        expect(api.post).toHaveBeenCalledWith('/upload/complete', expect.anything(), { pinSubject: 'u1' }),
+      )
 
-      expect(rowOf(id).heartbeatAt!).toBeGreaterThan(claimed)
+      expect(stamps.size).toBeGreaterThanOrEqual(PARTS)
     } finally {
+      unsubscribe()
       now.mockRestore()
     }
   })
 
-  it('claims the row and stamps it', async () => {
-    vi.mocked(api.post).mockImplementation(() => new Promise(() => {}) as never)
+  it('stamps the row while the parts are going up, not only once they are done', async () => {
+    // A stamp only counts while the upload is still running: another tab reads
+    // it to decide whether to offer Discard now, and a pile of stamps written
+    // after the last part would leave the whole transfer looking stopped. So
+    // every PUT looks at the stamp as it leaves. A part only starts once one
+    // before it has finished, so the PUT one pool width later must see a newer
+    // stamp. With 2001 parts, the at most 96 stamps progress writes leave long
+    // runs of PUTs seeing the same one.
+    const PARTS = 2001
+    const POOL = 5 // UPLOAD_CONCURRENCY when the build sets none
+    let clock = 1_000_000
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000))
+    vi.mocked(api.post).mockImplementation((path: string) => {
+      if (path === '/upload/initiate') {
+        return Promise.resolve({
+          upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID,
+          version_id: VERSION_ID, chunk_size_bytes: 1000,
+        }) as never
+      }
+      if (path === '/upload/presign-part') {
+        return Promise.resolve({ presigned_url: 'https://s3.example/p' }) as never
+      }
+      return new Promise(() => {}) as never // completion never answers
+    })
+    let id = ''
+    const seenAtPut: number[] = []
+    installXhrFake(() => {
+      seenAtPut.push(rowOf(id).heartbeatAt!)
+      return ok('"e"')
+    })
 
-    const id = useUploadStore.getState().startUpload(
-      new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
-    )
+    try {
+      id = useUploadStore.getState().startUpload(
+        new File([new Uint8Array(PARTS * 1000)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
+      )!
+      await vi.waitFor(() => expect(seenAtPut).toHaveLength(PARTS), { timeout: 20_000 })
 
-    expect(rowOf(id).ownerTab).toBe(currentTabId())
-    expect(rowOf(id).heartbeatAt).toBeGreaterThan(Date.now() - 1000)
+      const stale = seenAtPut.slice(POOL).filter((stamp, i) => stamp <= seenAtPut[i])
+      expect(stale).toHaveLength(0)
+    } finally {
+      now.mockRestore()
+    }
+  }, 30_000)
+
+  it('claims the row and stamps it at its turn, and not before', async () => {
+    // A row waiting in the queue has nothing on the server for another tab to
+    // be told about. The claim comes with the turn: here the first file is
+    // still starting, and until its initiate answers it counts as the whole
+    // part budget, so the second waits.
+    let answerFirst!: (value: unknown) => void
+    vi.mocked(api.post).mockImplementation(((path: string) => {
+      if (path === '/upload/initiate' && !answerFirst) {
+        return new Promise((resolve) => {
+          answerFirst = resolve
+        })
+      }
+      return new Promise(() => {})
+    }) as never)
+    const big = (name: string) => {
+      const file = new File([new Uint8Array(10)], name, { type: 'video/mp4' })
+      Object.defineProperty(file, 'size', { value: 50 * MB })
+      return file
+    }
+
+    const first = useUploadStore.getState().startUpload(big('a.mp4'), 'project-1', 'a')!
+    const second = useUploadStore.getState().startUpload(big('b.mp4'), 'project-1', 'b')!
+
+    expect(rowOf(first).ownerTab).toBe(currentTabId())
+    expect(rowOf(first).heartbeatAt).toBeGreaterThan(Date.now() - 1000)
+    expect(rowOf(second).status).toBe('queued')
+    expect(rowOf(second).ownerTab).toBeUndefined()
+    expect(rowOf(second).heartbeatAt).toBeUndefined()
+
+    // The initiate follows the readability probe (spec goal 5), so it leaves a
+    // moment after the turn rather than in the same tick.
+    await vi.waitFor(() => expect(answerFirst).toBeTypeOf('function'))
+
+    // Five parts of 10 MB once the first answers: a part slot is still not
+    // free, so the second keeps waiting, unclaimed.
+    answerFirst({
+      upload_id: 'u1', s3_key: 'raw/k', asset_id: ASSET_ID, version_id: VERSION_ID, chunk_size_bytes: 10 * MB,
+    })
+    await new Promise((r) => setTimeout(r, 0))
+    expect(rowOf(second).ownerTab).toBeUndefined()
   })
 })
 
 // ---------------------------------------------------------- cancel
 
 describe('cancelling an upload', () => {
+  let put = vi.fn<PartHandler>()
+
   beforeEach(() => {
     vi.clearAllMocks()
     useUploadStore.setState({ files: [], versionsRevision: 0 })
@@ -394,10 +543,8 @@ describe('cancelling an upload', () => {
       return Promise.resolve({}) as never
     })
     // A part that only ends when it is aborted.
-    global.fetch = vi.fn((_: string, init?: RequestInit) => new Promise((_resolve, reject) => {
-      init?.signal?.addEventListener('abort', () =>
-        reject(new DOMException('Aborted', 'AbortError')))
-    })) as never
+    put = vi.fn<PartHandler>(() => new Promise(() => {}))
+    installXhrFake(put)
   })
 
   it('throws the upload away rather than recording a failure, and tells the version list', async () => {
@@ -406,15 +553,15 @@ describe('cancelling an upload', () => {
     // which went on saying "Uploading" until a reload.
     const id = useUploadStore.getState().startUpload(
       new File([new Uint8Array(10)], 'clip.mp4', { type: 'video/mp4' }), 'project-1', 'clip',
-    )
-    await vi.waitFor(() => expect(global.fetch).toHaveBeenCalled())
+    )!
+    await vi.waitFor(() => expect(put).toHaveBeenCalled())
 
     useUploadStore.getState().cancelUpload(id)
 
     await vi.waitFor(() => expect(useUploadStore.getState().versionsRevision).toBe(1))
     expect(api.post).toHaveBeenCalledWith('/upload/abort', {
       s3_key: 'raw/k', upload_id: 'u1', version_id: VERSION_ID, discard: true,
-    })
+    }, { pinSubject: 'u1' })
   })
 })
 
@@ -446,7 +593,10 @@ describe('writing to storage every tab shares', () => {
     storage().setItem(KEY, { state: { files: files.map((f) => row(f)) }, version: 0 })
   }
 
-  beforeEach(() => window.localStorage.clear())
+  beforeEach(() => {
+    window.localStorage.clear()
+    signInAs('u1')
+  })
 
   it('does not roll back a heartbeat another tab wrote more recently', () => {
     // The whole reason the sweep reads storage rather than the row it hydrated.
@@ -500,15 +650,64 @@ describe('writing to storage every tab shares', () => {
 
   it('lets a row that nobody is sending be removed', () => {
     // Otherwise Discard, Dismiss and "clear completed" could never take effect.
-    seedStorage([{ id: 'row-1', ownerTab: 'tab-A', heartbeatAt: Date.now() - LIVE_WINDOW_MS - 1 }])
+    // The row is one this tab held (it wrote it), and then let go of.
+    const stale = { id: 'row-1', ownerTab: 'tab-A', heartbeatAt: Date.now() - LIVE_WINDOW_MS - 1 }
+    seedStorage([stale])
+    write([stale])
 
     write([])
 
     expect(storedFiles()).toEqual([])
   })
 
+  it('does not erase a row it once held while another tab is still sending it', () => {
+    // This tab loaded or wrote the row, and another tab has since taken the
+    // upload up. That this tab no longer writes it says nothing about a
+    // transfer the other tab is running.
+    const live = { id: 'row-1', ownerTab: 'tab-A', heartbeatAt: Date.now() }
+    seedStorage([live])
+    write([live])
+
+    write([])
+
+    expect(storedFiles().map((f) => f.id)).toEqual(['row-1'])
+  })
+
+  it('writes its own change to a row nobody stamps', () => {
+    // History rows carry no tab and no heartbeat. Judged on the stamp alone,
+    // the two missing stamps tied and storage won, so a refused Discard's
+    // `elsewhere`, or a Discard's error, never left this tab.
+    const createdAt = Date.now() - 60_000
+    const before = { id: 'history-asset-1', status: 'interrupted' as const, createdAt, uploadId: undefined }
+    seedStorage([before])
+    write([before])
+
+    const until = Date.now() + 60_000
+    write([{ ...before, status: 'elsewhere', elsewhereUntil: until }])
+
+    expect(storedFiles()[0].status).toBe('elsewhere')
+    expect(storedFiles()[0].elsewhereUntil).toBe(until)
+  })
+
+  it('does not write its unchanged copy of an unstamped row over another tab\'s change', () => {
+    // The other half of the same tie: a tab that has not touched the row since
+    // its last write has nothing newer to say than the tab that did.
+    const createdAt = Date.now() - 60_000
+    const before = { id: 'history-asset-1', status: 'interrupted' as const, createdAt, uploadId: undefined }
+    write([before])
+    const until = Date.now() + 60_000
+    seedStorage([{ ...before, status: 'elsewhere', elsewhereUntil: until }])
+
+    write([before])
+
+    expect(storedFiles()[0].status).toBe('elsewhere')
+    expect(storedFiles()[0].elsewhereUntil).toBe(until)
+  })
+
   it('lets this tab remove its own row', () => {
-    seedStorage([{ id: 'row-1', ownerTab: currentTabId(), heartbeatAt: Date.now() }])
+    const own = { id: 'row-1', ownerTab: currentTabId(), heartbeatAt: Date.now() }
+    seedStorage([own])
+    write([own])
 
     write([])
 
@@ -522,6 +721,7 @@ describe('polling a row whose upload is running on another device', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     window.localStorage.clear()
+    signInAs('u1')
   })
 
   function assetStillUploading(lastActivity: Date) {
@@ -543,7 +743,7 @@ describe('polling a row whose upload is running on another device', () => {
     // row already said -- so the early return fired and the row kept offering
     // Resume and Discard for an upload that was still running.
     useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: undefined })] })
-    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+    vi.mocked(api.get).mockImplementation(answerBatch([assetStillUploading(secondsAgo(5))]) as never)
 
     await useUploadStore.getState().refreshProcessingItems()
 
@@ -553,8 +753,8 @@ describe('polling a row whose upload is running on another device', () => {
 
   it('leaves it interrupted once the other device has stopped', async () => {
     useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: undefined })] })
-    vi.mocked(api.get).mockResolvedValue(
-      assetStillUploading(new Date(Date.now() - LIVE_WINDOW_MS - 1000)) as never,
+    vi.mocked(api.get).mockImplementation(
+      answerBatch([assetStillUploading(new Date(Date.now() - LIVE_WINDOW_MS - 1000))]) as never,
     )
 
     await useUploadStore.getState().refreshProcessingItems()
@@ -576,7 +776,7 @@ describe('polling a row whose upload is running on another device', () => {
         row({ status: 'interrupted', ownerTab: currentTabId(), heartbeatAt: Date.now() - 5000 }),
       ],
     })
-    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+    vi.mocked(api.get).mockImplementation(answerBatch([assetStillUploading(secondsAgo(5))]) as never)
 
     await useUploadStore.getState().refreshProcessingItems()
 
@@ -589,7 +789,7 @@ describe('polling a row whose upload is running on another device', () => {
     // into switching the poll off. A row this tab never owned, with the server
     // reporting movement, is exactly what `elsewhere` exists to say.
     useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: OTHER_TAB })] })
-    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+    vi.mocked(api.get).mockImplementation(answerBatch([assetStillUploading(secondsAgo(5))]) as never)
 
     await useUploadStore.getState().refreshProcessingItems()
 
@@ -600,10 +800,140 @@ describe('polling a row whose upload is running on another device', () => {
     useUploadStore.setState({
       files: [row({ status: 'interrupted', ownerTab: undefined, progress: 41 })],
     })
-    vi.mocked(api.get).mockResolvedValue(assetStillUploading(secondsAgo(5)) as never)
+    vi.mocked(api.get).mockImplementation(answerBatch([assetStillUploading(secondsAgo(5))]) as never)
 
     await useUploadStore.getState().refreshProcessingItems()
 
     expect(rowOf('row-1').progress).toBe(41)
+  })
+})
+
+// ---------------------------------------------------------- two tabs, one Resume each
+
+describe('two tabs resuming the same upload at the same moment', () => {
+  // Each tab looks in shared storage for the other's heartbeat once the server
+  // has said which parts it holds, and in a real browser the two answers can
+  // land together. Storage is shared across processes and a write reaches the
+  // other tab a moment later, so each looked before the other's stamp arrived:
+  // both presigned, sent both parts and completed the same upload (found by the
+  // Phase 4 browser scenario R2, in WebKit). Here the other tab's moves land
+  // just after this tab has looked, which is what that moment is.
+  let put = vi.fn<PartHandler>()
+  const longAgo = () => new Date(Date.now() - LIVE_WINDOW_MS - 60_000)
+  /** Nothing held yet and one part to send: the file picked again is the 10-byte file it was. */
+  const answer = () => ({ ...resumeInfo(longAgo()), file_size_bytes: 10 })
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    window.localStorage.clear()
+    signInAs('u1')
+    useUploadStore.setState({ files: [row({ status: 'interrupted', ownerTab: undefined, heartbeatAt: undefined })] })
+    vi.mocked(api.post).mockImplementation(((path: string) =>
+      Promise.resolve(path === '/upload/presign-part' ? { presigned_url: 'https://s3.example/p' } : {})) as never)
+    put = vi.fn<PartHandler>(() => ok('"e"'))
+    installXhrFake(put)
+  })
+
+  /** The other tab's claim on the upload, as it writes it. */
+  function otherTabClaims(at = Date.now()) {
+    window.localStorage.setItem(resumeClaimKey('version-1'), JSON.stringify({ tab: OTHER_TAB, nonce: 'theirs', at }))
+  }
+
+  /** Every resume claim in storage, by key. */
+  function storedClaims(): Record<string, unknown> {
+    const out: Record<string, unknown> = {}
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i)!
+      if (key.startsWith(RESUME_CLAIM_PREFIX)) out[key] = JSON.parse(window.localStorage.getItem(key)!)
+    }
+    return out
+  }
+
+  /** What the other tab writes as it takes the upload up: its claim, then its heartbeat on the row. */
+  function otherTabTakesItUp(at = Date.now()) {
+    otherTabClaims(at)
+    window.localStorage.setItem('ff-uploads', JSON.stringify({
+      state: { files: [row({ status: 'uploading', ownerTab: OTHER_TAB, heartbeatAt: at })] }, version: 1,
+    }))
+  }
+
+  const pick = () => new File([new Uint8Array(10)], 'clip.mp4')
+
+  it('sends nothing when the other tab took it up while this one was looking', async () => {
+    vi.mocked(api.get).mockImplementation((async () => {
+      setTimeout(() => otherTabTakesItUp(), 0)
+      return answer()
+    }) as never)
+
+    useUploadStore.getState().resumeUpload('row-1', pick())
+    await vi.waitFor(() => expect(rowOf('row-1').status).toBe('elsewhere'), { timeout: 3_000 })
+
+    expect(api.post).not.toHaveBeenCalledWith('/upload/presign-part', expect.anything(), expect.anything())
+    expect(put).not.toHaveBeenCalled()
+  })
+
+  it('stands aside at once when the other tab\'s claim is already there', async () => {
+    vi.mocked(api.get).mockResolvedValue(answer() as never)
+    const at = Date.now()
+    otherTabClaims(at)
+
+    useUploadStore.getState().resumeUpload('row-1', pick())
+    await vi.waitFor(() => expect(rowOf('row-1').status).toBe('elsewhere'), { timeout: 3_000 })
+
+    expect(put).not.toHaveBeenCalled()
+    expect(storedClaims()).toEqual({ [resumeClaimKey('version-1')]: { tab: OTHER_TAB, nonce: 'theirs', at } })
+  })
+
+  it('goes back to plain interrupted, for its owner, when the account changed while its claim settled and the claim was lost', async () => {
+    // Another account signing in during the settle is applied as at any start:
+    // the resume is its owner's to make, later. That holds whether or not this
+    // tab's claim stood; Elsewhere would tell the owner someone is sending it.
+    vi.mocked(api.get).mockImplementation((async (path: string) => {
+      if (path === '/upload/version-1/parts') {
+        setTimeout(() => {
+          otherTabClaims()
+          signInAs('u2')
+        }, 0)
+        return answer()
+      }
+      return new Promise(() => {})
+    }) as never)
+
+    useUploadStore.getState().resumeUpload('row-1', pick())
+    await vi.waitFor(() => expect(rowOf('row-1').status).toBe('starting'))
+    await vi.waitFor(() => expect(rowOf('row-1').status).not.toBe('starting'), { timeout: 3_000 })
+
+    expect(rowOf('row-1')).toMatchObject({ status: 'interrupted', ownerId: 'u1' })
+    expect(rowOf('row-1').resuming).toBeUndefined()
+    expect(api.post).not.toHaveBeenCalledWith('/upload/presign-part', expect.anything(), expect.anything())
+    expect(put).not.toHaveBeenCalled()
+  })
+
+  it('removes other uploads\' claims that hold nobody off any more as it writes its own, and keeps the fresh ones', async () => {
+    vi.mocked(api.get).mockResolvedValue(answer() as never)
+    const fresh = { tab: OTHER_TAB, nonce: 'fresh', at: Date.now() }
+    window.localStorage.setItem(resumeClaimKey('version-8'), JSON.stringify(fresh))
+    window.localStorage.setItem(resumeClaimKey('version-9'), JSON.stringify({ tab: OTHER_TAB, nonce: 'old', at: Date.now() - 11_000 }))
+
+    useUploadStore.getState().resumeUpload('row-1', pick())
+    await vi.waitFor(() => expect(storedClaims()[resumeClaimKey('version-1')]).toBeDefined())
+
+    expect(storedClaims()).toEqual({
+      [resumeClaimKey('version-1')]: expect.objectContaining({ tab: currentTabId() }),
+      [resumeClaimKey('version-8')]: fresh,
+    })
+    await vi.waitFor(() => expect(api.post).toHaveBeenCalledWith('/upload/complete', expect.anything(), { pinSubject: 'u1' }), { timeout: 3_000 })
+    await vi.waitFor(() => expect(storedClaims()).toEqual({ [resumeClaimKey('version-8')]: fresh }))
+  })
+
+  it('resumes when it is alone, or the only claim there is long over, and clears its own claim after', async () => {
+    vi.mocked(api.get).mockResolvedValue(answer() as never)
+    otherTabClaims(Date.now() - 10 * 60_000)
+
+    useUploadStore.getState().resumeUpload('row-1', pick())
+    await vi.waitFor(() => expect(api.post).toHaveBeenCalledWith('/upload/complete', expect.anything(), { pinSubject: 'u1' }), { timeout: 3_000 })
+
+    expect(put).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(storedClaims()).toEqual({}))
   })
 })

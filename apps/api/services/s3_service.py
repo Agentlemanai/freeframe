@@ -25,6 +25,30 @@ _STARTUP_S3_CONFIG = Config(connect_timeout=5, read_timeout=10, retries={"max_at
 # abandoned than waited on.
 _PROBE_S3_CONFIG = Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 2})
 
+# CreateMultipartUpload is the one storage call a user waits on before a single
+# byte is sent, so a store that cannot answer must fail in seconds, not in boto3's
+# default ~60 s per attempt. It must also be sent exactly once: `max_attempts`
+# counts retries *after* the first request, so any value of it would resend a
+# non-idempotent call and could leave a second multipart upload behind. Only
+# `total_max_attempts` (the first request included) pins it to one. The caller
+# turns the failure into a coded 503 and the browser decides whether to retry.
+_INITIATE_S3_CONFIG = Config(connect_timeout=5, read_timeout=10, retries={"total_max_attempts": 1})
+
+# AbortMultipartUpload runs on every cancel and discard. On the shared client a
+# store that hangs rather than refuses held the request for ~310 s (measured with
+# the storage container paused), and a burst of cancels held that many threads
+# (#523). The route turns a store it cannot reach into a 503 with Retry-After, so
+# this only has to get there in seconds. The first request and one retry: a
+# repeat of an abort whose answer was lost finds NoSuchUpload, which the route
+# reads as gone.
+#
+# The stale-upload reaper (tasks/cleanup_tasks.py) aborts through this client
+# too, and wraps each call in `_safe`, so a timeout there is logged and swallowed
+# rather than ending the sweep. An upload no row owns is listed again and retried
+# on the next sweep. A version's own upload is not: its version is soft-deleted
+# either way, so the next sweep no longer selects it.
+_ABORT_S3_CONFIG = Config(connect_timeout=5, read_timeout=10, retries={"total_max_attempts": 2})
+
 # S3 Content-Type and Cache-Control mappings
 CONTENT_TYPE_MAP = {
     ".m3u8": ("application/vnd.apple.mpegurl", "no-cache"),
@@ -95,6 +119,25 @@ def _get_probe_client():
     return _build_s3_client(_PROBE_S3_CONFIG)
 
 @lru_cache(maxsize=1)
+def _get_initiate_client():
+    """Client for starting a multipart upload (see _INITIATE_S3_CONFIG).
+
+    Separate from `get_s3_client` for the same reason as the probe client: its
+    short, single-shot settings would be wrong for the calls that legitimately take
+    minutes, such as completing a large multipart upload.
+    """
+    return _build_s3_client(_INITIATE_S3_CONFIG)
+
+@lru_cache(maxsize=1)
+def _get_abort_client():
+    """Client for aborting a multipart upload (see _ABORT_S3_CONFIG).
+
+    Separate from `get_s3_client` for the same reason as the probe client:
+    CompleteMultipartUpload stays on the long timeouts it legitimately needs.
+    """
+    return _build_s3_client(_ABORT_S3_CONFIG)
+
+@lru_cache(maxsize=1)
 def _get_presign_client():
     """
     Client for generating presigned URLs. Uses s3_public_endpoint if set,
@@ -150,11 +193,23 @@ def ensure_bucket_exists():
 
     # Set CORS for browser-based uploads (presigned PUT)
     if not _is_aws_s3():
-        # Browser Origin headers never include a path, so use the stripped
-        # origin from FRONTEND_URL in AllowedOrigins (e.g.
-        # https://host/freeframe -> https://host). Mirrors the CORS origin
-        # used in main.py.
-        _allowed_origins = [o for o in [settings.frontend_origin, "http://localhost:3000"] if o]
+        # The same origins the API's CORS allows (settings.cors_origins):
+        # a store that enforces bucket CORS (Silo, Garage) refuses uploads and
+        # playback from every other origin. Older MinIO answered PutBucketCors
+        # with NotImplemented and allowed every origin, which hid any gap.
+        if settings.cors_allows_any_origin:
+            _allowed_origins = ["*"]
+        else:
+            _allowed_origins = []
+            for _origin in settings.cors_origins:
+                # S3 rejects the WHOLE configuration over one bad entry
+                # (MalformedXML), and that would take FRONTEND_URL's rule with it.
+                if "?" in _origin or _origin.count("*") > 1:
+                    logger.warning("Leaving %r out of the bucket CORS rules: S3 does not accept it as an origin.", _origin)
+                    continue
+                _allowed_origins.append(_origin)
+            # S3 allows at most 100 CORS rules per bucket.
+            _allowed_origins = _allowed_origins[:100]
         try:
             # One rule per origin: Garage joins a rule's AllowedOrigins into a single
             # comma-separated Access-Control-Allow-Origin response header, which
@@ -170,6 +225,8 @@ def ensure_bucket_exists():
                         {
                             # Tighten from ["*"] to only the headers the
                             # browser upload + multipart flows actually send.
+                            # Silo and Garage enforce this list: a new header
+                            # the browser sends to storage must be added here.
                             "AllowedHeaders": [
                                 "Content-Type",
                                 "Content-MD5",
@@ -251,13 +308,26 @@ def get_content_type(key: str) -> tuple[str, str]:
     ext = os.path.splitext(key)[1].lower()
     return CONTENT_TYPE_MAP.get(ext, ("application/octet-stream", "no-cache"))
 
+def media_storage_class_args() -> dict:
+    """`{"StorageClass": ...}` for a media write when S3_STORAGE_CLASS is set, else `{}`.
+
+    Server-side writes only. A class in a browser presigned URL becomes a signed
+    `x-amz-storage-class` header the browser does not send.
+    """
+    return {"StorageClass": settings.s3_storage_class} if settings.s3_storage_class else {}
+
 def create_multipart_upload(s3_key: str, content_type: str) -> str:
-    """Initiate a multipart upload and return the upload_id."""
-    s3 = get_s3_client()
+    """Initiate a multipart upload and return the upload_id.
+
+    The storage class is fixed here, for the whole object: the part uploads the
+    browser sends afterwards carry none.
+    """
+    s3 = _get_initiate_client()
     response = s3.create_multipart_upload(
         Bucket=settings.s3_bucket,
         Key=s3_key,
         ContentType=content_type,
+        **media_storage_class_args(),
     )
     return response["UploadId"]
 
@@ -287,7 +357,7 @@ def complete_multipart_upload(s3_key: str, upload_id: str, parts: list[dict]) ->
 
 def abort_multipart_upload(s3_key: str, upload_id: str) -> None:
     """Abort a multipart upload and clean up uploaded parts."""
-    s3 = get_s3_client()
+    s3 = _get_abort_client()
     s3.abort_multipart_upload(
         Bucket=settings.s3_bucket,
         Key=s3_key,
@@ -536,14 +606,37 @@ def generate_presigned_get_url(s3_key: str, expires_in: int = 3600, download_fil
         ExpiresIn=expires_in,
     )
 
-def put_object(s3_key: str, body: bytes, content_type: str | None = None, cache_control: str | None = None) -> None:
-    """Upload a small object directly (for processed files like thumbnails)."""
+def generate_internal_presigned_get_url(s3_key: str, expires_in: int = 3600) -> str:
+    """Generate a presigned GET URL using the API's configured S3 endpoint.
+
+    Unlike browser-facing URLs, this uses the server-side endpoint so consumers
+    running inside the API environment can reach the object store.
+    """
+    s3 = _get_probe_client()
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.s3_bucket, "Key": s3_key},
+        ExpiresIn=expires_in,
+    )
+
+
+def put_object(
+    s3_key: str, body: bytes, content_type: str | None = None, cache_control: str | None = None,
+    media: bool = False,
+) -> None:
+    """Upload a small object directly (for processed files like thumbnails).
+
+    `media=True` writes it in S3_STORAGE_CLASS; anything else (a project
+    poster) stays on the bucket default.
+    """
     s3 = get_s3_client()
     kwargs = {"Bucket": settings.s3_bucket, "Key": s3_key, "Body": body}
     if content_type:
         kwargs["ContentType"] = content_type
     if cache_control:
         kwargs["CacheControl"] = cache_control
+    if media:
+        kwargs.update(media_storage_class_args())
     s3.put_object(**kwargs)
 
 def delete_object(s3_key: str) -> None:

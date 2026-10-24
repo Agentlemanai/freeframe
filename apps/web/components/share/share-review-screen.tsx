@@ -11,7 +11,7 @@
  * (#117, #123).
  */
 import * as React from 'react'
-import { ArrowLeft, Download, Loader2, PanelRightClose, PanelRightOpen } from 'lucide-react'
+import { ArrowLeft, ChevronDown, Download, Loader2, PanelRightClose, PanelRightOpen } from 'lucide-react'
 import { useReview, type CreateCommentPayload } from '@/components/review/review-provider'
 import { useReviewStore } from '@/stores/review-store'
 import { MobileCommentSheet, PEEK_PX, type SheetState } from '@/components/review/mobile-comment-sheet'
@@ -19,12 +19,28 @@ import { useMediaQuery } from '@/hooks/use-media-query'
 import { useMediaTransport } from '@/hooks/use-media-transport'
 import { formatTimecode } from '@/lib/utils'
 import type { SharePermission } from '@/types'
-import { handleDownload } from './share-download'
+import { fetchShareDownloadOptions, handleDownload } from './share-download'
+import { DownloadMenu } from '@/components/shared/download-menu'
+import { ShareBrandMark } from './share-brand-mark'
+
+/** Signed in, or a guest who has already given a name and email. */
+function hasIdentity(): boolean {
+  try {
+    return !!localStorage.getItem('ff_access_token') || !!localStorage.getItem('ff_guest_identity')
+  } catch {
+    return false
+  }
+}
 
 export function ShareReviewScreen({
-  token, shareSession, assetId, assetName, permission, allowDownload, showVersions, onBack,
+  token, shareSession, assetId, assetName, permission, allowDownload, showVersions, theme = 'dark', projectLogoUrl, onBack,
 }: {
-  token: string; shareSession?: string | null; assetId: string; assetName: string; permission: SharePermission; allowDownload: boolean; showVersions: boolean; onBack?: () => void
+  token: string; shareSession?: string | null; assetId: string; assetName: string; permission: SharePermission; allowDownload: boolean; showVersions: boolean
+  /** The link's theme, which the page renders in; picks the logo variant. Dark, the share pages' default, when not given. */
+  theme?: 'dark' | 'light'
+  /** The project's logo from the link's branding, shown ahead of the instance's. */
+  projectLogoUrl?: string | null
+  onBack?: () => void
 }) {
   const [ReviewProvider, setProvider] = React.useState<any>(null)
   const [VideoPlayer, setVideoPlayer] = React.useState<any>(null)
@@ -70,6 +86,8 @@ export function ShareReviewScreen({
         permission={permission}
         allowDownload={allowDownload}
         showVersions={showVersions}
+        theme={theme}
+        projectLogoUrl={projectLogoUrl}
         onBack={onBack}
         VideoPlayer={VideoPlayer}
         ImageViewer={ImageViewer}
@@ -83,12 +101,17 @@ export function ShareReviewScreen({
 }
 
 function ShareReviewInner({
-  token, shareSession, assetName, permission, allowDownload, showVersions, onBack,
+  token, shareSession, assetName, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack,
   VideoPlayer, ImageViewer, AudioPlayer, CommentPanel, CommentInput, VersionSwitcher,
 }: any) {
-  const { asset, versions, isLoading, comments, refetchComments, addComment } = useReview()
+  const { asset, versions, isLoading, comments, refetchComments, addComment, togglePlayback } = useReview()
   const { currentVersion, isDrawingMode, focusedCommentId, playheadTime } = useReviewStore()
-  const [sidebarOpen, setSidebarOpen] = React.useState(() => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches)
+  // An asset opens on its comments: that pane is the reason an asset link
+  // exists. The folder grid is the surface that starts closed. Below `md` the
+  // sheet's peek band stands in for it, as on the project review page.
+  const [sidebarOpen, setSidebarOpen] = React.useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches,
+  )
 
   // Same rule as the project review screen: a bottom sheet on a portrait phone
   // so the media stays in view, the side-by-side column on a landscape one.
@@ -97,7 +120,10 @@ function ShareReviewInner({
   const useSheet = !isWide && !isLandscape
   const [sheetState, setSheetState] = React.useState<SheetState>('peek')
   const [sheetHeight, setSheetHeight] = React.useState(PEEK_PX)
-  const { isPlaying, togglePlay } = useMediaTransport()
+  // One expression for the top-bar toggle's icon and its label, so the two
+  // cannot disagree about whether the panel is up.
+  const panelShown = useSheet ? sheetState !== 'peek' : sidebarOpen
+  const { isPlaying, togglePlay, mediaRootRef } = useMediaTransport({ toggleVideo: togglePlayback })
   const reviewRootRef = React.useRef<HTMLDivElement>(null)
   const handleSheetHeight = React.useCallback((px: number) => setSheetHeight(px), [])
 
@@ -152,7 +178,14 @@ function ShareReviewInner({
   // Guest identity flow for non-authenticated users
   const [guestIdentity, setGuestIdentity] = React.useState<{ name: string; email: string } | null>(null)
   const [showGuestPrompt, setShowGuestPrompt] = React.useState(false)
-  const pendingCommentRef = React.useRef<{ body: string; timecodeStart?: number; timecodeEnd?: number; annotationData?: Record<string, unknown> } | null>(null)
+  // What was typed before the guest had a name. A reply also carries its parent
+  // and the promise its InlineReplyInput is waiting on, so the typed text stays
+  // in the box until it is really sent (or the prompt is dismissed).
+  const pendingCommentRef = React.useRef<{
+    body: string; timecodeStart?: number; timecodeEnd?: number; annotationData?: Record<string, unknown>
+    parentId?: string
+    settle?: { resolve: () => void; reject: (e: Error) => void }
+  } | null>(null)
   React.useEffect(() => {
     try {
       const stored = localStorage.getItem('ff_guest_identity')
@@ -161,15 +194,31 @@ function ShareReviewInner({
   }, [])
   const isLoggedIn = typeof window !== 'undefined' && !!localStorage.getItem('ff_access_token')
 
-  const submitComment = React.useCallback(async (body: string, timecodeStart?: number, timecodeEnd?: number, annotationData?: Record<string, unknown>) => {
+  const submitComment = React.useCallback(async (body: string, timecodeStart?: number, timecodeEnd?: number, annotationData?: Record<string, unknown>, parentId?: string) => {
     const payload: CreateCommentPayload = { body }
     if (currentVersion?.id) payload.version_id = currentVersion.id
+    if (parentId) payload.parent_id = parentId
     if (timecodeStart != null) payload.timecode_start = timecodeStart
     if (timecodeEnd != null) payload.timecode_end = timecodeEnd
     if (annotationData) payload.annotation = { drawing_data: annotationData }
     await addComment(payload)
-    refetchComments().catch(() => {})
+    // The optimistic append only ever shows top-level rows (CommentPanel renders
+    // replies from their parent), so a reply is not on screen until the refetch.
+    if (parentId) await refetchComments().catch(() => {})
+    else refetchComments().catch(() => {})
   }, [addComment, currentVersion, refetchComments])
+
+  const submitReply = React.useCallback(async (parentId: string, body: string) => {
+    if (!hasIdentity()) {
+      // Resolved once the guest names themselves and the reply is sent; until
+      // then the reply box keeps what was typed.
+      return new Promise<void>((resolve, reject) => {
+        pendingCommentRef.current = { body, parentId, settle: { resolve, reject } }
+        setShowGuestPrompt(true)
+      })
+    }
+    await submitComment(body, undefined, undefined, undefined, parentId)
+  }, [submitComment])
 
   const handleGuestIdentitySave = React.useCallback(async (name: string, email: string) => {
     const identity = { name, email }
@@ -179,9 +228,13 @@ function ShareReviewInner({
 
     // Auto-submit the pending comment
     if (pendingCommentRef.current) {
-      const { body, timecodeStart, timecodeEnd, annotationData } = pendingCommentRef.current
+      const { body, timecodeStart, timecodeEnd, annotationData, parentId, settle } = pendingCommentRef.current
       pendingCommentRef.current = null
-      setTimeout(() => submitComment(body, timecodeStart, timecodeEnd, annotationData), 50)
+      setTimeout(() => {
+        submitComment(body, timecodeStart, timecodeEnd, annotationData, parentId)
+          .then(() => settle?.resolve())
+          .catch((e) => settle?.reject(e instanceof Error ? e : new Error('Failed to post comment')))
+      }, 50)
     }
   }, [submitComment])
 
@@ -215,7 +268,8 @@ function ShareReviewInner({
       onAddReaction={() => {}}
       onRemoveReaction={() => {}}
       onReply={() => {}}
-      onSubmitReply={async () => {}}
+      // Undefined on a view-only link, which also hides Reply (#439).
+      onSubmitReply={canComment ? submitReply : undefined}
     />
   ) : null
 
@@ -224,10 +278,9 @@ function ShareReviewInner({
       assetId={asset.id}
       projectId=""
       assetType={asset.asset_type}
+      allowInternal={false}
       onSubmit={async (body: string, timecodeStart?: number, timecodeEnd?: number, annotationData?: Record<string, unknown>) => {
-        const hasAuth = !!localStorage.getItem('ff_access_token')
-        const hasGuest = !!localStorage.getItem('ff_guest_identity')
-        if (!hasAuth && !hasGuest) {
+        if (!hasIdentity()) {
           pendingCommentRef.current = { body, timecodeStart, timecodeEnd, annotationData }
           setShowGuestPrompt(true)
           return
@@ -241,7 +294,7 @@ function ShareReviewInner({
     <div className="flex flex-col h-dvh bg-bg-primary text-text-primary pl-safe pr-safe">
       {/* Top bar — same style as project review */}
       <div className="flex items-center justify-between border-b border-border px-3 h-12 bg-bg-secondary shrink-0">
-        <div className="flex items-center gap-1 min-w-0 flex-1">
+        <div className="flex items-center gap-1 sm:gap-2 min-w-0 flex-1">
           {/* A single-asset link has no grid to go back to, so there is nothing
               for this to do there. */}
           {onBack && (
@@ -249,19 +302,28 @@ function ShareReviewInner({
               <ArrowLeft className="h-4 w-4" />
             </button>
           )}
-          <span className="text-[13px] font-medium text-text-primary truncate">{assetName}</span>
+          <ShareBrandMark theme={theme} projectLogoUrl={projectLogoUrl} />
+          {/* The name gives way last: the logo shrinks first (ShareBrandMark),
+              and Download is icon-only on a phone. */}
+          <span className="text-[13px] font-medium text-text-primary truncate min-w-[4rem]">{assetName}</span>
         </div>
         <div className="flex items-center gap-2">
           {showVersions && VersionSwitcher && versions.length > 0 && (
             <VersionSwitcher versions={versions} />
           )}
           {allowDownload && (
-            <button className="flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium text-text-inverse bg-accent hover:bg-accent-hover transition-colors" onClick={() => handleDownload(token, asset.id, shareSession)}>
-              <Download className="h-3 w-3" /> Download
-            </button>
+            <DownloadMenu
+              load={() => fetchShareDownloadOptions(token, asset.id, shareSession)}
+              onPick={(rendition) => handleDownload(token, asset.id, shareSession, rendition)}
+            >
+              <button aria-label="Download" className="flex items-center gap-1.5 h-7 px-2 sm:px-3 rounded-md text-xs font-medium text-text-inverse bg-accent hover:bg-accent-hover transition-colors">
+                <Download className="h-3 w-3" /> <span className="hidden sm:inline">Download</span>
+                <ChevronDown className="h-3 w-3 opacity-70" />
+              </button>
+            </DownloadMenu>
           )}
-          <button onClick={() => (useSheet ? setSheetState(st => (st === 'peek' ? 'half' : 'peek')) : setSidebarOpen(v => !v))} className="flex items-center justify-center h-8 w-8 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors">
-            {(useSheet ? sheetState !== 'peek' : sidebarOpen) ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
+          <button onClick={() => (useSheet ? setSheetState(st => (st === 'peek' ? 'half' : 'peek')) : setSidebarOpen(v => !v))} title={panelShown ? 'Hide panel' : 'Show panel'} className="flex items-center justify-center h-8 w-8 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors">
+            {panelShown ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
           </button>
         </div>
       </div>
@@ -275,6 +337,7 @@ function ShareReviewInner({
       >
         {/* Media viewer — reuses project components */}
         <div
+          ref={mediaRootRef}
           className="flex-1 flex flex-col bg-bg-primary overflow-hidden min-w-0"
         >
           {asset.asset_type === 'video' && versionReady && VideoPlayer ? (
@@ -352,7 +415,12 @@ function ShareReviewInner({
       {showGuestPrompt && (
         <GuestIdentityPrompt
           onSave={handleGuestIdentitySave}
-          onCancel={() => { setShowGuestPrompt(false); pendingCommentRef.current = null }}
+          onCancel={() => {
+            setShowGuestPrompt(false)
+            // A quiet abort: the reply box keeps its text and shows no error.
+            pendingCommentRef.current?.settle?.reject(new Error(''))
+            pendingCommentRef.current = null
+          }}
         />
       )}
     </div>

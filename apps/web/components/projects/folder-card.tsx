@@ -2,13 +2,14 @@
 
 import React, { useCallback, useRef, useState } from 'react'
 import useSWR from 'swr'
-import { Folder, Film, Music, Image as ImageIcon, Images, MoreHorizontal, Pencil, Trash, Share2 } from 'lucide-react'
+import { Folder, Film, Music, Image as ImageIcon, Images, MoreHorizontal } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
-import { NameDialog } from './name-dialog'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ContextMenuArea, DotsMenu } from '@/components/shared/item-menu'
+import { useFolderMenu } from './menus/folder-menu'
 import type { Folder as FolderType, AssetResponse } from '@/types'
 import { carriesFiles } from '@/lib/drag'
+import { collectDataTransfer, type Collected } from '@/lib/upload-folder-walk'
 
 const assetTypeIcons = {
   video: Film,
@@ -85,10 +86,16 @@ interface FolderCardProps {
   onSelect?: (e: React.MouseEvent) => void
   onRename?: (folderId: string, name: string) => Promise<void>
   onDelete?: (folderId: string) => Promise<void>
-  onShare?: (folderId: string, folderName: string) => Promise<void>
+  onShare?: (folderId: string, folderName: string) => void
+  /** New Subfolder in the menu, with this folder as the parent. */
+  onNewSubfolder?: (parentId: string) => void
+  /** Shown on right-click instead of the folder's own menu: the grid passes the
+   *  selection's menu when this folder is one of several selected. */
+  contextMenu?: React.ReactNode
   onDropItems?: (targetFolderId: string, assetIds: string[], folderIds: string[]) => void
-  /** Files dropped on this folder upload into it. Absent = uploads not allowed here. */
-  onDropFiles?: (targetFolderId: string, files: File[]) => void
+  /** Files dropped on this folder upload into it, as `collectDataTransfer`
+   *  reads them. Absent = uploads not allowed here. */
+  onDropFiles?: (targetFolderId: string, dropped: Promise<Collected>) => void
   /** Tells the region above that a file drag is over this folder, so it can
    *  shrink its own marking to this one -- two frames lit at once do not say
    *  where the file will land. On release the folder names itself, so a leave
@@ -109,29 +116,21 @@ export function FolderCard({
   onRename,
   onDelete,
   onShare,
+  onNewSubfolder,
+  contextMenu,
   onDropItems,
   onDropFiles,
   onFileDragOverFolder,
   fileDragActive,
   className,
 }: FolderCardProps) {
-  const [menuOpen, setMenuOpen] = useState(false)
   const [isDragOver, setIsDragOver] = useState(false)
-  const [renameOpen, setRenameOpen] = useState(false)
-  const [deleteOpen, setDeleteOpen] = useState(false)
-  const menuRef = React.useRef<HTMLDivElement>(null)
-
-  // Close menu on outside click
-  React.useEffect(() => {
-    if (!menuOpen) return
-    function handleClick(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [menuOpen])
+  const { items: menuItems, dialogs: menuDialogs } = useFolderMenu(folder, {
+    onShare,
+    onNewSubfolder,
+    onRename,
+    onDelete,
+  })
 
   // Draggable
   const handleDragStart = useCallback(
@@ -199,6 +198,10 @@ export function FolderCard({
       return
     }
     e.preventDefault()
+    // Taken here, as a file drop is: a card dragged by its thumbnail also lists
+    // `Files` in Chrome and Safari, and the shell's refusal behind this would
+    // set `none` over the move.
+    e.stopPropagation()
     e.dataTransfer.dropEffect = 'move'
     setIsDragOver(true)
   }, [folder.id, onDropFiles, onFileDragOverFolder])
@@ -212,14 +215,18 @@ export function FolderCard({
         // Stops the region above uploading the same files into the open folder.
         e.stopPropagation()
         clearDrag()
-        // Handed over even when the list is empty, which is what several
-        // promised-file sources on macOS produce. The region behind this card
-        // never sees the drop, so its marking comes down through this call and
-        // nothing else: skipping it leaves "Drop to upload" on screen for good.
-        onDropFiles(folder.id, Array.from(e.dataTransfer.files))
+        // Read here, in the drop event's own turn: afterwards the drop's items
+        // answer nothing, and a dropped folder is only an unreadable
+        // placeholder in `files`. Handed over even when the drop is empty,
+        // which is what several promised-file sources on macOS produce. The
+        // region behind this card never sees the drop, so its marking comes
+        // down through this call and nothing else: skipping it leaves "Drop to
+        // upload" on screen for good.
+        onDropFiles(folder.id, collectDataTransfer(e.dataTransfer))
         return
       }
       e.preventDefault()
+      e.stopPropagation()
       setIsDragOver(false)
       try {
         const data = JSON.parse(e.dataTransfer.getData('application/json'))
@@ -233,12 +240,12 @@ export function FolderCard({
 
   return (
     <>
+      <ContextMenuArea items={contextMenu ?? menuItems}>
       <div
         className={cn(
           'group relative rounded-lg border bg-bg-tertiary/50 cursor-pointer transition-all hover:border-border-focus hover:scale-[1.01]',
           selected ? 'ring-2 ring-accent border-accent/50' : 'border-border',
           (isDragOver || fileDragActive) && 'ring-2 ring-accent/50 bg-accent/5',
-          menuOpen && 'z-[60]',
           className,
         )}
         draggable
@@ -257,80 +264,27 @@ export function FolderCard({
         <div className="px-3 py-2">
           <div className="flex items-start justify-between gap-1">
             <p className="text-sm font-medium text-text-primary truncate">{folder.name}</p>
-            <div className="relative" ref={menuRef}>
-              <button
-                className="opacity-0 group-hover:opacity-100 flex items-center justify-center h-6 w-6 rounded hover:bg-bg-hover transition-opacity shrink-0"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setMenuOpen((p) => !p)
-                }}
-              >
-                <MoreHorizontal className="h-3.5 w-3.5 text-text-tertiary" />
-              </button>
-
-              {menuOpen && (
-                <div className="absolute right-0 top-full mt-1 z-50 w-40 rounded-lg border border-border bg-bg-elevated shadow-xl py-1">
-                  <button
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-hover"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      setMenuOpen(false)
-                      setRenameOpen(true)
-                    }}
-                  >
-                    <Pencil className="h-3 w-3" /> Rename
-                  </button>
-                  <button
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-hover"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      setMenuOpen(false)
-                      onShare?.(folder.id, folder.name)
-                    }}
-                  >
-                    <Share2 className="h-3 w-3" /> Share
-                  </button>
-                  <button
-                    className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      setMenuOpen(false)
-                      setDeleteOpen(true)
-                    }}
-                  >
-                    <Trash className="h-3 w-3" /> Delete
-                  </button>
-                </div>
-              )}
-            </div>
+            {menuItems && (
+              <DotsMenu items={menuItems}>
+                <button
+                  aria-label={`${folder.name} menu`}
+                  className="opacity-0 group-hover:opacity-100 data-[state=open]:opacity-100 flex items-center justify-center h-6 w-6 rounded hover:bg-bg-hover transition-opacity shrink-0"
+                  // Opening the menu is not a click on the folder.
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <MoreHorizontal className="h-3.5 w-3.5 text-text-tertiary" />
+                </button>
+              </DotsMenu>
+            )}
           </div>
           <p className="text-xs text-text-tertiary mt-0.5">
             {folder.item_count} {folder.item_count === 1 ? 'Item' : 'Items'}
           </p>
         </div>
       </div>
+      </ContextMenuArea>
 
-      {/* Rename dialog */}
-      <NameDialog
-        open={renameOpen}
-        onOpenChange={setRenameOpen}
-        title="Rename Folder"
-        placeholder="Folder name"
-        defaultValue={folder.name}
-        submitLabel="Rename"
-        onSubmit={(name) => onRename?.(folder.id, name)}
-      />
-
-      {/* Delete confirmation */}
-      <ConfirmDialog
-        open={deleteOpen}
-        onOpenChange={setDeleteOpen}
-        title={`Delete "${folder.name}"?`}
-        description="This folder and all its contents will be moved to trash. You can restore them later."
-        confirmLabel="Delete"
-        variant="danger"
-        onConfirm={() => onDelete?.(folder.id)}
-      />
+      {menuDialogs}
     </>
   )
 }

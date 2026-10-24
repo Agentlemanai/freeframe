@@ -5,6 +5,8 @@ import { Upload, X, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
 import { api } from '@/lib/api'
+import { withBasePath } from '@/lib/base-path'
+import { logoUrlFromApi } from '@/lib/branding-logo'
 
 const TYPE_MAP: Record<string, string> = {
   logo_light: 'logo-light',
@@ -102,7 +104,7 @@ export function BrandingLogoUpload({
 
       // Extract the URL
       const urlKey = `${slotKey}_url`
-      const logoUrl = updated[urlKey as keyof typeof updated] || null
+      const logoUrl = logoUrlFromApi(updated[urlKey as keyof typeof updated])
       if (logoUrl) {
         onUpload(logoUrl, s3Key)
       }
@@ -144,7 +146,7 @@ export function BrandingLogoUpload({
         ) : (
           // eslint-disable-next-line @next/next/no-img-element
           <img
-            src={defaultUrl || `/logo-icon.png`}
+            src={withBasePath(defaultUrl || '/logo-icon.png')}
             alt="Default"
             className="h-full w-full object-contain p-1 opacity-40"
           />

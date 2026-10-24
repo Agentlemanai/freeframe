@@ -1,6 +1,8 @@
 import asyncio
 import json
+import math
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -12,6 +14,207 @@ from typing import Optional
 import boto3
 from botocore.config import Config
 from .base import BaseTranscoder, TranscodeJob, TranscodeResult, VideoMetadata
+from .redact import redact_presigned_urls, redacted_timeout
+
+# FFmpeg's uppercase `V` excludes streams flagged with the attached_pic disposition.
+_PRIMARY_VIDEO_STREAM = "V:0"
+
+
+def _stream_start_seconds(stream: dict) -> float:
+    """Where a stream's first packet sits on the timeline, or 0.0."""
+    try:
+        return max(0.0, float(stream.get("start_time")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# The demuxers whose per-stream `duration` is measured from the track and means
+# the track. ffprobe reports the family as one comma-joined string
+# ("mov,mp4,m4a,3gp,3g2,mj2"), so this is matched against the split parts.
+#
+# The list is short on purpose, and the reason is that elsewhere the number is
+# not a measurement at all but something the demuxer synthesises:
+#
+#   ASF/WMV      copies the file's play duration onto every stream, so a clip
+#                whose audio outlives its picture reports the audio for both
+#   AVI          derives it from `dwLength`, which counts the zero-size drop
+#                chunks a held last frame is stored as, and which is a
+#                placeholder when the file was written to a pipe
+#   MPEG-PS      reports the PTS span, which a clock jump between two spliced
+#                recordings inflates without a frame to show for it
+#
+# Each of those is a number that looks exactly like a duration and is not one.
+# Declining there is what `main` does, and being inert is the correct outcome
+# for a check that has nothing trustworthy to compare against.
+_MOV_FAMILY_FORMATS = frozenset({"mov", "mp4", "m4a", "3gp", "3g2", "mj2"})
+
+# Matroska and WebM publish no per-stream `duration` for an ordinary track, and
+# are handled through the `DURATION` tag below instead. Not "never": an
+# attachment-shaped cover image does carry one, and it holds the file's length
+# rather than the picture's. The probes ask for `_PRIMARY_VIDEO_STREAM`, which
+# never returns such a stream; `_is_attached_pic` is the fallback for a probe
+# that does.
+_MATROSKA_FORMATS = frozenset({"matroska", "webm"})
+
+
+def _mapping(value) -> dict:
+    """`value` if it is a mapping, else an empty one.
+
+    ffprobe's JSON has the shapes below as objects, and a bare `or {}` would
+    still hand a list straight to `.get`. This function exists so that a probe
+    whose shape moves cannot raise `AttributeError` out of a metadata read: the
+    old code could not raise for these inputs, and neither should this.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _format_names(data: dict) -> frozenset[str]:
+    """The demuxer names ffprobe reported, split out of its comma-joined list."""
+    raw = _mapping(data.get("format")).get("format_name") or ""
+    return frozenset(part.strip() for part in str(raw).split(",") if part.strip())
+
+
+def _format_end_seconds(data: dict) -> Optional[float]:
+    """The container's own duration, or None."""
+    try:
+        seconds = float(_mapping(data.get("format")).get("duration"))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 and math.isfinite(seconds) else None
+
+
+def _is_attached_pic(stream: dict) -> bool:
+    """Whether this "video" stream is a still cover image rather than a track.
+
+    An audio file with artwork carries the picture as a video stream, and the
+    demuxer gives that one frame the whole file's duration. When mutagen adds a
+    cover to an MP4 that has no `udta` yet, it inserts one ahead of `trak`, so a
+    real video whose artwork was embedded that way has its cover at `v:0`. A
+    cover has no timeline, so there is nothing here to compare a ladder against.
+
+    The transcoder's probes ask for `_PRIMARY_VIDEO_STREAM` (`V:0`), which skips
+    a stream flagged as an attached picture (#430), so in `transcode()` this is a
+    fallback rather than the main defence. It still holds for a probe made any
+    other way, and it costs nothing.
+
+    ffprobe writes the flag as an integer, and `"0"` is read as the zero it
+    means rather than as a non-empty string: taking every disposition value as
+    true would make every file decline and switch the check off everywhere,
+    which is the kind of failure that looks like nothing happening.
+    """
+    flag = _mapping(stream.get("disposition")).get("attached_pic")
+    if isinstance(flag, str):
+        return flag.strip() not in ("", "0", "false", "False")
+    return bool(flag)
+
+
+def _tag_end_seconds(stream: dict) -> Optional[float]:
+    """Seconds from a Matroska `DURATION` stream tag, or None.
+
+    Matroska and WebM carry no per-stream `duration` field; the muxer writes the
+    track's extent as a tag instead, formatted `HH:MM:SS.nnnnnnnnn`.
+
+    It is an **end timestamp**, not a length: ffmpeg writes zero-to-last-packet,
+    so a track whose first frame sits at 3s reports 33s for 30s of picture.
+    Measured on a file built for it -- `start_time 3.023`, `DURATION
+    00:00:33.023`, 750 packets at 25fps. Hence the name, and hence the
+    subtraction wherever this is used as a length.
+
+    Only the exact key. A suffixed `DURATION-eng` is not the same claim: it is
+    what mkvmerge v45 and earlier wrote, it survives a `-c copy` cut into the new
+    file, and it then states the length of the file the cut came from. Reading
+    whichever `DURATION*` key came first would let a stale 120s win over a fresh
+    32s -- so a suffix is ignored rather than accepted, and a file that has only
+    a suffixed tag is simply not judged.
+    """
+    value = _mapping(stream.get("tags")).get("DURATION")
+    if value is None:
+        return None
+    parts = str(value).split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours, minutes, seconds = (float(p) for p in parts)
+    except ValueError:
+        return None
+    total = hours * 3600 + minutes * 60 + seconds
+    # `inf` would pass `> 0` and then refuse every ladder at 0% while the file is
+    # perfectly good. `hls_output_seconds` guards its own arithmetic the same way
+    # and for the same reason; no muxer writes this, and the guard costs nothing.
+    if not math.isfinite(total):
+        return None
+    return total if total > 0 else None
+
+
+def _has_sample_table(stream: dict) -> bool:
+    """Whether the mov demuxer found this track's samples in `moov`.
+
+    ffprobe reports `nb_frames` from the sample table in `moov`, so the field is
+    absent for an fMP4 whose `moov` holds no samples and present on an ordinary
+    file. (A fragmented file written without `empty_moov` keeps its first
+    fragment's samples in `moov` and reports a partial count; it is read as
+    unfragmented, and ffmpeg starts those at zero, where the two readings agree.)
+    Measured with ffmpeg 7.1: `-movflags frag_keyframe+empty_moov` output and
+    joined HLS-fMP4 segments carry no `nb_frames`; plain, faststart and
+    `-itsoffset` files all carry their frame count.
+    """
+    try:
+        return int(stream.get("nb_frames")) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def video_track_seconds(data: dict, stream: dict) -> Optional[float]:
+    """How long the picture runs, but only where the file really says so.
+
+    None is the common answer and a legitimate one: it means nothing here can be
+    compared against a ladder, and a caller must then decline to judge rather
+    than reach for the next number that happens to be shaped like a duration.
+    That is the whole difficulty. Every container publishes something; only some
+    of them publish a measurement.
+    """
+    if _is_attached_pic(stream):
+        return None
+    formats = _format_names(data)
+    if formats & _MOV_FAMILY_FORMATS:
+        # A track length already, needing no offset correction: measured with
+        # `-itsoffset 3`, which gives start_time 3.000 alongside duration 30.000.
+        try:
+            seconds = float(stream.get("duration"))
+        except (TypeError, ValueError):
+            return None
+        if not _has_sample_table(stream):
+            # Except in a fragmented file, where it is an end timestamp. The
+            # samples live in the fragments rather than in `moov`, and the
+            # demuxer takes the duration from the end of the last fragment
+            # without subtracting the first `tfdt`. Measured on an fMP4 init
+            # segment joined to media segments 6-15 of a 60s stream (a live
+            # window, a partial download): start_time 20.066, duration 60.000,
+            # 1200 frames at 30fps, which is 40s of picture. Read as a length,
+            # that refuses a complete ladder at 67% on every attempt but the last. A
+            # fragmented file that starts at zero is unaffected either way.
+            seconds -= _stream_start_seconds(stream)
+        return seconds if seconds > 0 and math.isfinite(seconds) else None
+    if formats & _MATROSKA_FORMATS:
+        tag_end = _tag_end_seconds(stream)
+        if tag_end is None:
+            return None
+        # Capped at the container's own duration, which a `DURATION` tag written
+        # for this file cannot exceed: the same muxer writes both, so a tag past
+        # the segment's own end did not come from these packets.
+        #
+        # A sanity bound and nothing cleverer. It does not rescue a file whose
+        # two numbers are stale together -- measured on the shape that suggests
+        # it, an mkv cut into a pipe: that one carries a stale `format.duration`
+        # and no `DURATION` tag at all, so it declines for want of a tag rather
+        # than being capped. What bounds the stale-both case is the last attempt
+        # giving way, which spends three encodes instead of the master.
+        format_end = _format_end_seconds(data)
+        if format_end is not None:
+            tag_end = min(tag_end, format_end)
+        seconds = tag_end - _stream_start_seconds(stream)
+        return seconds if seconds > 0 else None
+    return None
 
 
 def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
@@ -20,6 +223,18 @@ def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
     Returns None when no video stream exists.  A zero/invalid frame rate stays
     zero rather than inventing a value, and format-level duration is used when
     the video stream does not provide one.
+
+    `duration_seconds` is left exactly as it was -- the video stream's own
+    duration where the container publishes one, the format's otherwise -- since
+    it is what reaches the database and the comment timecodes, and changing it
+    is not this function's business.
+
+    `video_duration_seconds` is new, and is the picture track's length and
+    nothing else -- and only where the file genuinely states it, which is a
+    minority of containers. None everywhere else, which is a real answer rather
+    than a gap: the two numbers differ whenever another stream outlives the
+    video, and several demuxers synthesise the per-stream figure from the
+    container instead of measuring the track. See `video_track_seconds`.
     """
     streams = data.get("streams") or []
     if not streams:
@@ -42,6 +257,7 @@ def parse_probe_metadata(data: dict) -> Optional[VideoMetadata]:
         width=int(stream.get("width") or 0),
         height=int(stream.get("height") or 0),
         fps=fps,
+        video_duration_seconds=video_track_seconds(data, stream),
     )
 
 
@@ -222,6 +438,144 @@ _HDR_TRANSFERS = {"smpte2084", "arib-std-b67", "smpte2094"}
 _HDR_TONEMAP_ALGO = "mobius"
 _HDR_UPLOAD = {"nvenc": "_cuda", "vaapi": "", "qsv": "_qsv"}
 
+# Sources the GPU decoders (NVDEC, Intel VAAPI) handle, by codec and pixel
+# format. For anything else -- ProRes, DNxHR, H.264 10-bit, and 4:2:2 H.264 or
+# HEVC, which ffmpeg 7.1's NVDEC never offers whatever the GPU generation --
+# `-hwaccel` quietly falls back to a software decode, the
+# frames never reach the device, and the GPU scaler fails filter setup with
+# "Function not implemented". Those sources are decoded on the CPU and uploaded
+# explicitly instead, so the scale and the encode still run on the GPU.
+#
+# This is a prediction, not a guarantee: AV1 has no NVDEC before Ampere, and
+# 10-bit HEVC none on a Skylake iGPU. A wrong guess never produces bad output --
+# a software frame in front of a GPU filter fails loudly -- and the attempt
+# chain in transcode() retries such a failure with the CPU decode.
+_GPU_DECODABLE = {
+    "h264": {"yuv420p", "yuvj420p"},
+    "hevc": {"yuv420p", "yuvj420p", "yuv420p10le", "yuv420p12le", "yuv444p", "yuv444p10le"},
+    "vp9": {"yuv420p", "yuv420p10le", "yuv420p12le"},
+    "vp8": {"yuv420p"},
+    "av1": {"yuv420p", "yuv420p10le"},
+    "mpeg2video": {"yuv420p"},
+    "mpeg4": {"yuv420p"},
+}
+
+# Backends that can take CPU-decoded frames: the global args that give the
+# filter graph a device to upload to, and the filter that uploads. hwupload_cuda
+# opens its own CUDA device; -vaapi_device doubles as the filter device. QSV is
+# absent (its upload needs -filter_hw_device wiring nobody can test here), so it
+# keeps hardware decode with the plain software fallback.
+_CPU_DECODE_UPLOAD = {
+    "nvenc": {"args": [], "filter": "hwupload_cuda"},
+    "vaapi": {"args": ["-vaapi_device", "/dev/dri/renderD128"], "filter": "hwupload"},
+}
+
+# A source with a display matrix -- a portrait phone clip, stored landscape --
+# is turned upright by ffmpeg ahead of the filter graph (autorotate), but only
+# when its frames are in system memory: ffmpeg 7.1 skips any hardware pixel
+# format, so CUDA, VAAPI and QSV frames reach the scaler as stored, and the
+# rendition lies on its side. MPEG-TS cannot carry the matrix, so nothing later
+# can undo it. For such a source the GPU-decode attempt drops
+# -hwaccel_output_format: NVDEC still decodes, the frames are copied into system
+# memory, ffmpeg turns them exactly as it does on the CPU (rotations and flips),
+# and they are uploaded for the scale and the encode.
+#
+# `copy` first, because a vertical flip is done by negating the frame's linesize
+# rather than moving pixels, and hwupload_cuda cannot copy from a negative pitch
+# -- it logs CUDA_ERROR_INVALID_VALUE, sends garbage and exits 0. The upload
+# takes the decoder's own nv12 or p010 and scale_cuda sets the encoder's depth:
+# converting 4K 8-bit to p010 on the CPU first made the job cost four times the
+# CPU. Measured on an RTX 5070 Ti with ffmpeg 7.1.5, 10 s of 4K HEVC: about 7
+# CPU-seconds, against 18-28 on the CPU-decode tier. VAAPI has no entry because
+# nobody can test it here: a rotated source starts on its CPU-decode tier instead
+# (_plan_attempts).
+_MEMORY_DECODE_HWACCEL = {"nvenc": ["-hwaccel", "cuda"]}
+
+
+def _gpu_can_decode(backend: str, stream: dict) -> bool:
+    """Whether `backend`'s hardware decoder is expected to handle `stream`.
+
+    True for a backend with no CPU-decode path and for a probe that names no
+    codec, so those keep the command they had. A codec with no pix_fmt is
+    predicted not to decode: the CPU decode handles any source.
+    """
+    if backend not in _CPU_DECODE_UPLOAD:
+        return True
+    codec = stream.get("codec_name")
+    if not codec:
+        return True
+    return stream.get("pix_fmt") in _GPU_DECODABLE.get(codec, ())
+
+
+def _plan_attempts(
+    primary_backend: str, encode_backend: str, stream: dict, dv_software: bool,
+) -> list[tuple[str, bool]]:
+    """The ladder of (backend, gpu_decode) attempts, most capable first.
+
+    A hardware backend that can take uploaded frames gets two tiers -- GPU
+    decode, then CPU decode with the GPU still encoding -- and the first is
+    skipped when the source is known not to decode on the GPU, or when it has a
+    display matrix and the backend cannot decode into system memory for it (see
+    _MEMORY_DECODE_HWACCEL). Every hardware chain ends on the software pipeline.
+    Dolby Vision profile 5 is decoded and encoded in software whatever the
+    backend, so it gets a single attempt.
+    """
+    attempts: list[tuple[str, bool]] = []
+    if primary_backend == "copy":
+        attempts.append(("copy", False))
+    backend = encode_backend
+    if backend == "cpu" or dv_software:
+        attempts.append((backend, False))
+        return attempts
+    turned_on_the_cpu_only = (
+        backend in _CPU_DECODE_UPLOAD
+        and backend not in _MEMORY_DECODE_HWACCEL
+        and is_display_transformed(stream)
+    )
+    if _gpu_can_decode(backend, stream) and not turned_on_the_cpu_only:
+        attempts.append((backend, True))
+    if backend in _CPU_DECODE_UPLOAD:
+        attempts.append((backend, False))
+    attempts.append(("cpu", False))
+    return attempts
+
+# Thumbnails are square-pixel and fit within a 1280x1280 box, keeping the
+# source's shape. JPEG carries no pixel aspect a browser honours, so an
+# anamorphic frame has to be de-squeezed here: the first scale shrinks the long
+# axis by the sample aspect ratio (`sar` is 1 when the source sets none), rather
+# than widening, so a 2x-squeezed 4K frame never passes through an 8K one. The
+# fit that follows needs that step first, because force_original_aspect_ratio
+# works on pixel dimensions and ignores SAR. Display rotation needs nothing
+# extra: autorotate's transpose flips the SAR too.
+#
+# The fit can leave a SAR a hair off 1 (PAL 16:9 lands on 3231:3232), so the
+# result is marked square again for anything that reads the JFIF density.
+_THUMB_BOX = 1280
+_THUMB_GEOMETRY = (
+    "scale=w='trunc(iw*min(1\\,sar)/2)*2':h='trunc(ih/max(1\\,sar)/2)*2',setsar=1,"
+    f"scale={_THUMB_BOX}:{_THUMB_BOX}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+    "setsar=1"
+)
+
+
+def _thumbnail_filter(is_hdr: bool, dv_software: bool) -> str:
+    """The -vf for the poster frame: pick, tone-map, de-squeeze, fit."""
+    vf = "thumbnail"
+    if dv_software:
+        vf += ",libplacebo=tonemapping=bt.2446a:colorspace=bt709:color_trc=bt709:range=tv,format=yuvj420p"
+    elif is_hdr:
+        # Match the HLS path's full zscale->tonemap->zscale chain so the
+        # thumbnail converts BOTH the HDR transfer (PQ/HLG->linear->bt709)
+        # AND the wide gamut (bt2020->bt709 primaries). The older short
+        # form (tonemap=mobius only) tone-mapped the curve but left
+        # bt2020 primaries, producing a washed-out "log on Rec709" look.
+        vf += (
+            ",format=p010,zscale=t=linear:npl=100,format=gbrpf32le,"
+            "zscale=p=bt709,tonemap=tonemap=" + _HDR_TONEMAP_ALGO + ":desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv"
+        )
+    return f"{vf},{_THUMB_GEOMETRY},format=yuvj420p"
+
 # NVENC constant-quality (CQ) settings, keyed by output mode.
 # This ffmpeg/nvenc build has no "-rc cq" mode and ignores "-rc vbr -cq",
 # so constant quality is achieved via "-rc constqp -qp <value>"
@@ -239,7 +593,15 @@ _NVENC_CQ = {
 # Module level rather than local to transcode(), because the names are now
 # configuration and something outside this file has to be able to tell a valid
 # one from a typo before a job is built.
+#
+# 2160p is opt-in: it is not in DEFAULT_QUALITIES, so an instance that says
+# nothing keeps the ladder it had. Configured alone it is the "source size"
+# setting for anything up to 4K, since a rung above the source is clamped to the
+# source rather than dropped (see the ladder in transcode()). Its CRF matches
+# 1080p's for that reason: a 1080p or 1440p master clamped under it should come
+# out exactly as it did under `TRANSCODER_QUALITIES=1080p`, not larger.
 QUALITY_MAP = {
+    "2160p": ("3840:2160", 20),
     "1080p": ("1920:1080", 20),
     "720p": ("1280:720", 22),
     "360p": ("640:360", 26),
@@ -250,7 +612,12 @@ DEFAULT_QUALITIES = ("1080p", "720p", "360p")
 
 
 def rung_height(name: str) -> int:
-    """The vertical resolution a rung encodes to (QUALITY_MAP holds `w:h`)."""
+    """The short-side resolution a rung names: 1080 for 1080p.
+
+    QUALITY_MAP holds landscape `w:h` boxes, so this is the box's height, and
+    it is what a source's short side is measured against: a 1080x1920 portrait
+    clip is a 1080p source (#452).
+    """
     return int(QUALITY_MAP[name][0].split(":")[1])
 
 
@@ -291,6 +658,231 @@ def parse_qualities(raw: str | None) -> list[str]:
     return [q for q in QUALITY_MAP if q in known]
 
 
+# ----------------------------------------------------------------- CPU budget
+#
+# How much of the machine one transcode may take (TRANSCODER_CPU_LIMIT).
+#
+# Unset keeps what this has always done: ffmpeg chooses its own thread counts,
+# which on a 16-core host works out at about 10.6 cores for the default ladder.
+# Trimming the ladder is not a way to get the machine back -- a single rung
+# still takes 9.5 -- so an instance that wants to stay responsive while a
+# transcode runs has nothing to reach for. A review instance is not a render
+# farm: nobody is waiting on the encode with a stopwatch, and finishing later on
+# a machine that stays usable is usually the better trade.
+#
+# Measured on a 16-vCPU host, 20 s of 1080p30, libx264 preset fast:
+#
+#   3 rungs, unbounded           6.3 s wall   66.9 s CPU   10.6 cores
+#   3 rungs, 2 threads each     13.6 s wall   66.5 s CPU    4.9 cores
+#   3 rungs, 1 thread each      29.2 s wall   61.6 s CPU    2.1 cores
+#
+# The middle column is why this is safe to offer: total CPU time barely moves.
+# A budget buys wall-clock time, it does not waste work.
+#
+# It has to be a per-output-stream option. A global `-threads` before `-i` is an
+# input option and reaches the decoder; the encoders never see it, and occupancy
+# stays at ~11 cores for every value from 1 to 8.
+#
+# Every thread count below has a `max(1, ...)` floor, and the reason is not that
+# ffmpeg refuses a zero. It accepts one everywhere: `-threads 0`, `-threads:v:0
+# 0` and `-filter_complex_threads 0` all run to completion, because zero is how
+# ffmpeg spells "pick for yourself". Measured on the same host, one 1080p
+# encode: `-threads:v:0 0` occupies 7.97 cores, `1` occupies 1.17, `2` occupies
+# 2.50. A zero anywhere in the plan therefore does not break the command, it
+# silently switches the cap off for that stage -- which is the outcome this
+# setting exists to prevent, and the one an operator would never spot.
+
+_CPU_LIMIT_ENV = "TRANSCODER_CPU_LIMIT"
+
+
+def available_cpus() -> int:
+    """Cores this process may actually use, cgroup quota included.
+
+    `os.cpu_count()` reports the host's cores even inside a container with a
+    `cpus:` limit, so a deployment that already caps the worker at 4 of 16 and
+    then asks for 50% would get 8 -- twice what it has. The quota is read first
+    for that reason, affinity second, and the host count only as a last resort.
+    """
+    for quota_path, period_path in (
+        ("/sys/fs/cgroup/cpu.max", None),                                  # cgroup v2
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+         "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),                          # cgroup v1
+    ):
+        try:
+            raw = Path(quota_path).read_text().strip()
+            if period_path is None:
+                quota_s, period_s = raw.split()
+            else:
+                quota_s, period_s = raw, Path(period_path).read_text().strip()
+            if quota_s not in ("max", "-1"):
+                cores = int(quota_s) / int(period_s)
+                # A sub-core quota still gets one thread. Zero would not be a
+                # smaller budget, it would be no budget -- see the note above.
+                return int(cores) if cores >= 1 else 1
+        except (OSError, ValueError):
+            pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def parse_cpu_budget(raw: str | None, cpu_count: int | None = None) -> Optional[int]:
+    """Turn TRANSCODER_CPU_LIMIT into a core count, or None for unbounded.
+
+    Accepts an absolute number of cores ("6") or a share of what is available
+    ("50%"). Both shapes are here because operators think in both: someone who
+    knows the box says six, someone on a VPS says half. The share also survives
+    moving the instance to a different machine, where an absolute number quietly
+    means something else.
+
+    An unusable value falls back to unbounded and says so, the way an
+    unrecognised TRANSCODER_OUTPUT resolves to its default rather than refusing
+    to start. Silence would be the worst outcome here: the setting gets written
+    precisely when the machine is already struggling, and an operator who
+    mistyped it would watch the same problem continue with no hint why.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    total = cpu_count if cpu_count is not None else available_cpus()
+
+    if text.endswith("%"):
+        try:
+            share = float(text[:-1].strip().replace(",", "."))
+        except ValueError:
+            share = float("nan")
+        # Not-a-number covers both the strings float() rejects and the three it
+        # accepts and should not. "nan", "inf" and "infinity" get past a
+        # ValueError check and then raise inside round() below, ValueError for
+        # NaN and OverflowError for inf, and nothing between there and the job's
+        # outer handler catches either -- so one mistyped share failed every
+        # upload at 0% with an error that never named this setting, which is the
+        # outcome falling back to unbounded exists to prevent.
+        if not math.isfinite(share):
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} is not a percentage; "
+                  "leaving CPU use unbounded", flush=True)
+            return None
+        if share <= 0:
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} would leave no cores; "
+                  "leaving CPU use unbounded", flush=True)
+            return None
+        # Rounded, not truncated: on a 2-core box "50%" has to mean 1, and
+        # truncation would make every share below one core mean "no limit".
+        cores = max(1, round(total * share / 100))
+    else:
+        try:
+            cores = int(text)
+        except ValueError:
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} is neither a core count "
+                  "nor a percentage; leaving CPU use unbounded", flush=True)
+            return None
+        if cores < 1:
+            print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} would leave no cores; "
+                  "leaving CPU use unbounded", flush=True)
+            return None
+
+    if cores >= total:
+        # Asking for everything is the same as asking for nothing, and saying so
+        # is kinder than letting someone believe a limit is in force.
+        print(f"[transcoder] {_CPU_LIMIT_ENV}={text!r} is {cores} of {total} available "
+              "core(s); leaving CPU use unbounded", flush=True)
+        return None
+    return cores
+
+
+def get_cpu_budget() -> Optional[int]:
+    return parse_cpu_budget(os.environ.get(_CPU_LIMIT_ENV))
+
+
+def thread_plan(budget: Optional[int], rung_count: int) -> Optional[tuple[list[int], int]]:
+    """Split a core budget into per-encoder threads plus filter-graph threads.
+
+    Returns None when there is no budget, so the command is built exactly as it
+    was before this setting existed.
+
+    The encoders get the budget split between them and the filter graph gets
+    half of it. Both numbers are measured, and the graph's share is the one that
+    had to be measured twice.
+
+    It was one thread at first, on the strength of a 1080p SDR source where
+    capping the graph cost nothing (13.7 s against 13.5 s unbounded). That
+    number is real and still reproduces -- and it is a statement about a graph
+    that has almost nothing to do, not about this setting. A 4K source scales
+    three rungs, and an HDR one tone-maps every frame before the split through
+    `zscale, tonemap, zscale`, which are slice-threaded. Pinning the graph at
+    one thread serialises exactly the expensive part.
+
+    Measured on 16 cores, three rungs, budget 6, three runs each, spread 1-4%:
+
+        source                 graph=1          graph=3        graph=6
+        1080p SDR          16.2 s / 4.44    16.2 s / 4.38   16.5 s / 4.39
+        4K, scale only     30.4 s / 2.99    16.2 s / 5.87   10.7 s / 9.02
+        4K HDR, tone-map  101.5 s / 1.65    51.1 s / 3.68   30.5 s / 6.44
+
+    Half the budget is the largest share tried that stayed inside the cap on all
+    three. The whole budget is 1.5x faster again and overruns it on both 4K sources, by
+    0.44 cores on the tone-map graph and by 3.0 on the scaling one. One thread
+    holds the cap only by wasting it: the operator granted six cores and the job
+    takes 1.65. On the 1080p source, where the first measurement was taken, the
+    share makes no measurable difference at all, so nothing is traded away for
+    the sources that do need it.
+
+    The graph's threads are not subtracted from the encoders'. Thread counts are
+    ceilings on parallelism rather than reservations, and the stages run as a
+    pipeline: whichever is slowest holds the others back, so the sum of the
+    ceilings is not what the job occupies. On the three sources above, at half
+    the budget, what it occupied stayed inside the cap.
+
+    That is a measurement and not a promise, because one stage is inside no
+    budget: decoding. A capped job can exceed its cap, and the amount is the
+    decoder's CPU time divided by how long the rest of the job runs -- an
+    uncapped decoder runs only as fast as the capped stages take frames from it,
+    so the same decode is a fraction of a core over a long job and several cores
+    over a short one. Measured on 16 cores at a budget of 6, the same 12.5s of
+    1080p, three runs each:
+
+        master                decode alone     3 rungs      1 rung
+        H.264                  5.8 CPU-s     4.45 cores   5.92 cores
+        ProRes 4444 XQ        24.0 CPU-s     5.47 cores   7.70 cores
+
+    Only the last cell is over, and it is over by 28%. The three sources in the
+    first table held for the length of their jobs rather than for their codec:
+    two of those rows are one ProRes 422 HQ 10-bit master (`4K, scale only` is
+    that file with `TRANSCODER_HDR=preserve`), and at half the budget they run
+    16.2s and 51.1s, which is long enough to spread even that decode thin. A
+    shorter ladder and a faster machine both shrink the divisor, so
+    `TRANSCODER_QUALITIES` trimmed to one rung is the configuration where this
+    leaks most -- and an upstream report (#390) on an 11-core host, with a real
+    NLE export rather than a master built to match one, measured 7.46 cores at
+    three rungs where this host measured 5.47.
+
+    Capping the decoder is not the fix. `-threads` before `-i` does reach it, and
+    on the full job it moved occupancy by less than the run-to-run spread, here
+    and on the reporting host -- not because the decoder is cheap, but because
+    the option is a loose bound on a codec that threads on frame and slice
+    level: `-threads 2` was measured at 4.61 cores, not 2.
+
+    Every rung keeps at least one thread, so `n` rungs cannot go below `n`
+    encoder threads. A budget under the rung count is honoured as closely as it
+    can be, and the shortfall is reported rather than quietly rounded away.
+    """
+    if budget is None or rung_count < 1:
+        return None
+
+    base, remainder = divmod(budget, rung_count)
+    # The remainder goes to the earliest rungs, which are the largest ones and
+    # the slowest to encode.
+    per_rung = [max(1, base + (1 if i < remainder else 0)) for i in range(rung_count)]
+
+    if sum(per_rung) > budget:
+        print(f"[transcoder] {_CPU_LIMIT_ENV} asks for {budget} core(s) but "
+              f"{rung_count} rungs need one thread each; using {sum(per_rung)}",
+              flush=True)
+    return per_rung, max(1, budget // 2)
+
+
 # Output codec / quality selection (TRANSCODER_OUTPUT).
 #   h264_8  -> H.264 8-bit, DEFAULT (broad device compatibility, smaller files)
 #   h265_10 -> HEVC 10-bit, high quality (opt-in via the env var below)
@@ -309,6 +901,47 @@ def get_output_mode() -> str:
 #   preserve -> keep HDR10/HLG passthrough (10-bit, original colour tags)
 def get_hdr_mode() -> str:
     return os.environ.get("TRANSCODER_HDR", "convert").lower()
+
+
+# Audio bitrate for the review stream (TRANSCODER_AUDIO_BITRATE, #328).
+#
+# Unset emits no audio options at all, which is what this has always done: the
+# HLS muxer picks native AAC-LC itself, measured at about 128 kb/s for a stereo
+# source (ffmpeg 7.1). The codec stays AAC-LC whatever is set, because it is the
+# only audio codec every browser plays out of HLS/MPEG-TS.
+#
+# The number is a target for ffmpeg's built-in AAC encoder rather than a
+# promise. Measured on 6s of stereo, 192k lands within a few kb/s of the ask;
+# above that what it spends depends on the material, 223-262 kb/s for 256k
+# and 224-245 kb/s for 320k.
+_AUDIO_BITRATE_ENV = "TRANSCODER_AUDIO_BITRATE"
+_AUDIO_BITRATE_RANGE_K = (64, 512)
+
+
+def parse_audio_bitrate(raw: str | None) -> Optional[str]:
+    """Turn TRANSCODER_AUDIO_BITRATE into an ffmpeg `-b:a` value, or None.
+
+    Only `<n>k` is accepted. A bare number reaches ffmpeg as bits per second,
+    so "320" would be a silent request for 320 b/s; refusing it is kinder than
+    guessing which unit was meant. Like TRANSCODER_CPU_LIMIT, an unusable value
+    falls back to the default with a line in the log rather than failing jobs.
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        return None
+    low, high = _AUDIO_BITRATE_RANGE_K
+    # [0-9], not \d: \d also matches non-ASCII digits such as full-width
+    # "３２０k", which int() reads but ffmpeg refuses.
+    match = re.fullmatch(r"([0-9]+)k", text)
+    if not match or not low <= int(match.group(1)) <= high:
+        print(f"[transcoder] {_AUDIO_BITRATE_ENV}={raw!r} is not a bitrate between "
+              f"{low}k and {high}k; leaving the audio at ffmpeg's default", flush=True)
+        return None
+    return text
+
+
+def get_audio_bitrate() -> Optional[str]:
+    return parse_audio_bitrate(os.environ.get(_AUDIO_BITRATE_ENV))
 
 
 # Stream copy (TRANSCODER_SOURCE_COPY), off unless a deployment asks for it.
@@ -355,26 +988,82 @@ def display_rotation(stream: dict) -> float:
     condition, and comes out lying on its side, next to a thumbnail that is
     upright because thumbnails are made through a filter graph.
 
-    The encoding path never had to ask, because ffmpeg autorotates whenever a
-    filter graph is present and the ladder always has one -- so the rotation is
-    baked into the pixels there, and the rendition is upright.
+    The encoding path bakes the rotation into the pixels instead, because
+    ffmpeg autorotates a frame on its way into the filter graph -- but only a
+    frame in system memory. It leaves a hardware frame (CUDA, VAAPI, QSV) as it
+    is, so a GPU decode has to be told to hand over system-memory frames for a
+    rotated source; see _MEMORY_DECODE_HWACCEL and is_display_transformed.
 
     `rotate` in the stream tags is the older spelling of the same thing and is
     still what some files carry, so both are read.
+
+    A value that is there but is not a finite number also comes back as 0, so
+    callers can size with it; whether to trust that 0 is rotation_unreadable().
     """
     for side_data in stream.get("side_data_list") or []:
         if side_data.get("rotation") is not None:
-            try:
-                return abs(float(side_data["rotation"])) % 360
-            except (TypeError, ValueError):
-                return 0.0
+            return _rotation_degrees(side_data["rotation"]) or 0.0
     tag = (stream.get("tags") or {}).get("rotate")
     if tag is not None:
-        try:
-            return abs(float(tag)) % 360
-        except (TypeError, ValueError):
-            return 0.0
+        return _rotation_degrees(tag) or 0.0
     return 0.0
+
+
+def _rotation_degrees(value) -> Optional[float]:
+    """`value` as degrees in [0, 360), or None if it is not a finite number."""
+    try:
+        degrees = float(value)
+    except (TypeError, ValueError):
+        return None
+    return abs(degrees) % 360 if math.isfinite(degrees) else None
+
+
+def rotation_unreadable(stream: dict) -> bool:
+    """Whether this stream carries a rotation that does not parse as one.
+
+    Not reachable from ffprobe 7.1, which prints rotation as a number. Such a
+    value reads as 0 from display_rotation() but says nothing about whether the
+    picture is turned, so the copy gate refuses it and is_display_transformed()
+    counts it: an unanswered question falls toward encoding (#380).
+    """
+    values = [side_data.get("rotation")
+              for side_data in stream.get("side_data_list") or []]
+    values.append((stream.get("tags") or {}).get("rotate"))
+    return any(value is not None and _rotation_degrees(value) is None
+               for value in values)
+
+
+def is_display_transformed(stream: dict) -> bool:
+    """Whether ffmpeg will turn this stream's frames before the filter graph.
+
+    Any display matrix, not only a rotation: a vertical flip probes as rotation
+    0 and ffmpeg still flips the frames for it. The demuxers export a matrix only
+    when it is not the identity, so its presence is the test. Deliberately wider
+    than display_rotation(), whose job is the stream-copy gate: here a false
+    positive costs a little CPU and a false negative a picture on its side.
+    """
+    for side_data in stream.get("side_data_list") or []:
+        if side_data.get("side_data_type") == "Display Matrix" \
+                or "rotation" in side_data or "displaymatrix" in side_data:
+            return True
+    return bool(display_rotation(stream)) or rotation_unreadable(stream)
+
+
+def rung_box(target: str, width: int, height: int) -> str:
+    """A rung's `w:h` box, turned to lie the way a `width` x `height` frame does.
+
+    QUALITY_MAP's boxes are landscape, and fitted as they are a portrait frame
+    is sized by its long side: the 1080p rung made 608x1080 of a 1080x1920 phone
+    clip. Turned, the box puts the rung's height on the frame's short side, so
+    1080x1920 keeps its size under 1080p and comes out 720x1280 under 720p, as a
+    landscape source would (#452). A square frame or box is left as it is.
+    """
+    if not width or not height:
+        return target
+    box_w, box_h = (int(v) for v in target.split(":"))
+    if (box_w - box_h) * (width - height) < 0:
+        return f"{box_h}:{box_w}"
+    return target
 
 
 def rung_is_source_size(target: str, width: int, height: int) -> bool:
@@ -407,6 +1096,70 @@ def rung_is_source_size(target: str, width: int, height: int) -> bool:
     )
 
 
+def fitted_size(target: str, width: int, height: int) -> tuple[int, int]:
+    """The frame a rung's `w:h` box makes of a `width` x `height` one.
+
+    That is `scale=w:h:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+    worked the way the worker image's ffmpeg (7.1) does it, for `scale` and
+    `scale_cuda` alike: each side is the other box side rescaled by the source's
+    shape and rounded to the nearest even number, the box side wins where it is
+    smaller, and that is rounded down to even. 720x1920 in `640:360` is 136x360.
+    """
+    target_width, target_height = (int(v) for v in target.split(":"))
+    w = min(target_width, (target_height * width + height) // (2 * height) * 2)
+    h = min(target_height, (target_width * height + width) // (2 * width) * 2)
+    return w // 2 * 2, h // 2 * 2
+
+
+# The smallest and largest frame each NVENC encoder opens for, as
+# ((min_w, min_h), (max_w, max_h)) in the even sizes the ladder produces.
+# Measured on an RTX 5070 Ti with the worker image's ffmpeg 7.1.5, the same with
+# CUDA or system-memory frames and with any preset: h264_nvenc refuses 144x360,
+# 640x48 and 4098 on either side, hevc_nvenc refuses 128x360, 640x32 and 8194.
+# Another GPU generation may differ. A rung outside its own card's range fails to
+# open the encoder, which falls back to software (_NVENC_ENCODER_REFUSALS), so a
+# figure here that is too generous costs a slower transcode, not a failed one.
+_NVENC_FRAME_LIMITS = {
+    "h264_nvenc": ((146, 50), (4096, 4096)),
+    "hevc_nvenc": ((130, 34), (8192, 8192)),
+}
+
+
+def nvenc_rung_target(target: str, width: int, height: int, encoder: str) -> str:
+    """A rung's box, enlarged where its fit would be too small for `encoder`.
+
+    A very tall source comes out of the 360p box narrower than NVENC encodes
+    (400x1920 in `360:640` gives 134x640, under h264_nvenc's 146), and a very
+    wide one shorter (8000x480 in `640:360` gives 640x38). Such a rung gets the
+    smallest box of the source's own shape that the encoder takes instead --
+    146:702 and 834:50 for those two -- so the job stays on the GPU rather than
+    failing over to software. The rung is a little larger than the software
+    pipeline makes it, and keeps its shape.
+
+    `width` x `height` must be the frame the scaler is handed, which is not
+    always the stored one: see the call in transcode(). Returned unchanged when
+    the fit already suits the encoder, or when no box would without scaling the
+    source up or passing the encoder's maximum; the software fallback takes
+    those.
+    """
+    limits = _NVENC_FRAME_LIMITS.get(encoder)
+    if not limits or not width or not height:
+        return target
+    (min_w, min_h), (max_w, max_h) = limits
+    fit_w, fit_h = fitted_size(target, width, height)
+    if fit_w >= min_w and fit_h >= min_h:
+        return target
+    # Whichever minimum the source's shape reaches last sets the size, and the
+    # other side follows it, rounded up to even.
+    if min_w * height >= min_h * width:
+        w, h = min_w, -(-height * min_w // (2 * width)) * 2
+    else:
+        w, h = -(-width * min_h // (2 * height)) * 2, min_h
+    if w > min(width, max_w) or h > min(height, max_h):
+        return target
+    return f"{w}:{h}"
+
+
 # The keyframe probe below reads this much of the source, and refuses a copy
 # whose sync samples are further apart than this. A copy cannot make keyframes,
 # so the master's own spacing *is* the segment length -- `-hls_time` is a floor
@@ -416,13 +1169,30 @@ _COPY_PROBE_SECONDS = 30.0
 _MAX_COPY_SEGMENT_SECONDS = 12.0
 
 
+# NVENC would not open an encoder for this frame. A frame under the encoder's
+# minimum size fails in the driver ("InitializeEncoder failed: invalid param (8):
+# Frame Dimension less than the minimum supported value"), one over its maximum
+# fails ffmpeg's capability check ("Width 8000 exceeds 4096", then "Provided
+# device doesn't support required NVENC features"), and other settings the GPU
+# lacks fail one of the two the same way. Decoding on the CPU would hand NVENC
+# the same frame with the same settings, so these go straight to the software
+# pipeline, which has no such limits. The ladder avoids the size limits where it
+# can (see nvenc_rung_target); this is what catches the rest, on any GPU.
+_NVENC_ENCODER_REFUSALS = (
+    "initializeencoder failed",
+    "provided device doesn't support required nvenc features",
+)
+
 # Runtime hardware failures that should transparently fall back to software.
 # These are environmental (no/!busy device, exhausted VRAM, missing driver
 # library), not input-specific, so re-running the same job on the CPU pipeline
 # is expected to succeed.
 _HW_RUNTIME_FAILURES = (
-    "cuda_error_out_of_memory",
     "out of memory",
+    # Any CUDA driver error, e.g. CUDA_ERROR_NO_DEVICE when the card fell off the
+    # bus. hwupload_cuda opens its device during filter setup and says nothing
+    # else that matches, unlike `-hwaccel cuda` ("Device creation failed").
+    "cuda_error_",
     "hwaccel initialisation returned error",
     "failed setup for format cuda",
     "no capable devices found",
@@ -430,16 +1200,47 @@ _HW_RUNTIME_FAILURES = (
     "cannot load libcuda",
     "openencodesessionex failed",
     "no free encoding sessions",
+    # Ahead of "function not implemented", which the size refusal also prints,
+    # so the fallback log names the encoder.
+    *_NVENC_ENCODER_REFUSALS,
     "function not implemented",
     "failed to create specified hw device",
     "device creation failed",
     "error creating a mfx session",
+    # A software frame handed to a GPU-only filter. Listed so a format mismatch
+    # in the CPU-decode graph degrades to software rather than failing the asset.
+    "impossible to convert between the formats",
+)
+
+# The subset of hardware failures that point at the decoder rather than the
+# device as a whole: the hwaccel would not open for this stream, or it fell back
+# to software and the GPU filter graph refused the frames. A GPU-decode attempt
+# that fails this way is retried with the CPU decoding and the GPU encoding.
+# Anything else (exhausted VRAM, a missing encode library, no free sessions)
+# would stop the GPU encoder too, so it goes straight to software.
+_GPU_DECODE_FAILURES = (
+    "impossible to convert between the formats",
+    "function not implemented",
+    "failed setup for format",
+    "hwaccel initialisation returned error",
 )
 
 
 def _is_hw_runtime_failure(err: str) -> bool:
     lowered = (err or "").lower()
     return any(marker in lowered for marker in _HW_RUNTIME_FAILURES)
+
+
+def _is_gpu_decode_failure(err: str) -> bool:
+    lowered = (err or "").lower()
+    # An NVDEC out-of-memory also logs "hwaccel initialisation returned error",
+    # but it is the device that is full, and the encoder needs VRAM as well.
+    if "out of memory" in lowered:
+        return False
+    # The size refusal ends in "Function not implemented" too.
+    if any(marker in lowered for marker in _NVENC_ENCODER_REFUSALS):
+        return False
+    return any(marker in lowered for marker in _GPU_DECODE_FAILURES)
 
 
 def _hw_failure_reason(err: str) -> str:
@@ -449,6 +1250,20 @@ def _hw_failure_reason(err: str) -> str:
         if marker in lowered:
             return marker
     return "unknown hardware failure"
+
+
+def _failure_detail(err: str) -> str:
+    """The stderr line that names the failure, for the fallback log.
+
+    ffmpeg's last lines are usually teardown ("Terminating thread with return
+    code -22"), so the line holding the marker _hw_failure_reason reports is
+    the readable one. With no marker, the tail is all there is.
+    """
+    marker = _hw_failure_reason(err)
+    for line in (err or "").splitlines():
+        if marker in line.lower():
+            return redact_presigned_urls(line.strip())[:300]
+    return redact_presigned_urls((err or "").strip()[-300:])
 
 
 def get_backend() -> str:
@@ -483,6 +1298,171 @@ def parse_progress_percent(line: str, duration_seconds: float | None) -> int | N
     return max(0, min(99, percent))
 
 
+class TranscodeTruncated(RuntimeError):
+    """ffmpeg reported success, and the ladder is shorter than the video track.
+
+    Its own type because this must not be absorbed by the fallbacks below. A
+    remux that fails for a reason of its own is worth encoding instead; a ladder
+    that came out short is worth *reading again*, which is what a task retry does
+    and a fallback does not -- a fallback would re-read the same bytes the same
+    way and charge hours for it.
+
+    Raised only while an attempt remains. On the last one the mismatch is logged
+    and the ladder kept, because reaching `failed` costs the master; see
+    `refuse_a_truncated_result`.
+
+    What does the passing-through is the `except TranscodeTruncated: raise`
+    placed ahead of `except RuntimeError` in the attempt loop, not the base
+    class. `RuntimeError` is kept only because every other failure the
+    transcoder raises is one, and nothing here should be the exception to that.
+    """
+
+
+# How far short of the source the output may fall before it counts as truncated
+# rather than rounded. The last segment is cut wherever the frames end, and a
+# copy's segment boundaries come from the source's GOP, so an exact match is not
+# on offer.
+#
+# A flat number rather than a share of the duration, because the drift it covers
+# is flat. Measured against the video track's own duration on 1-, 10- and
+# 40-minute sources, both paths:
+#
+#     copy    +0.0230s   at every length
+#     encode  -0.0400s   at every length
+#
+# It is a rounding remainder in the last segment, so it does not grow with the
+# file. A proportional term would grow anyway -- 24s of blindness on a
+# 40-minute master, 36s on an hour -- and buy nothing: 3s is already 75 times
+# the largest drift measured.
+_TRUNCATION_SLACK_SECONDS = 3.0
+
+def hls_output_seconds(hls_dir: Path) -> Optional[float]:
+    """How long the longest variant in a finished HLS directory actually is.
+
+    Read from the playlists, which are the only place the muxer records what it
+    wrote. Counting segments would not do: their length varies with the frame
+    rate, and on the copy path it follows the source's GOP rather than
+    `-hls_time`.
+
+    Returns None when there is no playlist at all. The caller deliberately does
+    not judge that -- see `refuse_a_truncated_result` -- because ffmpeg with an
+    HLS muxer either writes one or exits non-zero.
+    """
+    longest: Optional[float] = None
+    for playlist in sorted(hls_dir.glob("*/playlist.m3u8")):
+        try:
+            text = playlist.read_text(errors="replace")
+        except OSError:
+            # A path that matched the glob but cannot be read -- a directory of
+            # that name, a dangling symlink. Skipping it leaves the decision to
+            # the other variants, or to "no playlist at all", both of which are
+            # handled. Letting an OSError out here would escape the attempt
+            # loop's RuntimeError handler and burn the fallbacks.
+            continue
+        total = 0.0
+        for line in text.splitlines():
+            if not line.startswith("#EXTINF:"):
+                continue
+            try:
+                seconds = float(line.split(":", 1)[1].split(",")[0])
+            except ValueError:
+                continue  # a malformed line is not a reason to lose the rest
+            # `nan` fails every comparison, so a single one would make the whole
+            # check accept anything; `inf` does the same by swamping the sum.
+            if not math.isfinite(seconds):
+                continue
+            total += seconds
+        longest = total if longest is None else max(longest, total)
+    return longest
+
+
+def refuse_a_truncated_result(
+    hls_dir: Path,
+    source_video_seconds: Optional[float],
+    label: str = "ffmpeg",
+    *,
+    final_attempt: bool = False,
+) -> None:
+    """Raise unless the ladder just written is as long as the source's video.
+
+    The argument is the *video track's* duration, not the file's, and the name
+    says so because handing it the wrong one is silent and wrong rather than
+    loud: `#EXTINF` measures picture, a container's duration is its longest
+    stream, and a rough cut whose audio runs past its last frame would be
+    refused at 57% while being perfectly intact. `VideoMetadata` carries both
+    numbers separately for this reason, and most containers do not state the
+    video track's length at all -- for those this is handed None and declines.
+
+    ffmpeg's exit code does not answer this. If the input stops being readable
+    part-way through, the demuxer reaches what looks like the end of the file,
+    the muxer closes the playlist with `#EXT-X-ENDLIST`, and ffmpeg exits 0.
+    Measured on a 31:18 master cut at three successive frame boundaries: 92.4s,
+    96.1s and 99.8s of output, exit 0 every time, every playlist well-formed.
+    It is not confined to a clean boundary either: cut inside a video packet and
+    the encode pipeline decodes through the damage and still exits 0, and a
+    dropped HTTP read logs `Input/output error` before exiting 0. Only the copy
+    pipeline reports it, with exit 183 out of `h264_mp4toannexb` -- and there the
+    remux-to-encoder fallback absorbs it and stores the short ladder anyway.
+
+    A live instance carried such a version for two days. The database had
+    `ready` and the source's real duration side by side with 5% of it in the
+    bucket, and it took someone dragging the scrubber to the end to notice.
+
+    **On the last attempt this logs instead of raising**, which is `final_attempt`
+    and is the most important line in the function. A refusal is a mismatch
+    between two numbers, and a mismatch is not proof of a short read: it can also
+    be a duration this code trusted and should not have. The two outcomes are
+    not symmetric. Raising once costs a re-read, and a re-read is the cure for
+    the transient case. Raising every time strands the master: the version
+    reaches `failed`, and nothing ever transcodes a `failed` version again. The
+    ladder can always be built again; the master cannot. So this refuses while a
+    retry remains and gives way when none does.
+    """
+    if not source_video_seconds or source_video_seconds <= 0:
+        # Nothing trustworthy to compare against, which is the normal case for
+        # most containers -- see `video_track_seconds`. Reaching for the
+        # container's duration instead is what would refuse intact files, so
+        # this declines to judge rather than judging on the wrong number.
+        return
+    written = hls_output_seconds(hls_dir)
+    if written is None:
+        # No playlist at all is not judged here. ffmpeg with an HLS muxer either
+        # writes one or exits non-zero, so in production this branch means the
+        # layout moved, not that a transcode failed -- and failing every asset
+        # over a renamed directory is the worse error. `test_the_check_is_wired
+        # _into_the_transcode` is what keeps this from being a quiet way for the
+        # whole check to stop applying.
+        return
+    if written >= source_video_seconds - _TRUNCATION_SLACK_SECONDS:
+        return
+    # Says what was measured and not why. With the last attempt accepting, a
+    # mismatch is no longer evidence of a cause -- it is two numbers that do not
+    # agree, and either of them can be the wrong one.
+    measured = (
+        f"{label} exited 0 with {written:.1f}s of ladder against a "
+        f"{source_video_seconds:.1f}s video track "
+        f"({written / source_video_seconds:.0%})"
+    )
+    if final_attempt:
+        try:
+            print(
+                f"[transcoder] {measured}; no attempt left, so this is being "
+                "stored as it is rather than failed",
+                flush=True,
+            )
+        except Exception:                                    # noqa: BLE001
+            # This branch exists so that a mismatch cannot cost the master, and
+            # a failing stdout must not be the one thing that undoes it. Under
+            # Celery's stdout redirection a broken pipe is swallowed already, but
+            # anywhere stdout is a real stream -- a manual run, another backend
+            # embedding this -- the exception would leave through both handlers
+            # in the attempt loop and fail the transcode on precisely the
+            # attempt that was added to keep it.
+            pass
+        return
+    raise TranscodeTruncated(f"{measured}; reading the source again")
+
+
 # Segments are uploaded by a small pool of threads rather than one after the
 # other. A PUT to a remote object store costs most of a round-trip whatever it
 # carries, and a 50-minute encode at the default segment length produces on the
@@ -498,10 +1478,19 @@ _UPLOAD_THREADS = 8
 
 
 class FFmpegTranscoder(BaseTranscoder):
-    def __init__(self, s3_client, bucket: str, s3_endpoint: str = None):
+    def __init__(self, s3_client, bucket: str, s3_endpoint: str = None, storage_class: str | None = None):
         self.s3 = s3_client
         self.bucket = bucket
         self.s3_endpoint = s3_endpoint
+        # S3_STORAGE_CLASS, sent on every output; None leaves the bucket default.
+        self.storage_class = storage_class
+
+    def _extra_args(self, content_type: str, cache_control: str) -> dict:
+        """ExtraArgs for one output upload, with the storage class when set."""
+        extra = {"ContentType": content_type, "CacheControl": cache_control}
+        if self.storage_class:
+            extra["StorageClass"] = self.storage_class
+        return extra
     
     def _get_presigned_url(self, s3_key: str, expires_in: int = 7200) -> str:
         """Generate a presigned URL for streaming input to FFmpeg."""
@@ -587,12 +1576,13 @@ class FFmpegTranscoder(BaseTranscoder):
 
             if timed_out:
                 # Same exception subprocess.run(timeout=...) raises, so callers
-                # that already handle it keep working unchanged.
-                raise subprocess.TimeoutExpired(cmd, timeout)
+                # that already handle it keep working unchanged. The argv it
+                # quotes holds the presigned input URL.
+                raise redacted_timeout(subprocess.TimeoutExpired(cmd, timeout))
 
             if proc.returncode != 0:
                 err_file.seek(0)
-                stderr = err_file.read().strip()
+                stderr = redact_presigned_urls(err_file.read().strip())
                 raise RuntimeError(
                     f"{label} exited {proc.returncode}: {stderr or 'no stderr output'}"
                 )
@@ -603,18 +1593,50 @@ class FFmpegTranscoder(BaseTranscoder):
 
         Uses errors='replace' because ffmpeg often echoes input metadata
         (Latin-1 / Shift-JIS) to stderr, which would break strict UTF-8 decode.
+
+        ffmpeg prints its input URL in stderr, and a timeout quotes it in the
+        argv, so both are scrubbed of presigned query strings here: this is
+        where that text becomes an exception, and from there an SSE event and
+        a log line.
         """
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, errors='replace', timeout=timeout,
-        )
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, errors='replace', timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # `from None`: a chained original would print the URL in the
+            # traceback that Celery logs and stores.
+            raise redacted_timeout(exc) from None
         if result.returncode != 0:
-            stderr = result.stderr.strip()
+            stderr = redact_presigned_urls(result.stderr.strip())
             raise RuntimeError(
                 f"{label} exited {result.returncode}: {stderr or 'no stderr output'}"
             )
         return result.stdout
 
-    def _copy_keyframe_refusal(self, input_url: str) -> str | None:
+    def _copy_probe_windows(self, duration_seconds: float | None) -> list[tuple[float, float]]:
+        """Which stretches of the master to inspect, as `(start, length)`.
+
+        The head, always. Plus the tail when the file is longer than one window,
+        because the thing the head cannot see is a master built out of parts: a
+        slate spliced onto the front, or a lossless join of clips from different
+        encoders. Both leave the first window describing something the rest of
+        the file is not (#379).
+
+        Two windows is a sample, not a proof. A three-part join whose middle
+        piece is the odd one still passes, and a full-file read is the only
+        thing that would not. That trade is the whole reason this is bounded:
+        the alternative is a second complete pass over a master that can be
+        tens of gigabytes, which is the cost this setting exists to avoid.
+        """
+        head = (0.0, _COPY_PROBE_SECONDS)
+        if not duration_seconds or duration_seconds <= _COPY_PROBE_SECONDS:
+            return [head]
+        return [head, (max(0.0, duration_seconds - _COPY_PROBE_SECONDS), _COPY_PROBE_SECONDS)]
+
+    def _copy_keyframe_refusal(
+        self, input_url: str, duration_seconds: float | None = None
+    ) -> str | None:
         """Why this source's sync samples make it unsafe to copy, or None.
 
         A stream copy hands the segmenter whatever random-access points the
@@ -633,21 +1655,30 @@ class FFmpegTranscoder(BaseTranscoder):
         * **They are too far apart.** `-hls_time` is a floor here, so the
           master's own spacing decides how long a segment is.
 
-        Bounded to the first `_COPY_PROBE_SECONDS`: one range read rather than a
-        second pass over a 4 GB master, on the reasoning that an encoder does
-        not change its GOP structure halfway through a file. A master whose
-        first window holds fewer than two sync samples is refused rather than
-        guessed at, which is the same answer the segment-length bound gives.
-
-        Anything that goes wrong in here refuses the copy. A refusal costs
-        encode time, which is the thing this setting exists to save; the other
-        direction costs an asset nobody can seek in, which is worse.
+        Each window from `_copy_probe_windows` is judged on its own and the
+        first complaint wins. Anything that goes wrong in here refuses the copy.
+        A refusal costs encode time, which is the thing this setting exists to
+        save; the other direction costs an asset nobody can seek in, which is
+        worse.
         """
+        for start, length in self._copy_probe_windows(duration_seconds):
+            refusal = self._copy_window_refusal(input_url, start, length, duration_seconds)
+            if refusal:
+                return refusal
+        return None
+
+    def _copy_window_refusal(
+        self, input_url: str, start: float, length: float,
+        duration_seconds: float | None,
+    ) -> str | None:
+        """`_copy_keyframe_refusal` for one window, or None if it looks copyable."""
+        where = "" if start <= 0 else f" at {start:g}s"
+        interval = f"{start:g}%+{length:g}" if start > 0 else f"%+{length:g}"
         try:
             probed = self._run(
                 [
-                    "ffprobe", "-v", "error", "-select_streams", "v:0",
-                    "-read_intervals", f"%+{_COPY_PROBE_SECONDS:g}",
+                    "ffprobe", "-v", "error", "-select_streams", _PRIMARY_VIDEO_STREAM,
+                    "-read_intervals", interval,
                     "-show_entries", "packet=pts_time,flags",
                     "-print_format", "json", input_url,
                 ],
@@ -656,6 +1687,23 @@ class FFmpegTranscoder(BaseTranscoder):
             packets = json.loads(probed).get("packets") or []
         except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             return f"the keyframe probe failed ({exc})"
+
+        if any("D" in (packet.get("flags") or "") for packet in packets):
+            return (
+                f"the source has packets marked for discard{where}; an HLS MPEG-TS "
+                "remux cannot preserve the source trim"
+            )
+
+        if start <= 0 and packets:
+            try:
+                first_pts = float(packets[0].get("pts_time"))
+            except (TypeError, ValueError):
+                first_pts = None
+            if first_pts is not None and first_pts < 0:
+                return (
+                    f"the first packet has a negative PTS ({first_pts:g}s){where}; "
+                    "stream-copy would include trimmed pre-roll"
+                )
 
         keyframe_times: list[float] = []
         for packet in packets:
@@ -669,13 +1717,27 @@ class FFmpegTranscoder(BaseTranscoder):
 
         if len(keyframe_times) < 2:
             return (
-                f"only {len(keyframe_times)} sync sample(s) in the first "
-                f"{_COPY_PROBE_SECONDS:g}s, so segments would be at least that long"
+                f"only {len(keyframe_times)} sync sample(s) in {length:g}s{where}, "
+                "so segments would be at least that long"
             )
-        widest_gap = max(b - a for a, b in zip(keyframe_times, keyframe_times[1:]))
+
+        # The gap running off the end of the window counts too. Taking only the
+        # pairwise gaps measures the distance between sync samples and never the
+        # distance after the last one, so a master whose keyframes are dense at
+        # the head and absent afterwards -- a slate spliced onto a long-GOP body
+        # -- reported a fraction of a second and copied into one segment as long
+        # as the file (#378). Clamped to the real end so a short source, whose
+        # window is mostly past the end of the media, is not refused for silence
+        # that is not there.
+        window_end = start + length
+        if duration_seconds:
+            window_end = min(window_end, duration_seconds)
+        gaps = [b - a for a, b in zip(keyframe_times, keyframe_times[1:])]
+        gaps.append(max(0.0, window_end - keyframe_times[-1]))
+        widest_gap = max(gaps)
         if widest_gap > _MAX_COPY_SEGMENT_SECONDS:
             return (
-                f"sync samples up to {widest_gap:.1f}s apart, past the "
+                f"sync samples up to {widest_gap:.1f}s apart{where}, past the "
                 f"{_MAX_COPY_SEGMENT_SECONDS:g}s a copied segment may span"
             )
 
@@ -683,36 +1745,54 @@ class FFmpegTranscoder(BaseTranscoder):
         # unit it parses, which is the only place the distinction is visible:
         # ffprobe reports an open-GOP recovery point as `key_frame=1` and
         # `pict_type=I`, exactly as it reports a real IDR.
+        seek = ["-ss", f"{start:g}"] if start > 0 else []
         try:
             traced = subprocess.run(
                 [
-                    "ffmpeg", "-v", "trace", "-t", f"{_COPY_PROBE_SECONDS:g}",
-                    "-i", input_url, "-map", "0:v:0", "-c", "copy",
+                    "ffmpeg", "-v", "trace", *seek, "-t", f"{length:g}",
+                    "-i", input_url, "-map", f"0:{_PRIMARY_VIDEO_STREAM}", "-c", "copy",
                     "-bsf:v", "trace_headers", "-f", "null", "-",
                 ],
                 capture_output=True, text=True, errors="replace", timeout=600,
             )
         except subprocess.SubprocessError as exc:
-            return f"the keyframe probe failed ({exc})"
+            # Calls subprocess.run directly, so a timeout here still quotes the URL.
+            return f"the keyframe probe failed ({redact_presigned_urls(str(exc))})"
         if traced.returncode != 0:
             return f"the keyframe probe failed (ffmpeg exited {traced.returncode})"
 
-        idr_units = recovery_points = 0
+        # Only the lines trace_headers itself emitted. `avformat_find_stream_info`
+        # decodes a little to identify the stream and logs its own
+        # `nal_unit_type: 5(IDR)` from an `[h264 @ ...]` context before
+        # trace_headers runs, so counting every occurrence came out exactly one
+        # high and the backstop below tolerated one sync sample that was not an
+        # IDR (#377). Measured: a closed-GOP file with 15 sync samples prints 15
+        # trace_headers lines and 1 h264 line.
+        idr_units = recovery_points = traced_lines = 0
         for line in traced.stderr.splitlines():
+            if "[trace_headers @" not in line:
+                continue
+            traced_lines += 1
             if "nal_unit_type: 5(IDR)" in line:
                 idr_units += 1
             elif "recovery_frame_cnt" in line:
                 recovery_points += 1
 
+        # If trace_headers said nothing at all, the parse this gate rests on did
+        # not happen, whatever the exit code says. Refusing is the safe
+        # direction and turns any future change in ffmpeg's log spelling into an
+        # encode rather than into an unseekable asset (#381).
+        if not traced_lines:
+            return f"the keyframe probe produced no trace output{where}"
+
         if recovery_points:
             return (
-                f"{recovery_points} recovery point(s) in the first "
-                f"{_COPY_PROBE_SECONDS:g}s: this is an open-GOP master, and a segment "
-                "starting at one is not seekable"
+                f"{recovery_points} recovery point(s) in {length:g}s{where}: this is an "
+                "open-GOP master, and a segment starting at one is not seekable"
             )
         if idr_units < len(keyframe_times):
             return (
-                f"{idr_units} IDR(s) against {len(keyframe_times)} sync samples: not "
+                f"{idr_units} IDR(s) against {len(keyframe_times)} sync samples{where}: not "
                 "every random-access point is one a player can start at"
             )
         return None
@@ -746,7 +1826,7 @@ class FFmpegTranscoder(BaseTranscoder):
             content_type, cache_control = self._get_content_type(path.name)
             self.s3.upload_file(
                 str(path), self.bucket, s3_key,
-                ExtraArgs={"ContentType": content_type, "CacheControl": cache_control},
+                ExtraArgs=self._extra_args(content_type, cache_control),
             )
             return s3_key
 
@@ -818,7 +1898,7 @@ class FFmpegTranscoder(BaseTranscoder):
             )
             self.s3.upload_file(
                 str(mp4_path), self.bucket, key,
-                ExtraArgs={"ContentType": "video/mp4", "CacheControl": "max-age=86400"},
+                ExtraArgs=self._extra_args("video/mp4", "max-age=86400"),
             )
         except Exception as exc:  # noqa: BLE001 - never fail a good ladder over this
             print(
@@ -833,7 +1913,8 @@ class FFmpegTranscoder(BaseTranscoder):
         input_url = self._get_presigned_url(s3_key)
         cmd = [
             "ffprobe", "-v", "error", "-print_format", "json",
-            "-show_streams", "-select_streams", "v:0", "-show_format", input_url,
+            "-show_streams", "-select_streams", _PRIMARY_VIDEO_STREAM,
+            "-show_format", input_url,
         ]
         stdout = self._run(cmd, timeout=120, label="ffprobe")
         meta = parse_probe_metadata(json.loads(stdout))
@@ -847,8 +1928,8 @@ class FFmpegTranscoder(BaseTranscoder):
         thumb_dir = tempfile.mkdtemp()
         try:
             cmd = [
-                "ffmpeg", "-i", input_url,
-                "-vf", "fps=0.1,format=yuvj420p",
+                "ffmpeg", "-i", input_url, "-map", f"0:{_PRIMARY_VIDEO_STREAM}",
+                "-vf", f"fps=0.1,{_THUMB_GEOMETRY},format=yuvj420p",
                 "-q:v", "2",
                 f"{thumb_dir}/thumb_%04d.jpg",
             ]
@@ -880,7 +1961,8 @@ class FFmpegTranscoder(BaseTranscoder):
             # _run() already fail-fasts on non-zero exit.
             cmd = [
                 "ffprobe", "-v", "error", "-print_format", "json",
-                "-show_streams", "-select_streams", "v:0", "-show_format", input_url,
+                "-show_streams", "-select_streams", _PRIMARY_VIDEO_STREAM,
+                "-show_format", input_url,
             ]
             vid_info = self._run(cmd, timeout=120, label="ffprobe")
             vid_data = json.loads(vid_info)
@@ -888,7 +1970,7 @@ class FFmpegTranscoder(BaseTranscoder):
             if meta is None:
                 # No video stream. Every rung of the ladder would be filtered
                 # out, the "never emit an empty ladder" fallback would re-add
-                # one anyway, and ffmpeg would die on `[v:0] matches no
+                # one anyway, and ffmpeg would die on `[0:V:0] matches no
                 # streams` -- an error that says nothing about the real cause.
                 # Report it as its own outcome so the caller can decide; an
                 # audio-only file in a video container is a normal upload, not
@@ -910,6 +1992,9 @@ class FFmpegTranscoder(BaseTranscoder):
             # ordinary HDR path and retain hardware decode/scale/encode.
             dv_software = dovi_profile == 5
             tone_map = (is_hdr and hdr_mode == "convert") or dv_software
+            # A display matrix, which ffmpeg applies to system-memory frames
+            # only; see _MEMORY_DECODE_HWACCEL.
+            turned = is_display_transformed(_vid_stream)
 
             # 2. Check if input has an audio stream
             audio_cmd = [
@@ -937,9 +2022,12 @@ class FFmpegTranscoder(BaseTranscoder):
             source_height = (meta.height if meta else 0) or 0
             source_width = (meta.width if meta else 0) or 0
 
-            qualities = [q for q in requested if rung_height(q) <= source_height]
+            # A rung is named for the short side, whichever way up the source
+            # is, and rotation does not change which side that is (#452).
+            qualities = [q for q in requested
+                         if rung_height(q) <= min(source_width, source_height)]
             # What each rung scales to. Its own nominal size, except for the one
-            # kept below.
+            # kept below; either is turned to the frame's shape by rung_box().
             scale_targets = {q: QUALITY_MAP[q][0] for q in requested}
             if not qualities and requested:
                 # Never emit an empty ladder: keep the smallest requested rung,
@@ -978,7 +2066,8 @@ class FFmpegTranscoder(BaseTranscoder):
             #     codec name alone,
             #   * SDR, since HDR and Dolby Vision are the cases the filter graph
             #     exists for,
-            #   * no display rotation, which a remux cannot carry, and
+            #   * no display rotation, which a remux cannot carry, nor one too
+            #     garbled to read, and
             #   * sync samples a player can start at, which costs a probe and so
             #     is asked last, only once everything free has passed.
             #
@@ -991,16 +2080,21 @@ class FFmpegTranscoder(BaseTranscoder):
                 source_copy_enabled()
                 and len(qualities) == 1
                 and rung_is_source_size(
-                    scale_targets[qualities[0]], source_width, source_height
+                    rung_box(scale_targets[qualities[0]], source_width, source_height),
+                    source_width, source_height,
                 )
                 and is_browser_safe(_vid_stream)
                 and not is_hdr
                 and dovi_profile is None
                 and not display_rotation(_vid_stream)
+                and not rotation_unreadable(_vid_stream)
             )
 
             if copy_source:
-                refusal = self._copy_keyframe_refusal(input_url)
+                refusal = self._copy_keyframe_refusal(
+                    input_url,
+                    duration_seconds=(meta.duration_seconds if meta else None),
+                )
                 if refusal:
                     copy_source = False
                     print(
@@ -1019,6 +2113,17 @@ class FFmpegTranscoder(BaseTranscoder):
 
             primary_backend = "copy" if copy_source else get_backend()
 
+            # Computed once rather than inside _build_ffmpeg_cmd, which runs a
+            # second time when a hardware attempt falls back to software: the
+            # plan does not depend on the backend, and reporting a shortfall
+            # twice for one job would read like two jobs. Computing it for a
+            # job that goes on to stream-copy is harmless -- a copy only happens
+            # when the ladder has resolved to a single rung, and a single rung
+            # is never short of threads.
+            cpu_plan = thread_plan(get_cpu_budget(), len(qualities))
+            # Read once for the same reason: a typo is reported once per job.
+            audio_bitrate = get_audio_bitrate() if has_audio else None
+
             hls_dir = work_dir / "hls"
             hls_dir.mkdir()
 
@@ -1036,14 +2141,17 @@ class FFmpegTranscoder(BaseTranscoder):
                 that, and the alternative would be re-encoding, which is the
                 thing being avoided.
                 """
-                cmd = ["ffmpeg", "-y", "-i", input_url, "-map", "0:v:0"]
+                cmd = [
+                    "ffmpeg", "-y", "-i", input_url,
+                    "-map", f"0:{_PRIMARY_VIDEO_STREAM}",
+                ]
                 if has_audio:
                     cmd += ["-map", "0:a:0"]
                 cmd += ["-c:v", "copy"]
                 if has_audio:
                     cmd += (
                         ["-c:a", "copy"] if audio_codec == "aac"
-                        else ["-c:a", "aac", "-b:a", "192k"]
+                        else ["-c:a", "aac", "-b:a", audio_bitrate or "192k"]
                     )
                 cmd += [
                     "-f", "hls",
@@ -1062,12 +2170,18 @@ class FFmpegTranscoder(BaseTranscoder):
                 ]
                 return cmd
 
-            def _build_ffmpeg_cmd(backend: str) -> list[str]:
+            def _build_ffmpeg_cmd(backend: str, gpu_decode: bool = True) -> list[str]:
                 """Build the full ffmpeg command for a given backend.
 
                 Kept as a closure so the whole graph (hwaccel, scale filter,
                 HDR prefix, encoders, colour tags) is rebuilt consistently when
                 a hardware attempt has to fall back to software.
+
+                `gpu_decode=False` on a hardware backend decodes on the CPU and
+                uploads the frames, so the scale and the encode stay on the GPU.
+                A GPU decode of a source with a display matrix also uploads: the
+                frames come off the GPU decoder into system memory, where ffmpeg
+                turns them upright (_MEMORY_DECODE_HWACCEL).
                 """
                 if backend == "copy":
                     return _build_copy_cmd()
@@ -1075,6 +2189,14 @@ class FFmpegTranscoder(BaseTranscoder):
                 # below), so force the CPU scale filter for it.
                 scale_filter = "scale" if dv_software else _BACKEND_SCALE.get(backend, "scale")
                 out_mode = _OUTPUT_MODES.get(get_output_mode(), _OUTPUT_MODES["h264_8"])
+                memory_decode = (
+                    gpu_decode and not dv_software and turned
+                    and backend in _MEMORY_DECODE_HWACCEL
+                )
+                cpu_upload = (
+                    None if dv_software or (gpu_decode and not memory_decode)
+                    else _CPU_DECODE_UPLOAD.get(backend)
+                )
 
 
                 # Build filter_complex: split then per-quality scale.
@@ -1095,7 +2217,7 @@ class FFmpegTranscoder(BaseTranscoder):
                     # the source's bt2020 primaries in frame metadata.  Normalize
                     # all three Rec.709 tags before the software encoder.
                     _lp += ",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
-                    hdr_prefix = f"[v:0]{_lp}[tcpu];"
+                    hdr_prefix = f"[0:{_PRIMARY_VIDEO_STREAM}]{_lp}[tcpu];"
                     src = "[tcpu]"
                 elif is_hdr:
                     # Normalize HDR to 10-bit p010, tone-map to Rec.709 SDR (or keep
@@ -1107,7 +2229,7 @@ class FFmpegTranscoder(BaseTranscoder):
                     # (no hwdownload/hwupload) -- this is what lets HDR decode work
                     # on CPU-only and ARM self-hosts with no GPU.
                     if backend == "cpu":
-                        hdr_prefix = "[v:0]format=p010"
+                        hdr_prefix = f"[0:{_PRIMARY_VIDEO_STREAM}]format=p010"
                         if tone_map:
                             hdr_prefix += (",zscale=t=linear:npl=100,format=gbrpf32le,"
                                            f"zscale=p=bt709,tonemap=tonemap={_HDR_TONEMAP_ALGO}:desat=0,"
@@ -1115,16 +2237,37 @@ class FFmpegTranscoder(BaseTranscoder):
                         hdr_prefix += "[tcpu];"
                         src = "[tcpu]"
                     else:
-                        hdr_prefix = "[v:0]hwdownload,format=p010"
+                        # A CPU-decoded frame is already in system memory, so
+                        # there is nothing to download; nor is one the GPU
+                        # decoder put there, which `copy` gives a positive pitch.
+                        hdr_prefix = f"[0:{_PRIMARY_VIDEO_STREAM}]"
+                        if memory_decode:
+                            hdr_prefix += "copy,format=p010"
+                        else:
+                            hdr_prefix += "format=p010" if cpu_upload else "hwdownload,format=p010"
                         if tone_map:
                             hdr_prefix += (",zscale=t=linear:npl=100,format=gbrpf32le,"
                                            f"zscale=p=bt709,tonemap=tonemap={_HDR_TONEMAP_ALGO}:desat=0,"
                                            f"zscale=t=bt709:m=bt709:r=tv,format=yuv420p10le")
                         hdr_prefix += f"[tcpu];[tcpu]hwupload{_HDR_UPLOAD.get(backend, '')}[t];"
                         src = "[t]"
+                elif memory_decode:
+                    # Already nv12 or p010 off the decoder; scale_cuda sets the
+                    # encoder's depth. See _MEMORY_DECODE_HWACCEL for the copy.
+                    hdr_prefix = (f"[0:{_PRIMARY_VIDEO_STREAM}]copy,"
+                                  f"{cpu_upload['filter']}[up];")
+                    src = "[up]"
+                elif cpu_upload:
+                    # Decoded on the CPU: convert to the encoder's depth there
+                    # (the GPU scalers take no 4:2:2, and nv12 halves the upload
+                    # for 8-bit output), then hand the frames to the device.
+                    fmt = "p010" if out_mode["ten_bit"] else "nv12"
+                    hdr_prefix = (f"[0:{_PRIMARY_VIDEO_STREAM}]format={fmt},"
+                                  f"{cpu_upload['filter']}[up];")
+                    src = "[up]"
                 else:
                     hdr_prefix = ""
-                    src = "[v:0]"
+                    src = f"[0:{_PRIMARY_VIDEO_STREAM}]"
                 # Scale-filter suffix: append 10-bit surface forcing when requested.
                 scale_extra = _BACKEND_SCALE_OPTS.get(backend, "")
                 _sf = _BACKEND_SCALE_FORMAT.get(backend, {}).get(
@@ -1135,55 +2278,114 @@ class FFmpegTranscoder(BaseTranscoder):
                     # or format option; the libplacebo prefix already set the target
                     # bit depth and the software encoder sets -pix_fmt itself.
                     scale_extra = ""
+                # Each box is turned to the frame the scaler is handed. ffmpeg
+                # autorotates a frame in system memory ahead of the graph, so a
+                # software decode, and whatever is uploaded -- a CPU decode, or
+                # a rotated source's GPU decode -- is scaled upright. Only
+                # hardware frames keep the stored size: NVENC and VAAPI decode
+                # no rotated source into those, and QSV, which does, is sized
+                # as stored.
+                hardware_frames = (
+                    not (cpu_upload or dv_software) and bool(_BACKEND_HWACCEL.get(backend))
+                )
+                seen = (source_width, source_height)
+                if not hardware_frames and round(display_rotation(_vid_stream)) % 180 == 90:
+                    seen = (source_height, source_width)
+                targets = {q: rung_box(scale_targets[q], *seen) for q in qualities}
+                if backend == "nvenc" and not dv_software:
+                    # NVENC has a minimum frame size; see nvenc_rung_target.
+                    encoder = "hevc_nvenc" if out_mode["family"] == "hevc" else "h264_nvenc"
+                    targets = {q: nvenc_rung_target(targets[q], *seen, encoder)
+                               for q in qualities}
                 filter_complex = f"{hdr_prefix}{src}split={len(qualities)}{split_outputs};"
                 filter_complex += ";".join(
-                    f"[v{i}]{scale_filter}={scale_targets[q]}:force_original_aspect_ratio=decrease:force_divisible_by=2{scale_extra}[{q}]"
+                    f"[v{i}]{scale_filter}={targets[q]}:force_original_aspect_ratio=decrease:force_divisible_by=2{scale_extra}[{q}]"
                     for i, q in enumerate(qualities)
                 )
 
                 ffmpeg_cmd = ["ffmpeg", "-y"]
-                if not dv_software:
+                if memory_decode:
+                    ffmpeg_cmd += _MEMORY_DECODE_HWACCEL[backend]
+                elif cpu_upload:
+                    ffmpeg_cmd += cpu_upload["args"]
+                elif not dv_software:
                     ffmpeg_cmd += _BACKEND_HWACCEL.get(backend, [])
                 ffmpeg_cmd += ["-i", input_url]
                 ffmpeg_cmd += ["-filter_complex", filter_complex]
+                if cpu_plan is not None:
+                    ffmpeg_cmd += ["-filter_complex_threads", str(cpu_plan[1])]
 
                 # Per-backend encoder selection driven by TRANSCODER_OUTPUT.
                 family = out_mode["family"]      # "hevc" or "h264"
                 ten_bit = out_mode["ten_bit"]    # True=10-bit, False=8-bit
+                # Every output option emitted in here has to carry `:v:{i}`.
+                # Without a stream specifier ffmpeg applies the LAST copy to
+                # every video stream, so an option computed per rung silently
+                # collapses to the smallest rung's value: the ladder runs
+                # largest first, and `-crf` 24/26/30 made all three renditions
+                # CRF 30. Measured on a 6s 1080p source, the top rung came out
+                # at 1776 KB against 4264 KB qualified, and the bottom rung was
+                # byte-identical because it is the one that won (#393).
+                #
+                # ffmpeg warns for `-pix_fmt` and `-force_key_frames` and says
+                # nothing for `-crf`, `-qp` or `-global_quality`, so a clean log
+                # is not evidence. `-preset`, `-rc`, `-look_ahead` and
+                # `-profile:v` keep no stream index deliberately: they carry the
+                # same value on every rung, so the collapse is a no-op. Give any
+                # of them a per-rung value and it needs the index too.
                 for i, quality in enumerate(qualities):
                     _, crf = QUALITY_MAP[quality]
                     ffmpeg_cmd += ["-map", f"[{quality}]"]
                     if has_audio:
                         ffmpeg_cmd += ["-map", "a:0"]
+                        if audio_bitrate:
+                            # Indexed per audio stream for the reason above.
+                            ffmpeg_cmd += [f"-c:a:{i}", "aac", f"-b:a:{i}", audio_bitrate]
                     if backend == "cpu" or dv_software:
                         enc = "libx265" if family == "hevc" else "libx264"
                         ffmpeg_cmd += [f"-c:v:{i}", enc, "-preset", "fast",
-                                       "-force_key_frames", "expr:gte(t,n_forced*2)"]
+                                       f"-force_key_frames:v:{i}", "expr:gte(t,n_forced*2)"]
                         if ten_bit:
-                            ffmpeg_cmd += ["-pix_fmt", "yuv420p10le", "-crf", str(crf - 4)]
+                            ffmpeg_cmd += [f"-pix_fmt:v:{i}", "yuv420p10le",
+                                           f"-crf:v:{i}", str(crf - 4)]
                         else:
-                            ffmpeg_cmd += ["-pix_fmt", "yuv420p", "-crf", str(crf + 4)]
+                            ffmpeg_cmd += [f"-pix_fmt:v:{i}", "yuv420p",
+                                           f"-crf:v:{i}", str(crf + 4)]
+                        if cpu_plan is not None:
+                            # Software encoders only. The hardware ones do their
+                            # work on the device and take their thread counts
+                            # from the driver, so a count here would either be
+                            # ignored or throttle the one part that is not the
+                            # bottleneck. On a hardware backend the CPU work
+                            # that remains is decode and the filter graph;
+                            # -filter_complex_threads above covers the graph,
+                            # and decode is not covered on any backend -- there
+                            # is deliberately no global -threads here, because
+                            # before -i it would reach only the decoder and
+                            # leave every encoder unbounded.
+                            ffmpeg_cmd += [f"-threads:v:{i}", str(cpu_plan[0][i])]
                     elif backend == "nvenc":
                         enc = "hevc_nvenc" if family == "hevc" else "h264_nvenc"
                         cq = _NVENC_CQ.get(get_output_mode(), 26)
                         ffmpeg_cmd += [f"-c:v:{i}", enc, "-preset", "p6", "-rc", "constqp",
-                                       "-qp", str(cq), "-force_key_frames", "expr:gte(t,n_forced*2)"]
+                                       f"-qp:v:{i}", str(cq),
+                                       f"-force_key_frames:v:{i}", "expr:gte(t,n_forced*2)"]
                         if family == "hevc":
                             ffmpeg_cmd += ["-profile:v", "main10" if ten_bit else "main"]
                         else:
                             ffmpeg_cmd += ["-profile:v", "high"]
                     elif backend == "qsv":
                         enc = "hevc_qsv" if family == "hevc" else "h264_qsv"
-                        ffmpeg_cmd += [f"-c:v:{i}", enc, "-global_quality", str(crf),
+                        ffmpeg_cmd += [f"-c:v:{i}", enc, f"-global_quality:v:{i}", str(crf),
                                        "-look_ahead", "1",
-                                       "-force_key_frames", "expr:gte(t,n_forced*2)"]
+                                       f"-force_key_frames:v:{i}", "expr:gte(t,n_forced*2)"]
                     elif backend == "vaapi":
                         enc = "hevc_vaapi" if family == "hevc" else "h264_vaapi"
-                        ffmpeg_cmd += [f"-c:v:{i}", enc, "-global_quality", str(crf),
-                                       "-force_key_frames", "expr:gte(t,n_forced*2)"]
+                        ffmpeg_cmd += [f"-c:v:{i}", enc, f"-global_quality:v:{i}", str(crf),
+                                       f"-force_key_frames:v:{i}", "expr:gte(t,n_forced*2)"]
                         if family == "hevc":
                             ffmpeg_cmd += ["-profile:v", "main10" if ten_bit else "main"]
-                        ffmpeg_cmd += ["-pix_fmt", "p010" if ten_bit else "nv12"]
+                        ffmpeg_cmd += [f"-pix_fmt:v:{i}", "p010" if ten_bit else "nv12"]
 
                 # Colour tags: tone-mapped SDR -> Rec.709; preserved HDR -> pass
                 # through the source's HDR tags; plain SDR -> no override.
@@ -1233,6 +2435,12 @@ class FFmpegTranscoder(BaseTranscoder):
                 # Timeout scales with expected duration - 4 hours for very large files
                 return ffmpeg_cmd
 
+            # What the ladder will be held against. The video track's length,
+            # never the file's -- see refuse_a_truncated_result -- and None
+            # wherever the container does not state it, which leaves the check
+            # inert rather than guessing.
+            source_video_seconds = meta.video_duration_seconds
+
             # Try hardware first, then degrade to the software pipeline if the
             # device is unusable at runtime (most commonly another process on the
             # box has exhausted VRAM, so CUDA decode init fails with
@@ -1246,15 +2454,53 @@ class FFmpegTranscoder(BaseTranscoder):
             # remux drops to the encoder rather than failing the asset, and
             # unlike the hardware case any error is reason enough: a remux has
             # no environmental failures to tell apart from input ones.
-            attempts = [primary_backend]
-            if primary_backend == "copy":
-                attempts.append(get_backend())
-            if attempts[-1] not in ("cpu", "copy") and not dv_software:
-                attempts.append("cpu")
+            #
+            # Between the two, a hardware backend that can take uploaded frames
+            # has a middle tier: decode on the CPU and keep the scale and the
+            # encode on the GPU. A source the GPU cannot decode (ProRes, 4:2:2,
+            # 10-bit H.264) starts there; one predicted to decode that turns out
+            # not to reaches it through _is_gpu_decode_failure. See
+            # _plan_attempts for the ladder. Like a remux, that tier drops to
+            # software on any error: the source decoding there is the one the
+            # software pipeline decodes too, so what fails is the upload, the
+            # GPU scaler or the encoder, and no marker list covers them all.
+            # A truly corrupt file then fails once more in software. An encoder
+            # NVENC will not open skips the CPU-decode tier altogether, since it
+            # would be handed the same frame (_NVENC_ENCODER_REFUSALS).
+            encode_backend = get_backend() if primary_backend == "copy" else primary_backend
+            attempts = _plan_attempts(primary_backend, encode_backend, _vid_stream, dv_software)
+            if encode_backend in _CPU_DECODE_UPLOAD and not dv_software \
+                    and not _gpu_can_decode(encode_backend, _vid_stream):
+                print(
+                    f"[transcoder] {encode_backend} cannot decode "
+                    f"{_vid_stream.get('codec_name')}/{_vid_stream.get('pix_fmt')}; "
+                    f"decoding on the CPU and encoding on {encode_backend} "
+                    f"for {job.input_s3_key}",
+                    flush=True,
+                )
+            elif encode_backend in _CPU_DECODE_UPLOAD and not dv_software and turned:
+                how = ("decoding into system memory" if encode_backend in _MEMORY_DECODE_HWACCEL
+                       else "decoding on the CPU")
+                rotation = ("unreadable rotation" if rotation_unreadable(_vid_stream)
+                            else f"rotation {display_rotation(_vid_stream):g}")
+                print(
+                    f"[transcoder] {job.input_s3_key} has a display matrix "
+                    f"({rotation}); {how} so ffmpeg "
+                    f"turns it upright, encoding on {encode_backend}",
+                    flush=True,
+                )
+
+            def _describe(attempt: tuple[str, bool]) -> str:
+                name, gpu_decode = attempt
+                if name in _CPU_DECODE_UPLOAD and not dv_software:
+                    return f"'{name}' ({'GPU' if gpu_decode else 'CPU'} decode)"
+                return f"'{name}'"
 
             backend = primary_backend
-            for attempt_index, attempt_backend in enumerate(attempts):
-                ffmpeg_cmd = _build_ffmpeg_cmd(attempt_backend)
+            attempt_index = 0
+            while attempt_index < len(attempts):
+                attempt_backend, gpu_decode = attempts[attempt_index]
+                ffmpeg_cmd = _build_ffmpeg_cmd(attempt_backend, gpu_decode)
                 try:
                     if job.progress_cb:
                         self._run_with_progress(
@@ -1266,13 +2512,49 @@ class FFmpegTranscoder(BaseTranscoder):
                         )
                     else:
                         self._run(ffmpeg_cmd, timeout=14400, label="ffmpeg")
+                    # Exit 0 is not the same as "wrote the whole source" -- see
+                    # refuse_a_truncated_result. Checked before the backend is
+                    # accepted, so a short ladder is not uploaded while there is
+                    # still an attempt left to read the source again.
+                    refuse_a_truncated_result(
+                        hls_dir,
+                        source_video_seconds,
+                        label=f"ffmpeg ({attempt_backend})",
+                        final_attempt=job.final_attempt,
+                    )
                     backend = attempt_backend
                     break
+                except TranscodeTruncated:
+                    # Deliberately not absorbed by the fallbacks below. The
+                    # useful move is to read the source again: the task retries
+                    # in a minute, and the next read is a fresh connection to an
+                    # object the store has certainly finished assembling.
+                    # Degrading to the encoder would re-read the same bytes and,
+                    # for a source that really is short, cost hours to come out
+                    # short again. Not always identically: a remux drops the
+                    # packets ahead of the first keyframe and an encode does
+                    # not, so a source that opens on non-keyframes can be
+                    # refused here when the encoder would have matched. That
+                    # costs the remux retries, and the final attempt then
+                    # stores the remux's ladder.
+                    raise
                 except RuntimeError as exc:
                     is_last = attempt_index == len(attempts) - 1
                     remux = attempt_backend == "copy"
-                    if is_last or not (remux or _is_hw_runtime_failure(str(exc))):
+                    cpu_decode_tier = (attempt_backend in _CPU_DECODE_UPLOAD
+                                       and not gpu_decode and not dv_software)
+                    recognised = _is_hw_runtime_failure(str(exc))
+                    if is_last or not (remux or cpu_decode_tier or recognised):
                         raise
+                    next_index = attempt_index + 1
+                    if (attempt_backend in _CPU_DECODE_UPLOAD and gpu_decode
+                            and not _is_gpu_decode_failure(str(exc))):
+                        # The device itself is in trouble, not its decoder, and
+                        # the CPU-decode tier would hit it too: go to software.
+                        next_index = next(
+                            i for i in range(next_index, len(attempts))
+                            if attempts[i][0] == "cpu"
+                        )
                     if remux:
                         print(
                             f"[transcoder] remuxing {job.input_s3_key} failed; encoding "
@@ -1280,12 +2562,22 @@ class FFmpegTranscoder(BaseTranscoder):
                             flush=True,
                         )
                     else:
+                        # _failure_detail redacts the presigned URL, a working
+                        # credential until it expires, though _run already
+                        # strips it from what it raises.
+                        detail = _failure_detail(str(exc))
+                        reason = (_hw_failure_reason(str(exc)) if recognised
+                                  else "unrecognised failure on the CPU-decode attempt")
+                        nxt = attempts[next_index]
                         print(
-                            f"[transcoder] backend '{attempt_backend}' failed at runtime "
-                            f"({_hw_failure_reason(str(exc))}); retrying on the software "
-                            f"pipeline for {job.input_s3_key}",
+                            f"[transcoder] backend {_describe(attempts[attempt_index])} "
+                            f"failed at runtime ({reason}); retrying "
+                            + ("on the software pipeline" if nxt[0] == "cpu"
+                               else f"with {_describe(nxt)}")
+                            + f" for {job.input_s3_key}: {detail}",
                             flush=True,
                         )
+                    attempt_index = next_index
                     # Discard any partial HLS output before retrying.
                     shutil.rmtree(hls_dir, ignore_errors=True)
                     hls_dir.mkdir(exist_ok=True)
@@ -1308,21 +2600,7 @@ class FFmpegTranscoder(BaseTranscoder):
 
             # 6. Generate and upload thumbnail (using streaming URL)
             thumb_path = work_dir / "thumb_0001.jpg"
-            thumb_vf = "thumbnail"
-            if dv_software:
-                thumb_vf += ",libplacebo=tonemapping=bt.2446a:colorspace=bt709:color_trc=bt709:range=tv,format=yuvj420p"
-            elif is_hdr:
-                # Match the HLS path's full zscale->tonemap->zscale chain so the
-                # thumbnail converts BOTH the HDR transfer (PQ/HLG->linear->bt709)
-                # AND the wide gamut (bt2020->bt709 primaries). The older short
-                # form (tonemap=mobius only) tone-mapped the curve but left
-                # bt2020 primaries, producing a washed-out "log on Rec709" look.
-                thumb_vf += (
-                    ",format=p010,zscale=t=linear:npl=100,format=gbrpf32le,"
-                    "zscale=p=bt709,tonemap=tonemap=" + _HDR_TONEMAP_ALGO + ":desat=0,"
-                    "zscale=t=bt709:m=bt709:r=tv"
-                )
-            thumb_vf += ",format=yuvj420p"
+            thumb_vf = _thumbnail_filter(is_hdr, dv_software)
             thumb_cmd = [
                 "ffmpeg", "-y", "-i", input_url,
                 "-vf", thumb_vf, "-q:v", "2", "-frames:v", "1",
@@ -1334,7 +2612,7 @@ class FFmpegTranscoder(BaseTranscoder):
             if thumb_path.exists():
                 self.s3.upload_file(
                     str(thumb_path), self.bucket, thumbnail_key,
-                    ExtraArgs={"ContentType": "image/jpeg", "CacheControl": "max-age=86400"},
+                    ExtraArgs=self._extra_args("image/jpeg", "max-age=86400"),
                 )
                 uploaded_thumb = True
 
@@ -1350,7 +2628,9 @@ class FFmpegTranscoder(BaseTranscoder):
             )
 
         except Exception as e:
-            return TranscodeResult(success=False, error=str(e))
+            # The runners already scrub what they raise; this catches anything
+            # else on its way to the SSE event and the logs.
+            return TranscodeResult(success=False, error=redact_presigned_urls(str(e)))
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
