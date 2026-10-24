@@ -433,6 +433,66 @@ describe('CompareOverlay version-switch offset reset (#182)', () => {
     expect(useReviewStore.getState().currentVersion?.id).toBe('v-2')
   })
 
+  // The right pane lives in the store, which a reload does not keep, so the URL
+  // has to name it too or a reloaded compare comes back on the newest version (#299).
+  it('switching the right version writes it to the URL in the same write that clears the offsets', () => {
+    searchParamsString = 'compare=v-1&right=v-3&offA=1.5&offB=-0.5&offFor=v-1:v-3'
+    render(
+      <CompareOverlay
+        asset={videoAsset}
+        versions={[makeVersion(1), makeVersion(2), makeVersion(3)]}
+        rightVersion={makeVersion(3)}
+        onClose={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(within(screen.getByTestId('compare-select-b')).getByRole('button'))
+    fireEvent.click(screen.getByRole('option', { name: /^v2$/ }))
+
+    expect(replace).toHaveBeenCalledTimes(1)
+    const url = new URL(replace.mock.calls[0][0], 'http://x')
+    expect(url.searchParams.get('compare')).toBe('v-1')
+    expect(url.searchParams.get('right')).toBe('v-2')
+    expect(['offA', 'offB', 'offFor'].map((k) => url.searchParams.get(k))).toEqual([null, null, null])
+  })
+
+  it('switching the left version names the right pane too, so a link without it becomes complete', () => {
+    searchParamsString = 'compare=v-1'
+    render(
+      <CompareOverlay
+        asset={videoAsset}
+        versions={[makeVersion(1), makeVersion(2), makeVersion(3)]}
+        rightVersion={makeVersion(3)}
+        onClose={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(within(screen.getByTestId('compare-select-a')).getByRole('button'))
+    fireEvent.click(screen.getByRole('option', { name: /^v2$/ }))
+
+    const url = new URL(replace.mock.calls.at(-1)?.[0], 'http://x')
+    expect(url.searchParams.get('compare')).toBe('v-2')
+    expect(url.searchParams.get('right')).toBe('v-3')
+  })
+
+  it('calibrating an offset names the right pane next to the pair tag', () => {
+    searchParamsString = 'compare=v-1'
+    render(
+      <CompareOverlay
+        asset={videoAsset}
+        versions={[makeVersion(1), makeVersion(2), makeVersion(3)]}
+        rightVersion={makeVersion(3)}
+        onClose={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(screen.getByTestId('offB-plus-second'))
+
+    const url = new URL(replace.mock.calls.at(-1)?.[0], 'http://x')
+    expect(url.searchParams.get('offFor')).toBe('v-1:v-3')
+    expect(url.searchParams.get('right')).toBe('v-3')
+  })
+
   it('re-picking the version already shown leaves calibrated offsets alone', () => {
     // Reopening the dropdown and clicking the current version is not a switch.
     // The compared pair is unchanged, so offsets calibrated for it are still
@@ -648,6 +708,76 @@ describe('CompareOverlay never renders a version with another pair\'s offset', (
     act(() => { vi.runAllTimers() })
     expect(transportCalls.at(-1)?.timingA.offset).toBe(0)
     expect(transportCalls.at(-1)?.timingB.offset).toBeGreaterThan(0)
+  })
+})
+
+describe('CompareOverlay restores ?right= on mount (#299)', () => {
+  // ReviewProvider reads ?right= only when it mounts. A soft navigation to a
+  // compare URL on an already-open review page keeps the provider mounted, so
+  // the store still holds whatever version was shown before; the overlay has to
+  // restore the URL's right pane itself.
+  function Page({ versions = [makeVersion(1), makeVersion(2), makeVersion(3)] }: { versions?: never[] }) {
+    const current = useReviewStore((s) => s.currentVersion)
+    return <CompareOverlay asset={videoAsset} versions={versions} rightVersion={current ?? makeVersion(3)} onClose={vi.fn()} />
+  }
+  beforeEach(() => {
+    streamPerVersion = true
+    useReviewStore.getState().setCurrentVersion(makeVersion(3))
+  })
+
+  it('switches the store to the ready version ?right= names, without a URL write', () => {
+    searchParamsString = 'compare=v-1&right=v-2'
+    render(<Page />)
+
+    expect(useReviewStore.getState().currentVersion?.id).toBe('v-2')
+    expect(transportCalls.at(-1)).toMatchObject({ urlA: 'stream:v-1', urlB: 'stream:v-2' })
+    expect(replace).not.toHaveBeenCalled()
+  })
+
+  it('leaves the store alone and does not write when ?right= already names the shown version', () => {
+    searchParamsString = 'compare=v-1&right=v-3'
+    render(<Page />)
+
+    expect(useReviewStore.getState().currentVersion?.id).toBe('v-3')
+    expect(replace).not.toHaveBeenCalled()
+  })
+
+  it('does not write when the URL has no ?right=', () => {
+    searchParamsString = 'compare=v-1'
+    render(<Page />)
+
+    expect(useReviewStore.getState().currentVersion?.id).toBe('v-3')
+    expect(replace).not.toHaveBeenCalled()
+  })
+
+  it('an unknown ?right= is replaced, in one write, by the version actually shown', () => {
+    searchParamsString = 'compare=v-1&right=v-9&mode=sbs&commentId=c1'
+    render(<Page />)
+
+    expect(useReviewStore.getState().currentVersion?.id).toBe('v-3')
+    expect(replace).toHaveBeenCalledTimes(1)
+    const url = new URL(replace.mock.calls[0][0], 'http://x')
+    expect(url.searchParams.get('right')).toBe('v-3')
+    expect(url.searchParams.get('compare')).toBe('v-1')
+    expect(url.searchParams.get('mode')).toBe('sbs')
+    expect(url.searchParams.get('commentId')).toBe('c1')
+  })
+
+  it('a ?right= naming a version that is not ready is replaced by the version actually shown', () => {
+    searchParamsString = 'compare=v-1&right=v-2'
+    render(<Page versions={[makeVersion(1), makeVersion(2, 'processing'), makeVersion(3)]} />)
+
+    expect(useReviewStore.getState().currentVersion?.id).toBe('v-3')
+    expect(replace).toHaveBeenCalledTimes(1)
+    expect(new URL(replace.mock.calls[0][0], 'http://x').searchParams.get('right')).toBe('v-3')
+  })
+
+  it('legacy offsets belong to the pair the URL names, not to the store version shown before the restore', () => {
+    searchParamsString = 'compare=v-1&right=v-2&offA=1.5&offB=2'
+    render(<Page />)
+
+    expect(transportCalls.filter((c) => c.urlB === 'stream:v-3' && (c.timingA.offset !== 0 || c.timingB.offset !== 0))).toEqual([])
+    expect(transportCalls.at(-1)).toMatchObject({ urlB: 'stream:v-2', timingA: { offset: 1.5 }, timingB: { offset: 2 } })
   })
 })
 
