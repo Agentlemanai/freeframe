@@ -6,6 +6,7 @@ import { api } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
 import { safeInternalPath } from '@/lib/safe-redirect'
 import { LoginForm } from '@/components/auth/login-form'
+import { SsoButton } from '@/components/auth/sso-button'
 import { PoweredByBadge } from '@/components/shared/powered-by-badge'
 import type { SetupStatus } from '@/types'
 
@@ -39,6 +40,7 @@ export default function LoginPage() {
   return (
     <>
       {/* The branded logo + org name live in the (auth) layout, so every auth screen gets them */}
+      <SsoButton />
       <LoginForm />
 
       {/* Powered by FreeFrame */}

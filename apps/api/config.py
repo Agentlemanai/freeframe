@@ -78,6 +78,30 @@ class Settings(BaseSettings):
     # frontend + localhost defaults). Set to "*" to allow any origin — handy for
     # testing on a LAN via a machine's IP; do not use "*" in production.
     cors_allow_origins: str = ""
+
+    # Single sign-on through any OpenID Connect provider (Authentik, Keycloak,
+    # Entra ID, Google, ...). Off unless OIDC_ENABLED=true and the issuer,
+    # client id and secret are set. The provider must allow the redirect URI
+    # OIDC_REDIRECT_URI, which defaults to FRONTEND_URL + /api/auth/oidc/callback
+    # (the production compose serves the API under /api on the frontend host).
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""  # e.g. https://auth.example.com/application/o/freeframe/
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_redirect_uri: str = ""
+    oidc_scopes: str = "openid email profile"
+    oidc_button_label: str = "Sign in with SSO"
+    # Create a FreeFrame account on first SSO sign-in. Off: only people who
+    # already have an account (or a pending invite) can sign in with SSO. A new
+    # account sees nothing until it is added to a project.
+    oidc_auto_create_users: bool = False
+    # Comma-separated group names read from OIDC_GROUPS_CLAIM. Allowed: if set,
+    # only members of one of these groups may sign in. Admin: members are made
+    # instance admins on sign-in (never demoted automatically).
+    oidc_groups_claim: str = "groups"
+    oidc_allowed_groups: str = ""
+    oidc_admin_groups: str = ""
+
     transcoder_engine: str = "ffmpeg"
     # Which rungs of the quality ladder to build, comma-separated. Valid names
     # are the keys of packages.transcoder.ffmpeg_transcoder.QUALITY_MAP; the
@@ -232,6 +256,23 @@ class Settings(BaseSettings):
         if not parsed.scheme or not parsed.netloc:
             return raw
         return f"{parsed.scheme}://{parsed.netloc}"
+
+    @property
+    def oidc_configured(self) -> bool:
+        """SSO is on and has everything it needs to run."""
+        return bool(
+            self.oidc_enabled
+            and self.oidc_issuer.strip()
+            and self.oidc_client_id.strip()
+            and self.oidc_client_secret.strip()
+        )
+
+    @property
+    def oidc_callback_url(self) -> str:
+        explicit = self.oidc_redirect_uri.strip()
+        if explicit:
+            return explicit
+        return f"{(self.frontend_url or '').rstrip('/')}/api/auth/oidc/callback"
 
     @property
     def cors_allows_any_origin(self) -> bool:
