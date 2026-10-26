@@ -336,6 +336,13 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `CORS_ALLOW_ORIGINS` | Extra browser origins, comma-separated, allowed by the API and (non-AWS) the bucket | (empty) |
 | `JWT_SECRET` | Auth token signing key | (required, generate with `openssl rand -hex 64`) |
 | `FRONTEND_URL` | Your FreeFrame URL (with https://) | (required) |
+| `OIDC_ENABLED` | Show a single sign-on button on the login page (needs the three settings below) | `false` |
+| `OIDC_ISSUER` | Your OpenID Connect provider's issuer URL (its `/.well-known/openid-configuration` must be reachable from the API) | (empty) |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | The confidential client registered at the provider | (empty) |
+| `OIDC_REDIRECT_URI` | Callback to register at the provider | `FRONTEND_URL` + `/api/auth/oidc/callback` |
+| `OIDC_BUTTON_LABEL` | Text on the SSO button | `Sign in with SSO` |
+| `OIDC_AUTO_CREATE_USERS` | Create an account on first SSO sign-in (it sees nothing until added to a project); otherwise only existing accounts and pending invites can use SSO | `false` |
+| `OIDC_ALLOWED_GROUPS` / `OIDC_ADMIN_GROUPS` | Comma-separated groups (from the `OIDC_GROUPS_CLAIM` claim, default `groups`): only these may sign in / these become instance admins (never demoted automatically) | (empty) |
 | `DOMAIN` | Your domain for auto SSL | (optional) |
 | `ACME_EMAIL` | Email for Let's Encrypt notifications | (optional) |
 | `MAIL_PROVIDER` | `smtp` or `ses` | `smtp` |
