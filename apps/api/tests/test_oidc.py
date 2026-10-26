@@ -287,3 +287,37 @@ def test_provider_error_is_passed_on(client, oidc_on):
     state, _, _ = _start(client, oidc_on)
     resp = client.get("/auth/oidc/callback", params={"state": state, "error": "access_denied"}, follow_redirects=False)
     assert "sso_error=access_denied" in resp.headers["location"]
+
+
+def test_sso_sign_in_sets_project_permission_from_groups(client, oidc_on, monkeypatch):
+    from apps.api.config import settings
+    monkeypatch.setattr(settings, "oidc_project_creator_groups", "staff,freelancers")
+    state, stored, _ = _start(client, oidc_on)
+    client_user = _user()
+    client_user.can_create_projects = True
+    with patch("apps.api.routers.oidc.get_user_by_email", return_value=client_user):
+        _callback(client, state, {"id_token": _id_token(stored["nonce"], groups=["clients", "client-pragerkitti"])})
+    assert client_user.can_create_projects is False
+
+    state, stored, _ = _start(client, oidc_on)
+    crew = _user()
+    crew.can_create_projects = False
+    with patch("apps.api.routers.oidc.get_user_by_email", return_value=crew):
+        _callback(client, state, {"id_token": _id_token(stored["nonce"], groups=["freelancers"])})
+    assert crew.can_create_projects is True
+
+
+def test_new_sso_account_gets_project_permission_from_groups(client, oidc_on, mock_db, monkeypatch):
+    from apps.api.config import settings
+    monkeypatch.setattr(settings, "oidc_auto_create_users", True)
+    monkeypatch.setattr(settings, "oidc_project_creator_groups", "staff")
+    state, stored, _ = _start(client, oidc_on)
+
+    def _refresh(obj):
+        obj.id = uuid.uuid4()
+        obj.token_version = 1
+    mock_db.refresh.side_effect = _refresh
+    with patch("apps.api.routers.oidc.get_user_by_email", return_value=None), \
+         patch("apps.api.routers.oidc.get_email_owner", return_value=None):
+        _callback(client, state, {"id_token": _id_token(stored["nonce"])})
+    assert mock_db.add.call_args.args[0].can_create_projects is False

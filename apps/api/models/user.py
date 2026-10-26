@@ -26,6 +26,9 @@ class User(Base):
     password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[UserStatus] = mapped_column(Enum(UserStatus), default=UserStatus.active)
     is_superadmin: Mapped[bool] = mapped_column(default=False)
+    # Whether this user may create projects. Admins always may. On by default;
+    # SSO sign-in sets it from OIDC_PROJECT_CREATOR_GROUPS when that is configured.
+    can_create_projects: Mapped[bool] = mapped_column(default=True, server_default="true")
     email_verified: Mapped[bool] = mapped_column(default=False)
     invite_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     invite_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

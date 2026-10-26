@@ -343,6 +343,7 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `OIDC_BUTTON_LABEL` | Text on the SSO button | `Sign in with SSO` |
 | `OIDC_AUTO_CREATE_USERS` | Create an account on first SSO sign-in (it sees nothing until added to a project); otherwise only existing accounts and pending invites can use SSO | `false` |
 | `OIDC_ALLOWED_GROUPS` / `OIDC_ADMIN_GROUPS` | Comma-separated groups (from the `OIDC_GROUPS_CLAIM` claim, default `groups`): only these may sign in / these become instance admins (never demoted automatically) | (empty) |
+| `OIDC_PROJECT_CREATOR_GROUPS` | Comma-separated groups whose members may create projects; set on every SSO sign-in (admins always can). Empty leaves the permission on for everyone | (empty) |
 | `DOMAIN` | Your domain for auto SSL | (optional) |
 | `ACME_EMAIL` | Email for Let's Encrypt notifications | (optional) |
 | `MAIL_PROVIDER` | `smtp` or `ses` | `smtp` |

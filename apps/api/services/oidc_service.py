@@ -210,6 +210,15 @@ def is_admin(identity: OIDCIdentity) -> bool:
     return bool(admins) and bool(set(admins) & set(identity.groups))
 
 
+def project_creation_policy(identity: OIDCIdentity) -> Optional[bool]:
+    """Whether this person may create projects, or None when
+    OIDC_PROJECT_CREATOR_GROUPS is not set (the permission is then left alone)."""
+    creators = _csv(settings.oidc_project_creator_groups)
+    if not creators:
+        return None
+    return is_admin(identity) or bool(set(creators) & set(identity.groups))
+
+
 def reset_caches() -> None:
     """For tests and after a configuration change."""
     _discovery_cache.clear()
