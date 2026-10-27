@@ -40,6 +40,8 @@ def _require_project_owner(db: Session, project_id: uuid.UUID, user: User) -> Pr
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 def create_project(body: ProjectCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if not current_user.is_superadmin and current_user.can_create_projects is False:
+        raise HTTPException(status_code=403, detail="You don't have permission to create projects")
     project = Project(
         name=body.name,
         description=body.description,

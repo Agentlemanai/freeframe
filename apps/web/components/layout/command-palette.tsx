@@ -17,6 +17,8 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { useAuthStore } from "@/stores/auth-store";
+import { canCreateProjects } from "@/lib/project-permissions";
 import { Film, Music, Image as ImageIcon } from "lucide-react";
 import type { Project, AssetResponse } from "@/types";
 
@@ -37,6 +39,7 @@ interface CommandItem {
 
 export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const router = useRouter();
+  const mayCreateProjects = canCreateProjects(useAuthStore((s) => s.user));
   const [query, setQuery] = React.useState("");
 
   const [debouncedQuery, setDebouncedQuery] = React.useState("");
@@ -175,7 +178,9 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   }
 
   const navItems = staticItems.filter((i) => i.group === "navigation");
-  const actionItems = staticItems.filter((i) => i.group === "actions");
+  const actionItems = staticItems.filter(
+    (i) => i.group === "actions" && (i.id !== "new-project" || mayCreateProjects),
+  );
 
   const hasQuery = query.trim().length > 0;
 

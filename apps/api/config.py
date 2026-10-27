@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     oidc_groups_claim: str = "groups"
     oidc_allowed_groups: str = ""
     oidc_admin_groups: str = ""
+    # Comma-separated groups whose members may create projects. Empty: SSO
+    # leaves the permission alone (everyone keeps it, as without SSO). Set: it
+    # is recomputed on every SSO sign-in, so e.g. "staff,freelancers" keeps
+    # clients from creating projects. Admins can always create projects.
+    oidc_project_creator_groups: str = ""
 
     transcoder_engine: str = "ffmpeg"
     # Which rungs of the quality ladder to build, comma-separated. Valid names

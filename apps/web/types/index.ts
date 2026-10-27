@@ -51,6 +51,8 @@ export interface User {
   avatar_color: string | null;
   status: UserStatus;
   is_superadmin: boolean;
+  /** Absent on older servers, where everyone may create projects. */
+  can_create_projects?: boolean;
   email_verified: boolean;
   invite_token?: string | null;
   preferences: Record<string, unknown>;

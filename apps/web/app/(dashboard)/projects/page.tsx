@@ -25,6 +25,7 @@ import { ProjectsAppearancePopover } from "@/components/projects/projects-appear
 import { ProjectsSortPopover } from "@/components/projects/projects-sort-popover";
 import { EmptyState } from "@/components/shared/empty-state";
 import { useAuthStore } from "@/stores/auth-store";
+import { canCreateProjects } from "@/lib/project-permissions";
 import { useProjectsViewStore } from "@/stores/projects-view-store";
 import type { ViewLayout, CardSize } from "@/stores/view-store";
 import { sortProjects } from "@/lib/project-sort";
@@ -232,6 +233,7 @@ export default function ProjectsPage() {
   usePageTitle("Projects");
   const router = useRouter();
   const { user } = useAuthStore();
+  const mayCreate = canCreateProjects(user);
   const {
     layout: viewMode,
     cardSize,
@@ -351,12 +353,14 @@ export default function ProjectsPage() {
               if (!open) resetForm();
             }}
           >
-            <Dialog.Trigger asChild>
-              <Button size="sm">
-                <Plus className="h-4 w-4" />
-                New Project
-              </Button>
-            </Dialog.Trigger>
+            {mayCreate && (
+              <Dialog.Trigger asChild>
+                <Button size="sm">
+                  <Plus className="h-4 w-4" />
+                  New Project
+                </Button>
+              </Dialog.Trigger>
+            )}
 
             <Dialog.Portal>
               <Dialog.Overlay className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
@@ -458,11 +462,16 @@ export default function ProjectsPage() {
           <EmptyState
             icon={FolderOpen}
             title="No projects yet"
-            description="Create your first project to start organizing assets."
-            action={{
-              label: "New Project",
-              onClick: () => setDialogOpen(true),
-            }}
+            description={
+              mayCreate
+                ? "Create your first project to start organizing assets."
+                : "Projects you're added to will appear here."
+            }
+            action={
+              mayCreate
+                ? { label: "New Project", onClick: () => setDialogOpen(true) }
+                : undefined
+            }
           />
         </div>
       ) : (
@@ -476,7 +485,7 @@ export default function ProjectsPage() {
             showCardInfo={showCardInfo}
             emptyMessage="You haven't created any projects yet."
             onNewProject={() => setDialogOpen(true)}
-            showNewButton
+            showNewButton={mayCreate}
             userId={user?.id}
           />
           {sharedProjects.length > 0 && (

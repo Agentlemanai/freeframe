@@ -85,12 +85,14 @@ def _resolve_user(db: Session, identity: oidc_service.OIDCIdentity) -> User:
             raise oidc_service.OIDCError("account_unavailable", f"{identity.email} has no usable account")
         if not settings.oidc_auto_create_users:
             raise oidc_service.OIDCError("no_account", f"{identity.email} has no FreeFrame account")
+        may_create = oidc_service.project_creation_policy(identity)
         user = User(
             email=identity.email,
             name=identity.name,
             status=UserStatus.active,
             email_verified=True,
             is_superadmin=oidc_service.is_admin(identity),
+            can_create_projects=True if may_create is None else may_create,
         )
         db.add(user)
         db.commit()
@@ -111,5 +113,8 @@ def _resolve_user(db: Session, identity: oidc_service.OIDCIdentity) -> User:
     if oidc_service.is_admin(identity) and not user.is_superadmin:
         user.is_superadmin = True
         logger.info("oidc: promoted %s to admin (OIDC_ADMIN_GROUPS)", identity.email)
+    may_create = oidc_service.project_creation_policy(identity)
+    if may_create is not None:
+        user.can_create_projects = may_create
     db.commit()
     return user
