@@ -24,7 +24,10 @@ def pin_psycopg2_driver(url: str) -> str:
     return url
 
 
-engine = create_engine(pin_psycopg2_driver(settings.database_url))
+# pool_pre_ping: a long-lived process (above all a Celery worker, idle for days) keeps
+# its pooled connections across a Postgres restart. Without the check, the first query
+# afterwards fails with "server closed the connection unexpectedly".
+engine = create_engine(pin_psycopg2_driver(settings.database_url), pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
