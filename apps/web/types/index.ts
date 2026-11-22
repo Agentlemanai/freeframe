@@ -39,7 +39,9 @@ export type WatermarkContent = "email" | "name" | "custom_text";
 
 export type ViewerLayout = "grid" | "reel";
 
-export type ApprovalStatus = "approved" | "rejected" | "pending";
+/** What a reviewer can say about a version. Mirrors the API's `VerdictValue`;
+ *  `pending` is not a verdict and is never sent or returned. */
+export type VerdictValue = "approved" | "changes_requested" | "rejected";
 
 // ─── Core Entities ────────────────────────────────────────────────────────────
 
@@ -67,6 +69,145 @@ export interface InstanceSettings {
   upload_part_size_bytes?: number;
   /** Admins only. Whether people outside a project may download originals. */
   allow_original_downloads?: boolean;
+  /**
+   * Admins only. How hard review streams are compressed, 1 (highest quality) to
+   * 5 (smallest files). Absent when nobody has chosen one, in which case the
+   * server is following its TRANSCODER_CRF_OFFSET environment variable.
+   */
+  compression_level?: number | null;
+  /**
+   * Admins only. The CRF offset the next transcode will actually use, whether
+   * it comes from the level above or from the environment.
+   */
+  compression_crf_offset?: number;
+  /**
+   * Admins only. Which step of the scale that effective offset is, resolved by
+   * the server from the one scale (COMPRESSION_LEVELS in
+   * packages/transcoder/base.py). Absent when no step names the offset, and
+   * the UI then says so.
+   */
+  compression_level_effective?: number;
+}
+
+// ─── The admin Storage tab ────────────────────────────────────────────────────
+//
+// One figure per row. `total_bytes` is the originals plus the derived output
+// that has actually been measured (renditions and HLS segments, the single-file
+// download, poster thumbnails, audio waveforms). The split between the two
+// stays on the server: a storage page answers how big a thing is, not how its
+// bytes are apportioned.
+
+export interface StorageSummary {
+  used_bytes: number;
+  /** null when the instance has no storage limit set. There is no capacity to
+   *  read then, so the header says what is used rather than inventing a
+   *  denominator. */
+  capacity_bytes: number | null;
+  free_bytes: number | null;
+  unmeasured_files: number;
+  /** Bytes still held by things in the trash, not yet reclaimed. */
+  trash_bytes: number;
+  retention_days: number;
+}
+
+export interface StorageProjectRow {
+  project_id: string;
+  name: string;
+  total_bytes: number;
+}
+
+export interface StorageOverview {
+  summary: StorageSummary;
+  projects: StorageProjectRow[];
+  /** How many projects hold bytes in total; `projects` is the largest `limit`
+   *  of them. The summary is always instance-wide. */
+  project_count: number;
+  limit: number;
+}
+
+export interface StorageVersionRow {
+  version_id: string;
+  version_number: number;
+  total_bytes: number;
+  /** The file's newest version. It can only be deleted together with the whole
+   *  file; the server refuses it either way, this just lets the row say so. */
+  is_latest: boolean;
+}
+
+export interface StorageAssetRow {
+  asset_id: string;
+  name: string;
+  total_bytes: number;
+  versions: StorageVersionRow[];
+}
+
+export interface StorageProjectFiles {
+  project_id: string;
+  name: string;
+  assets: StorageAssetRow[];
+}
+
+export interface AdminDeleteResponse {
+  deleted_projects: number;
+  deleted_assets: number;
+  deleted_versions: number;
+  freed_bytes: number;
+  retention_days: number;
+  restorable_until: string | null;
+}
+
+export interface TrashProjectRow {
+  project_id: string;
+  name: string;
+  deleted_at: string | null;
+  days_left: number | null;
+  /** What deleting this one entry for good would free. */
+  total_bytes: number | null;
+}
+
+export interface TrashAssetRow {
+  asset_id: string;
+  name: string;
+  project_id: string;
+  project_name: string;
+  deleted_at: string | null;
+  days_left: number | null;
+  blocked_by_project: boolean;
+  /** null while the project above it is in the trash: those bytes are counted
+   *  on the project's row, and this entry has no delete of its own. */
+  total_bytes: number | null;
+}
+
+export interface TrashVersionRow {
+  version_id: string;
+  version_number: number;
+  asset_id: string;
+  asset_name: string;
+  project_id: string;
+  project_name: string;
+  deleted_at: string | null;
+  days_left: number | null;
+  blocked_by_parent: boolean;
+  /** null while a parent is in the trash, for the reason above. */
+  total_bytes: number | null;
+}
+
+export interface TrashOverview {
+  retention_days: number;
+  /** What emptying the whole trash would free. */
+  total_bytes: number;
+  projects: TrashProjectRow[];
+  assets: TrashAssetRow[];
+  versions: TrashVersionRow[];
+}
+
+export interface AdminPurgeResponse {
+  purged_projects: number;
+  purged_assets: number;
+  purged_versions: number;
+  freed_bytes: number;
+  s3_deletes: number;
+  s3_failures: number;
 }
 
 export interface Team {
@@ -135,6 +276,8 @@ export interface Asset {
   deleted_at: string | null;
   /** Comments on the latest version, replies included, as its comment panel shows them. */
   comment_count?: number;
+  /** Verdicts on the latest version, from team listings, which send zeros rather than null. */
+  verdict_summary?: VerdictSummary | null;
 }
 
 export interface AssetVersion {
@@ -259,15 +402,33 @@ export interface CommentReaction {
 
 // ─── Approvals & Sharing ──────────────────────────────────────────────────────
 
-export interface Approval {
+/** One verdict on one version, as GET .../verdicts returns it. No email, ever. */
+export interface Verdict {
   id: string;
-  asset_id: string;
   version_id: string;
-  user_id: string;
-  status: ApprovalStatus;
+  status: VerdictValue;
   note: string | null;
   created_at: string;
-  deleted_at: string | null;
+  updated_at: string;
+  who: {
+    /** `team` is a live project member; everyone else is `external`. */
+    kind: "team" | "external";
+    name: string;
+    avatar_url: string | null;
+    avatar_color: string | null;
+    /** A share-link guest with no account, as opposed to a signed-in non-member. */
+    is_guest: boolean;
+  };
+  /** The share link's title when the verdict was given, kept after the link is gone. */
+  via_link_title: string | null;
+  is_mine: boolean;
+}
+
+/** Verdicts per value on a version; team asset listings always send it. */
+export interface VerdictSummary {
+  approved: number;
+  changes_requested: number;
+  rejected: number;
 }
 
 export interface ShareLinkAppearance {
@@ -288,6 +449,7 @@ export interface ShareLink {
   folder_id: string | null;
   project_id: string | null;
   token: string;
+  short_code?: string | null;
   title: string;
   description: string | null;
   created_by: string;
@@ -319,6 +481,7 @@ export interface AssetShare {
 export interface ShareLinkListItem {
   id: string
   token: string
+  short_code?: string | null
   title: string
   description: string | null
   is_enabled: boolean
@@ -451,6 +614,8 @@ export interface Notification {
   actor_name: string | null;
   actor_is_guest?: boolean;
   comment_preview: string | null;
+  /** The verdict value on approval notifications. */
+  detail?: string | null;
   project_id: string | null;
 }
 

@@ -15,8 +15,10 @@ from ..models.activity import Mention, Notification, NotificationType
 from ..models.comment import Comment, COMMENT_TREE_MAX_DEPTH
 from ..schemas.asset import AssetResponse, AssetVersionResponse, AssetUpdate, StreamUrlResponse, MediaFileResponse, DownloadOption
 from ..schemas.notification import AssignmentUpdate
-from ..services.permissions import require_project_role, require_project_visible, require_asset_access, can_access_asset
+from ..schemas.verdict import VerdictSummary
+from ..services.permissions import require_project_role, require_project_visible, require_asset_access, can_access_asset_audited
 from ..services.s3_service import generate_presigned_get_url, build_download_filename
+from ..services.verdicts import verdict_summaries
 from ..services.downloads import (
     describe_choices, download_choices, download_filename, may_download_original,
     original_allowed_for_download, pick_or_refuse,
@@ -27,17 +29,13 @@ from ..schemas.upload import (
     ALLOWED_MIME_TYPES, mime_to_asset_type,
 )
 from ..services.storage import choose_part_size, upload_guard_error
-from ..services.versions import next_version_number
+from ..services.versions import UNVIEWABLE_STATUSES, next_version_number
 from ..services.s3_service import create_multipart_upload
-from .upload import storage_initiate_error
+from .upload import commit_initiated_upload, storage_initiate_error
 
 router = APIRouter(tags=["assets"])
 
 
-# A version in one of these is not something a viewer can open: it is an upload in
-# flight or one that died. It is still the newest version by number, which is why
-# "latest" and "the one to show" are not the same question.
-_UNVIEWABLE_STATUSES = (ProcessingStatus.uploading, ProcessingStatus.failed)
 
 
 def _pick_version(db: Session, asset_id: uuid.UUID, preferred) -> AssetVersion | None:
@@ -66,7 +64,7 @@ def _display_version(db: Session, asset_id: uuid.UUID) -> AssetVersion | None:
     being worked on" is true and useful.
     """
     return _pick_version(
-        db, asset_id, AssetVersion.processing_status.notin_(_UNVIEWABLE_STATUSES)
+        db, asset_id, AssetVersion.processing_status.notin_(UNVIEWABLE_STATUSES)
     )
 
 
@@ -138,6 +136,9 @@ def _build_asset_response(asset: Asset, db: Session) -> AssetResponse:
     resp.thumbnail_url = thumbnail_url
     if latest_version:
         resp.comment_count = _comment_counts(db, [latest_version.id]).get(latest_version.id, 0)
+        resp.verdict_summary = verdict_summaries(db, [latest_version.id])[latest_version.id]
+    else:
+        resp.verdict_summary = VerdictSummary()
     return resp
 
 
@@ -157,7 +158,7 @@ def _build_asset_responses_bulk(assets: list[Asset], db: Session) -> list[AssetR
             func.max(AssetVersion.version_number).label("max_version"),
         ).filter(AssetVersion.asset_id.in_(asset_ids), AssetVersion.deleted_at.is_(None))
         if viewable_only:
-            q = q.filter(AssetVersion.processing_status.notin_(_UNVIEWABLE_STATUSES))
+            q = q.filter(AssetVersion.processing_status.notin_(UNVIEWABLE_STATUSES))
         subq = q.group_by(AssetVersion.asset_id).subquery()
         return (
             db.query(AssetVersion)
@@ -178,6 +179,8 @@ def _build_asset_responses_bulk(assets: list[Asset], db: Session) -> list[AssetR
     version_ids = [v.id for v in latest_versions]
     all_files = db.query(MediaFile).filter(MediaFile.version_id.in_(version_ids)).all() if version_ids else []
     comment_counts = _comment_counts(db, version_ids)
+    # One grouped query for the page: every version asked for is present, zeroed.
+    verdicts = verdict_summaries(db, version_ids)
     files_by_version: dict = {}
     for f in all_files:
         files_by_version.setdefault(f.version_id, []).append(f)
@@ -202,6 +205,7 @@ def _build_asset_responses_bulk(assets: list[Asset], db: Session) -> list[AssetR
         asset_resp.latest_version = version_response
         asset_resp.thumbnail_url = thumbnail_url
         asset_resp.comment_count = comment_counts.get(version.id, 0) if version else 0
+        asset_resp.verdict_summary = verdicts[version.id] if version else VerdictSummary()
         result.append(asset_resp)
     return result
 
@@ -266,9 +270,13 @@ def get_assets_batch(
     What the uploads panel polls with, so the poll costs one read per tick rather
     than one per row. An asset `GET /assets/{id}` would refuse with a 403 or 404
     is left out of the answer instead of failing the request.
+
+    Audited like the single-asset read it replaces: an instance admin reaching
+    an asset in a project it is not a member of writes one `admin_project_access`
+    row per request and project.
     """
     assets = db.query(Asset).filter(Asset.id.in_(ids), Asset.deleted_at.is_(None)).all()
-    visible = [a for a in assets if can_access_asset(db, a, current_user)]
+    visible = [a for a in assets if can_access_asset_audited(db, a, current_user)]
     return _build_asset_responses_bulk(visible, db)
 
 
@@ -509,7 +517,7 @@ def initiate_new_version(
         s3_key_raw=s3_key,
     )
     db.add(media_file)
-    db.commit()
+    commit_initiated_upload(db, s3_key, upload_id)
 
     return InitiateUploadResponse(
         upload_id=upload_id,

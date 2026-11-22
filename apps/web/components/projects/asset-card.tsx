@@ -3,9 +3,12 @@
 import * as React from 'react'
 import { Film, Music, Image as ImageIcon, Images, MoreHorizontal, Check } from 'lucide-react'
 import { cn, formatRelativeTime, formatBytes } from '@/lib/utils'
-import type { Asset, AssetType, DownloadOption, User } from '@/types'
+import type { Asset, AssetType, DownloadOption, User, VerdictSummary } from '@/types'
 import { ContextMenuArea, DotsMenu } from '@/components/shared/item-menu'
+import { DurationBadge, VersionCountBadge } from '@/components/shared/asset-thumbnail-badges'
 import { CommentCountBadge } from '@/components/shared/comment-count-badge'
+import { VerdictBadge } from '@/components/review/verdict-badge'
+import { verdictTone } from '@/lib/verdicts'
 import { AssetMenuItems } from './menus/asset-menu'
 import type { AspectRatio, ThumbnailScale, TitleLines } from '@/stores/view-store'
 
@@ -30,6 +33,8 @@ interface AssetCardProps {
   authorName?: string
   thumbnailUrl?: string | null
   commentCount?: number
+  /** Verdicts on the latest version; nothing shows while there are none. */
+  verdictSummary?: VerdictSummary | null
   duration?: number | null
   selected?: boolean
   onSelect?: (e: React.MouseEvent) => void
@@ -55,17 +60,6 @@ interface AssetCardProps {
   className?: string
 }
 
-function formatDuration(seconds: number): string {
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  if (m >= 60) {
-    const h = Math.floor(m / 60)
-    const rm = m % 60
-    return `${h}:${String(rm).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-  }
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-}
-
 export function AssetCard({
   asset,
   projectId,
@@ -74,6 +68,7 @@ export function AssetCard({
   authorName,
   thumbnailUrl,
   commentCount,
+  verdictSummary,
   duration,
   selected = false,
   onSelect,
@@ -162,15 +157,32 @@ export function AssetCard({
           </button>
         )}
 
-        {/* Duration badge — bottom-right (for video/audio) */}
-        {duration != null && duration > 0 && (
-          <span className="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-2xs font-medium text-white tabular-nums backdrop-blur-sm">
-            {formatDuration(duration)}
-          </span>
-        )}
+        {/* Version chip: the latest version's number, top-left from v2 on, shifted
+            right of the selection checkbox, which owns the corner. */}
+        <VersionCountBadge
+          count={versionCount}
+          title={`Version ${versionCount}`}
+          className={onSelect ? 'left-9' : undefined}
+        />
+
+        {/* Duration badge — bottom-right (for video/audio), as in a share link's grid */}
+        <DurationBadge seconds={duration} />
 
         {/* Comment count badge — bottom-left, as in a share link's grid */}
         <CommentCountBadge count={commentCount} />
+
+        {/* Verdict badge — top-right, the one free corner. Its own pill, because
+            coloured text needs a backing on a thumbnail, and only when there is
+            a verdict: the API sends zeros, not null, so an unguarded pill would
+            be an empty blur on most cards. */}
+        {verdictSummary && verdictTone(verdictSummary) && (
+          <div
+            data-testid="card-verdict"
+            className="absolute top-2 right-2 flex items-center bg-bg-primary/80 backdrop-blur-sm rounded-md px-1.5 py-0.5"
+          >
+            <VerdictBadge summary={verdictSummary} />
+          </div>
+        )}
       </div>
 
       {/* Info section */}
