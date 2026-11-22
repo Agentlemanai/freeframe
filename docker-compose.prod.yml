@@ -19,9 +19,9 @@
 #   cp .env.example .env.prod        # configure your settings
 #   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 #
-# SSL: Set DOMAIN and ACME_EMAIL in .env.prod for automatic
-#      Let's Encrypt certificates. Without a domain, it runs
-#      on HTTP only (port 80).
+# SSL: This file alone serves HTTP only (port 80) and requests no
+#      certificate. For automatic Let's Encrypt certificates, set DOMAIN
+#      and ACME_EMAIL in .env.prod and add -f docker-compose.https.yml.
 # ============================================================
 
 services:
@@ -206,7 +206,6 @@ services:
       dockerfile: Dockerfile.prod
       args:
         NEXT_PUBLIC_API_URL: /api
-        NEXT_PUBLIC_UPLOAD_CONCURRENCY: ${NEXT_PUBLIC_UPLOAD_CONCURRENCY:-5}
         NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-}
     env_file:
       - .env

@@ -1,3 +1,4 @@
+import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -5,6 +6,7 @@ from typing import Optional
 import bcrypt
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 import sqlalchemy
 from sqlalchemy import func as sa_func, case
 from sqlalchemy.orm import Session
@@ -39,10 +41,11 @@ from ..schemas.share import (
 )
 from ..services.permissions import (
     require_project_role, validate_share_link, validate_share_link_with_session,
+    creator_skips_link_password,
     validate_asset_in_share, enforce_share_link_visibility, _is_descendant_of, folder_chain_is_live,
 )
 from ..services.auth_service import bcrypt_password_bytes
-from ..services.redis_service import create_share_session
+from ..services.redis_service import create_share_session, delete_share_sessions
 from ..services.search import escape_like
 from ..services.owned_keys import is_project_logo_key, sign_if_owned
 from ..services.avatar_keys import sign_avatar
@@ -58,8 +61,46 @@ from ..models.project import Project, ProjectRole
 from ..tasks.email_tasks import send_share_email
 from ..tasks.celery_app import send_task_safe
 from ..config import settings
+from ..utils.short_code import generate_short_code
 
 router = APIRouter(tags=["sharing"])
+logger = logging.getLogger(__name__)
+
+MAX_SHORT_CODE_RETRIES = 3
+
+
+def _frontend_base() -> str:
+    """FRONTEND_URL without a trailing slash, so joining paths never doubles it."""
+    return settings.frontend_url.rstrip("/")
+
+
+def _generate_unique_short_code(db: Session) -> str:
+    for _ in range(MAX_SHORT_CODE_RETRIES):
+        code = generate_short_code()
+        if not db.query(ShareLink).filter(ShareLink.short_code == code).first():
+            return code
+    raise RuntimeError(f"Failed to generate unique short code after {MAX_SHORT_CODE_RETRIES} attempts")
+
+
+def _short_share_url(link: ShareLink) -> str:
+    """Preferred public URL for a share link: the short code when available.
+
+    Short codes live under the frontend's `/s/` prefix — the web app serves
+    `{FRONTEND_URL}/s/{code}` and looks the code up via `/resolve/{short_code}`
+    — so sub-path deployments get `https://host/freeframe/s/AbC12345` and need
+    no proxy rule of their own. Falls back to the full token URL otherwise.
+    """
+    frontend = _frontend_base()
+    if link.short_code:
+        return f"{frontend}/s/{link.short_code}"
+    return f"{frontend}/share/{link.token}"
+
+
+def _link_by_token(db: Session, token: str) -> Optional[ShareLink]:
+    return db.query(ShareLink).filter(
+        ShareLink.token == token,
+        ShareLink.deleted_at.is_(None),
+    ).first()
 
 
 def _get_asset(db: Session, asset_id: uuid.UUID) -> Asset:
@@ -228,12 +269,13 @@ def create_share_link(
         show_versions=body.show_versions,
         show_watermark=body.show_watermark,
         appearance=body.appearance.model_dump(),
+        short_code=_generate_unique_short_code(db),
     )
     db.add(link)
     db.add(ActivityLog(user_id=current_user.id, asset_id=asset_id, action=ActivityAction.shared))
     db.commit()
     db.refresh(link)
-    return link
+    return _share_link_response(link)
 
 
 @router.get("/assets/{asset_id}/shares", response_model=list[ShareLinkResponse])
@@ -244,10 +286,11 @@ def list_share_links(
 ):
     asset = _get_asset(db, asset_id)
     require_project_role(db, asset.project_id, current_user, ProjectRole.editor)
-    return db.query(ShareLink).filter(
+    links = db.query(ShareLink).filter(
         ShareLink.asset_id == asset_id,
         ShareLink.deleted_at.is_(None),
     ).all()
+    return [_share_link_response(link) for link in links]
 
 
 def _share_branding(db: Session, project_id: uuid.UUID) -> Optional[ShareBranding]:
@@ -409,9 +452,10 @@ def validate_share_link_endpoint(
             )
 
     # Password-protected links: short-circuit and request POST /verify.
-    # Authenticated link creator bypasses the password (dashboard preview).
+    # The link's creator bypasses the password (dashboard preview) while they
+    # still manage links in its project.
     if link.password_hash:
-        if current_user and link.created_by == current_user.id:
+        if creator_skips_link_password(db, link, current_user):
             return _build_share_validate_response(db, link, current_user, log_open=log_open)
         return ShareLinkValidateResponse(
             requires_password=True,
@@ -449,8 +493,9 @@ def verify_share_link_password(
     # the login requirement.
     enforce_share_link_visibility(link, current_user)
 
-    # Authenticated link creator bypasses the password (dashboard preview)
-    if not (current_user and link.created_by == current_user.id):
+    # The link's creator bypasses the password (dashboard preview) while they
+    # still manage links in its project.
+    if not creator_skips_link_password(db, link, current_user):
         if not link.password_hash:
             # No password set — nothing to verify. Return the validate response.
             return _build_share_validate_response(db, link, current_user)
@@ -472,16 +517,71 @@ def verify_share_link_password(
     )
 
 
-def _share_link_response(link: ShareLink) -> ShareLinkResponse:
-    """Build ShareLinkResponse from ORM model, computing has_password and decrypting password."""
+def _share_link_response(link: ShareLink, *, reveal_password: bool = False) -> ShareLinkResponse:
+    """Build ShareLinkResponse from the ORM row, with has_password computed.
+
+    The password itself (`password_value`) is decrypted only when the caller
+    passes `reveal_password=True`, which is for people who manage the link
+    (editor or owner). Everyone else who can read the link, a viewer or a
+    reviewer among them, gets None and reads has_password instead.
+    """
     response = ShareLinkResponse.model_validate(link)
     response.has_password = link.password_hash is not None and link.password_hash != ''
-    if link.password_encrypted:
+    response.password_value = None
+    if reveal_password and link.password_encrypted:
         try:
             response.password_value = decrypt_password(link.password_encrypted)
         except Exception:
             response.password_value = None
     return response
+
+
+def _manages_links(member) -> bool:
+    """Whether a project member may change share links, and so see their passwords."""
+    return member.role in (ProjectRole.owner, ProjectRole.editor)
+
+
+# ── Short share code resolution ───────────────────────────────────────────────
+
+@router.get(
+    "/resolve/{short_code}",
+    dependencies=[Depends(rate_limit("share_resolve", 30, 60))],
+)
+def resolve_short_code(
+    short_code: str,
+    db: Session = Depends(get_db),
+):
+    """Resolve a short code to its share page.
+
+    Called server-side by the web app's `/s/[code]` route (a reverse-proxy rule
+    can call it too). A code that does not exist, belongs to a deleted link, or
+    points into trashed content answers 404 so the route can show the share
+    page's "Link not found" state; a known code 302s to the share page. The rate
+    limit keeps the code space from being enumerated.
+
+    A code must resolve by the same live-content rule as the share page it
+    redirects to, so this runs `validate_share_link` after the lookup. Its 404
+    (trashed project, asset, folder or folder above) is re-raised; its 403
+    (disabled) and 410 (expired) are left to the share page, which explains
+    them, so those codes still redirect.
+
+    The Location is a path, not a FRONTEND_URL-prefixed URL: the visitor stays
+    on the origin they used (LAN and multi-host installs included), and the web
+    app's redirect adds any basePath itself.
+    """
+    link = db.query(ShareLink).filter(
+        ShareLink.short_code == short_code,
+        ShareLink.deleted_at.is_(None),
+    ).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Share link not found")
+
+    try:
+        validate_share_link(db, link.token)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise
+    return RedirectResponse(url=f"/share/{link.token}", status_code=302)
 
 
 # ── Authenticated share link details (for settings panel) ────────────────────
@@ -500,8 +600,8 @@ def get_share_link_details(
     if not link:
         raise HTTPException(status_code=404, detail="Share link not found")
     project_id = _get_project_id_from_link(db, link)
-    require_project_role(db, project_id, current_user, ProjectRole.viewer)
-    return _share_link_response(link)
+    member = require_project_role(db, project_id, current_user, ProjectRole.viewer)
+    return _share_link_response(link, reveal_password=_manages_links(member))
 
 
 # ── PATCH share link ─────────────────────────────────────────────────────────
@@ -520,6 +620,9 @@ def update_share_link(
     require_project_role(db, project_id, current_user, ProjectRole.editor)
 
     updates = body.model_dump(exclude_unset=True)
+    # A session is granted under the password and the link being on. When either
+    # changes, the sessions from before end with it (see delete_share_sessions).
+    ends_sessions = "password" in updates or updates.get("is_enabled") is False
 
     # Handle password separately — hash + encrypt for reversible admin display
     if "password" in updates:
@@ -542,7 +645,10 @@ def update_share_link(
 
     db.commit()
     db.refresh(link)
-    return _share_link_response(link)
+    if ends_sessions:
+        delete_share_sessions(link.token)
+    # Editor-gated above, so the caller manages the link.
+    return _share_link_response(link, reveal_password=True)
 
 
 @router.delete("/share/{token}", status_code=status.HTTP_204_NO_CONTENT)
@@ -558,6 +664,7 @@ def revoke_share_link(
     require_project_role(db, project_id, current_user, ProjectRole.editor)
     link.deleted_at = datetime.now(timezone.utc)
     db.commit()
+    delete_share_sessions(token)
 
 
 # ── Folder share links ───────────────────────────────────────────────────────
@@ -597,11 +704,12 @@ def create_folder_share_link(
         show_versions=body.show_versions,
         show_watermark=body.show_watermark,
         appearance=body.appearance.model_dump(),
+        short_code=_generate_unique_short_code(db),
     )
     db.add(link)
     db.commit()
     db.refresh(link)
-    return link
+    return _share_link_response(link)
 
 
 @router.post("/projects/{project_id}/share", response_model=ShareLinkResponse, status_code=status.HTTP_201_CREATED)
@@ -642,11 +750,12 @@ def create_project_share_link(
         show_versions=body.show_versions,
         show_watermark=body.show_watermark,
         appearance=body.appearance.model_dump(),
+        short_code=_generate_unique_short_code(db),
     )
     db.add(link)
     db.commit()
     db.refresh(link)
-    return link
+    return _share_link_response(link)
 
 
 @router.post("/projects/{project_id}/share/user", response_model=DirectShareResponse, status_code=status.HTTP_201_CREATED)
@@ -679,9 +788,10 @@ def share_project_with_user(
     shared_user = db.query(User).filter(User.id == user_id).first()
     if shared_user:
         if body.share_token:
-            project_link = f"{settings.frontend_url}/share/{body.share_token}"
+            link = _link_by_token(db, body.share_token)
+            project_link = _short_share_url(link) if link else f"{_frontend_base()}/share/{body.share_token}"
         else:
-            project_link = f"{settings.frontend_url}/projects/{project_id}"
+            project_link = f"{_frontend_base()}/projects/{project_id}"
         send_task_safe(send_share_email,
             to_email=shared_user.email,
             sharer_name=current_user.name or current_user.email,
@@ -710,10 +820,11 @@ def list_folder_share_links(
 ):
     folder = _get_folder(db, folder_id)
     require_project_role(db, folder.project_id, current_user, ProjectRole.viewer)
-    return db.query(ShareLink).filter(
+    links = db.query(ShareLink).filter(
         ShareLink.folder_id == folder_id,
         ShareLink.deleted_at.is_(None),
     ).all()
+    return [_share_link_response(link) for link in links]
 
 
 # ── Folder direct user/team sharing ──────────────────────────────────────────
@@ -769,9 +880,10 @@ def share_folder_with_user(
     shared_user = db.query(User).filter(User.id == user_id).first()
     if shared_user:
         if body.share_token:
-            folder_link = f"{settings.frontend_url}/share/{body.share_token}"
+            link = _link_by_token(db, body.share_token)
+            folder_link = _short_share_url(link) if link else f"{_frontend_base()}/share/{body.share_token}"
         else:
-            folder_link = f"{settings.frontend_url}/projects/{folder.project_id}?folder={folder_id}"
+            folder_link = f"{_frontend_base()}/projects/{folder.project_id}?folder={folder_id}"
         send_task_safe(send_share_email,
             to_email=shared_user.email,
             sharer_name=current_user.name or current_user.email,
@@ -934,9 +1046,10 @@ def share_with_user(
     if shared_user:
         # Use share link URL if token provided, otherwise internal URL
         if body.share_token:
-            asset_link = f"{settings.frontend_url}/share/{body.share_token}"
+            link = _link_by_token(db, body.share_token)
+            asset_link = _short_share_url(link) if link else f"{_frontend_base()}/share/{body.share_token}"
         else:
-            asset_link = f"{settings.frontend_url}/projects/{asset.project_id}/assets/{asset_id}"
+            asset_link = f"{_frontend_base()}/projects/{asset.project_id}/assets/{asset_id}"
         send_task_safe(send_share_email,
             to_email=shared_user.email,
             sharer_name=current_user.name or current_user.email,
@@ -1019,6 +1132,7 @@ def list_project_share_links(
         db.query(
             ShareLink.id,
             ShareLink.token,
+            ShareLink.short_code,
             ShareLink.title,
             ShareLink.description,
             ShareLink.is_enabled,
@@ -1044,6 +1158,7 @@ def list_project_share_links(
         db.query(
             ShareLink.id,
             ShareLink.token,
+            ShareLink.short_code,
             ShareLink.title,
             ShareLink.description,
             ShareLink.is_enabled,
@@ -1069,6 +1184,7 @@ def list_project_share_links(
         db.query(
             ShareLink.id,
             ShareLink.token,
+            ShareLink.short_code,
             ShareLink.title,
             ShareLink.description,
             ShareLink.is_enabled,
@@ -1117,6 +1233,7 @@ def list_project_share_links(
         ShareLinkListItem(
             id=row.id,
             token=row.token,
+            short_code=row.short_code,
             title=row.title,
             description=row.description,
             is_enabled=row.is_enabled,
@@ -1289,8 +1406,12 @@ def create_multi_share_link(
         password_hash = bcrypt.hashpw(plain_bytes, bcrypt.gensalt()).decode("utf-8")
         try:
             password_encrypted = encrypt_password(body.password)
-        except Exception:
-            pass
+        except Exception as exc:
+            # The hash above is what guests are checked against, so the link is
+            # still protected; only the settings panel cannot show the password.
+            logger.warning(
+                "Could not encrypt a share link password for display: %s", type(exc).__name__,
+            )
 
     link = ShareLink(
         project_id=project_id,
@@ -1308,6 +1429,7 @@ def create_multi_share_link(
         expires_at=body.expires_at,
         appearance=body.appearance.model_dump(),
         created_by=current_user.id,
+        short_code=_generate_unique_short_code(db),
     )
     db.add(link)
     db.flush()
@@ -1320,7 +1442,7 @@ def create_multi_share_link(
 
     db.commit()
     db.refresh(link)
-    return link
+    return _share_link_response(link)
 
 
 # ── Folder share public endpoints ─────────────────────────────────────────────
@@ -1716,6 +1838,14 @@ def get_share_asset_versions(
     asset = _get_asset(db, asset_id)
     validate_asset_in_share(db, link, asset)
 
+    return shown_versions(db, link, asset)
+
+
+def shown_versions(db: Session, link: ShareLink, asset: Asset) -> list[AssetVersion]:
+    """The versions of `asset` a holder of `link` may see, newest first: every ready
+    version when the link has "Show all versions" on, otherwise only the latest
+    ready one. The share versions listing and the share verdict routes both go by
+    this, so a guest can only judge a version they can open."""
     versions = db.query(AssetVersion).filter(
         AssetVersion.asset_id == asset.id,
         AssetVersion.deleted_at.is_(None),

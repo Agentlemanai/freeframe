@@ -19,7 +19,7 @@ import {
   Globe,
   X,
 } from "lucide-react";
-import { cn, dateInputValue, endOfDayISO } from "@/lib/utils";
+import { cn, copyToClipboard, dateInputValue, endOfDayISO } from "@/lib/utils";
 import { withBasePath } from "@/lib/base-path";
 import { api } from "@/lib/api";
 import { ShareLinkActivityPanel } from "@/components/projects/share-link-activity";
@@ -29,10 +29,19 @@ import {
 } from "@/components/projects/share-appearance-fields";
 import { ToggleRow } from "@/components/ui/setting-controls";
 import { SHARE_ASSETS_PAGE_SIZE } from "@/lib/share-page";
+import {
+  permissionForApprovals,
+  permissionForComments,
+  togglesFrom,
+} from "@/lib/share-permission";
 import { useBranding } from "@/components/shared/branding-provider";
 import { resolveShareLogoUrl } from "@/lib/project-branding";
 import { SharePagePreviewFrame } from "@/components/projects/share-page-preview";
 import type { Project, ProjectBranding, ShareLink, ShareLinkAppearance } from "@/types";
+import {
+  SHARE_PASSWORD_TOO_LONG,
+  sharePasswordTooLong,
+} from "@/lib/share-password";
 
 // ─── Shared hook for share link data + mutations ────────────────────────────
 
@@ -60,6 +69,12 @@ function useShareLinkData(token: string) {
     },
     [token, mutate],
   );
+
+  // Drop a change still waiting in the debounce, so it is never sent.
+  const cancelPendingUpdate = React.useCallback(() => {
+    if (updateTimerRef.current) clearTimeout(updateTimerRef.current);
+    updateTimerRef.current = null;
+  }, []);
 
   const immediateUpdate = React.useCallback(
     async (updates: Record<string, unknown>) => {
@@ -90,6 +105,7 @@ function useShareLinkData(token: string) {
     shareLink,
     mutate,
     debouncedUpdate,
+    cancelPendingUpdate,
     immediateUpdate,
     appearance,
     updateAppearance,
@@ -425,13 +441,9 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
   const [copied, setCopied] = React.useState(false);
 
   async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Fallback
-    }
+    if (!(await copyToClipboard(text))) return;
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   }
 
   return (
@@ -464,13 +476,9 @@ function CopyLinkButton({ text }: { text: string }) {
   const [copied, setCopied] = React.useState(false);
 
   async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Fallback
-    }
+    if (!(await copyToClipboard(text))) return;
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   }
 
   return (
@@ -637,7 +645,9 @@ export function ShareLinkContent({
     };
   }, [projectId]);
 
-  const shareUrl = `${frontendUrl}${withBasePath(`/share/${token}`)}`;
+  const shareUrl = `${frontendUrl}${withBasePath(
+    shareLink?.short_code ? `/s/${shareLink.short_code}` : `/share/${token}`,
+  )}`;
 
   // Mirror how the share page itself renders this link (folder-share-viewer):
   // card size picks the grid columns, aspect ratio and fit/fill the thumbnail
@@ -905,6 +915,7 @@ export function ShareLinkSettingsPanel({ token }: ShareLinkSettingsPanelProps) {
   const {
     shareLink,
     debouncedUpdate,
+    cancelPendingUpdate,
     immediateUpdate,
     appearance,
     updateAppearance,
@@ -916,6 +927,8 @@ export function ShareLinkSettingsPanel({ token }: ShareLinkSettingsPanelProps) {
   const [localPassword, setLocalPassword] = React.useState("");
   const [passwordEnabled, setPasswordEnabled] = React.useState(false);
   const [showPassword, setShowPassword] = React.useState(false);
+  // The typed password is over the API's limit, so it is not being saved.
+  const [passwordTooLong, setPasswordTooLong] = React.useState(false);
 
   React.useEffect(() => {
     if (shareLink) {
@@ -926,8 +939,17 @@ export function ShareLinkSettingsPanel({ token }: ShareLinkSettingsPanelProps) {
 
   const shareUrl =
     typeof window !== "undefined"
-      ? `${window.location.origin}${withBasePath(`/share/${token}`)}`
-      : withBasePath(`/share/${token}`);
+      ? `${window.location.origin}${withBasePath(
+          shareLink?.short_code ? `/s/${shareLink.short_code}` : `/share/${token}`,
+        )}`
+      : withBasePath(shareLink?.short_code ? `/s/${shareLink.short_code}` : `/share/${token}`);
+
+  // The link has a password but the API did not send it back: it shows the
+  // password only to the people who manage the link, and not at all once the
+  // key it was stored under has changed. The box then starts empty, and typing
+  // replaces the password.
+  const passwordHidden =
+    !!shareLink?.has_password && !shareLink?.password_value;
 
   if (!shareLink) {
     return (
@@ -1015,12 +1037,17 @@ export function ShareLinkSettingsPanel({ token }: ShareLinkSettingsPanelProps) {
               <ToggleRow
                 label="Comments"
                 description="Allow viewers to leave comments"
-                checked={
-                  shareLink.permission === "comment" ||
-                  shareLink.permission === "approve"
-                }
+                checked={togglesFrom(shareLink.permission).comments}
                 onCheckedChange={(checked) =>
-                  immediateUpdate({ permission: checked ? "comment" : "view" })
+                  immediateUpdate({ permission: permissionForComments(checked) })
+                }
+              />
+              <ToggleRow
+                label="Allow approvals"
+                description="Let viewers approve, ask for changes or reject"
+                checked={togglesFrom(shareLink.permission).approvals}
+                onCheckedChange={(checked) =>
+                  immediateUpdate({ permission: permissionForApprovals(checked) })
                 }
               />
               <ToggleRow
@@ -1054,24 +1081,44 @@ export function ShareLinkSettingsPanel({ token }: ShareLinkSettingsPanelProps) {
                 onCheckedChange={(checked) => {
                   setPasswordEnabled(checked);
                   if (!checked) {
+                    cancelPendingUpdate();
                     setLocalPassword("");
                     setShowPassword(false);
+                    setPasswordTooLong(false);
                     immediateUpdate({ password: null });
                   }
                 }}
               />
+              {passwordEnabled && passwordHidden && (
+                <p className="text-xs text-text-tertiary">Password set</p>
+              )}
               {passwordEnabled && (
                 <div className="relative">
                   <input
                     type={showPassword ? "text" : "password"}
                     value={localPassword}
+                    // Keeps the browser from filling in a saved password,
+                    // which would save it over the link's.
+                    autoComplete="new-password"
                     onChange={(e) => {
                       setLocalPassword(e.target.value);
-                      debouncedUpdate({
-                        password: e.target.value.trim() || null,
-                      });
+                      const next = e.target.value.trim();
+                      // Over the limit the API refuses the save, and this
+                      // panel would not show that, so it is never sent and
+                      // the message below says why.
+                      const tooLong = sharePasswordTooLong(next);
+                      setPasswordTooLong(tooLong);
+                      // An empty box is not "remove the password": the
+                      // toggle above does that. Typing is only ever a new one.
+                      if (next && !tooLong) debouncedUpdate({ password: next });
+                      else cancelPendingUpdate();
                     }}
-                    placeholder="Enter passphrase"
+                    aria-invalid={passwordTooLong || undefined}
+                    placeholder={
+                      passwordHidden
+                        ? "Type a new passphrase to replace it"
+                        : "Enter passphrase"
+                    }
                     className="w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 pr-12 text-sm text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent/50"
                   />
                   <button
@@ -1086,6 +1133,11 @@ export function ShareLinkSettingsPanel({ token }: ShareLinkSettingsPanelProps) {
                     )}
                   </button>
                 </div>
+              )}
+              {passwordEnabled && passwordTooLong && (
+                <p role="alert" className="text-xs text-status-error">
+                  {SHARE_PASSWORD_TOO_LONG}
+                </p>
               )}
 
               <div className="flex items-center justify-between gap-3">

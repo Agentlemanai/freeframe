@@ -1,9 +1,10 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uuid
 from datetime import datetime
 from typing import Optional
 from ..models.asset import AssetType, AssetStatus, ProcessingStatus, FileType
 from ..models.activity import NotificationType
+from .verdict import VerdictSummary
 
 class MediaFileResponse(BaseModel):
     id: uuid.UUID
@@ -54,10 +55,15 @@ class AssetResponse(BaseModel):
     thumbnail_url: Optional[str] = None
     # Comments on latest_version, as its comment panel shows them (replies too).
     comment_count: int = 0
+    # Verdicts on latest_version, team and external alike. Always set on the team's
+    # listings (zeros when nobody has judged it, like comment_count); null means a
+    # builder did not compute it. Share responses are their own models and never
+    # carry it, so a guest cannot read the team's counts.
+    verdict_summary: Optional[VerdictSummary] = None
     model_config = {"from_attributes": True}
 
 class AssetUpdate(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=255)
     description: Optional[str] = None
     status: Optional[AssetStatus] = None
     rating: Optional[int] = None
@@ -92,3 +98,6 @@ class NotificationResponse(BaseModel):
     actor_is_guest: bool = False
     comment_preview: Optional[str] = None
     project_id: Optional[uuid.UUID] = None
+    # What the actor did, for a notification that has one (a verdict: "approved",
+    # "changes_requested" or "rejected"). Null on every other type.
+    detail: Optional[str] = None

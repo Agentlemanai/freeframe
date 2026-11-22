@@ -3,8 +3,7 @@
 import * as React from 'react'
 import * as Switch from '@radix-ui/react-switch'
 import { Search, Folder, File, Copy, Check, Eye } from 'lucide-react'
-import { cn } from '@/lib/utils'
-import { formatRelativeTime } from '@/lib/utils'
+import { cn, copyToClipboard, formatRelativeTime } from '@/lib/utils'
 import { withBasePath } from '@/lib/base-path'
 import { ContextMenuArea } from '@/components/shared/item-menu'
 import { ShareLinkMenuItems } from './menus/share-link-menu'
@@ -38,11 +37,13 @@ export function ShareLinksTable({
   }, [shareLinks, search])
 
   const handleCopy = React.useCallback(
-    async (token: string, e: React.MouseEvent) => {
+    async (link: ShareLinkListItem, e: React.MouseEvent) => {
       e.stopPropagation()
-      const url = `${frontendUrl}${withBasePath(`/share/${token}`)}`
-      await navigator.clipboard.writeText(url)
-      setCopiedToken(token)
+      const url = `${frontendUrl}${withBasePath(
+        link.short_code ? `/s/${link.short_code}` : `/share/${link.token}`,
+      )}`
+      if (!(await copyToClipboard(url))) return
+      setCopiedToken(link.token)
       setTimeout(() => setCopiedToken(null), 2000)
     },
     [frontendUrl],
@@ -101,7 +102,9 @@ export function ShareLinksTable({
             </thead>
             <tbody>
               {filtered.map((link, i) => {
-                const shareUrl = `${frontendUrl}${withBasePath(`/share/${link.token}`)}`
+                const shareUrl = `${frontendUrl}${withBasePath(
+                  link.short_code ? `/s/${link.short_code}` : `/share/${link.token}`,
+                )}`
                 const isCopied = copiedToken === link.token
                 const isLast = i === filtered.length - 1
 
@@ -144,7 +147,7 @@ export function ShareLinksTable({
                           {shareUrl}
                         </span>
                         <button
-                          onClick={(e) => handleCopy(link.token, e)}
+                          onClick={(e) => handleCopy(link, e)}
                           className="flex items-center justify-center h-6 w-6 rounded border border-border bg-bg-tertiary hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors shrink-0"
                           title="Copy link"
                         >
