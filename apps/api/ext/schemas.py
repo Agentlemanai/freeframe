@@ -184,6 +184,27 @@ class GatewayTokenCreated(GatewayTokenResponse):
     token: str
 
 
+class PersonResponse(BaseModel):
+    id: uuid.UUID
+    email: str
+    name: str
+    model_config = {"from_attributes": True}
+
+
+class TaskContext(BaseModel):
+    """Everything a machine needs to start on a task, in one read."""
+    task: TaskResponse
+    project: dict
+    asset: dict
+    # The version the task was created on: its number, frame rate, length and
+    # where it came from in Resolve, if the gateway recorded that.
+    version: Optional[dict]
+    source_comment: Optional[dict]
+    notes: list[NoteResponse]
+    assignee: Optional[PersonResponse]
+    created_by: Optional[PersonResponse]
+
+
 class ReviewContext(BaseModel):
     """What the review screen needs to know about the caller on this asset."""
     sees_internal: bool

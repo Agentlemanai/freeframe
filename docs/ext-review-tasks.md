@@ -84,6 +84,8 @@ under "ext: review tasks". "Team" means owner, editor or admin on the project.
 | `POST /ext/tasks` | team | create, from a comment (`source_comment_id`) or new |
 | `GET /ext/tasks` | team, gateway | filters: `project_id`, `asset_id`, `version_id`, `status` (comma-separated), `stage`, `assignee_type`, `assignee_person_id` |
 | `GET /ext/tasks/{id}` | team, gateway | |
+| `GET /ext/tasks/{id}/context` | team, gateway | the task with its project, video, version (fps, Resolve timeline), source comment and notes |
+| `GET /ext/people?ids=&emails=` | gateway, admin | match FreeFrame accounts with the gateway's people; nothing is listed without a key |
 | `PATCH /ext/tasks/{id}` | team | instruction, kind, stage, frames, assignee |
 | `POST /ext/tasks/{id}/status` | gateway, manager | move a task; `result_version_id` is required for `proposed`, a `note` for `needs_info` |
 | `POST /ext/tasks/{id}/approve` | manager | |

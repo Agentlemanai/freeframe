@@ -297,3 +297,49 @@ def test_a_manager_toggles_a_comments_visibility(http, world, live_db):
     assert [e.type for e in events] == [
         "comment.visibility_changed", "comment.created", "comment.visibility_changed",
     ]
+
+
+# ── What the gateway reads to route a task and brief a machine ─────────────────
+
+def test_the_gateway_matches_people_by_email_or_id(gateway, http, world):
+    by_email = gateway.get(f"/ext/people?emails={world.editor.email.upper()},nobody@example.com")
+    assert by_email.status_code == 200, by_email.text
+    assert by_email.json() == [{"id": str(world.editor.id), "email": world.editor.email, "name": world.editor.name}]
+    by_id = gateway.get(f"/ext/people?ids={world.owner.id},{world.reviewer.id}").json()
+    assert {p["email"] for p in by_id} == {world.owner.email, world.reviewer.email}
+    assert gateway.get("/ext/people").status_code == 422              # no listing everyone
+    assert gateway.get("/ext/people?ids=not-an-id").status_code == 422
+    for user in (world.owner, world.editor, world.reviewer):
+        assert http(user).get(f"/ext/people?emails={world.editor.email}").status_code == 403
+    assert http(world.admin).get(f"/ext/people?emails={world.editor.email}").status_code == 200
+
+
+def test_a_tasks_context_is_one_read(gateway, http, world, live_db):
+    from apps.api.models.asset import MediaFile
+
+    live_db.query(MediaFile).filter(MediaFile.version_id == world.v1.id).one().fps = 25.0
+    live_db.flush()
+    gateway.put(f"/ext/versions/{world.v1.id}/meta", json={
+        "resolve_project": "2026-11-20_GARLO_Campaign", "resolve_timeline": "hero-cut v1",
+        "start_timecode": "01:00:00:00", "fps": 25,
+    })
+    task = http(world.owner).post("/ext/tasks", json={
+        "asset_id": str(world.asset.id), "source_comment_id": str(world.c_client.id), "kind": "cut_trim",
+        "stage": "review", "assignee_type": "person", "assignee_person_id": str(world.editor.id),
+    }).json()
+    http(world.owner).post(f"/ext/tasks/{task['id']}/notes", json={"kind": "editor_note", "body": "use take 3"})
+    context = gateway.get(f"/ext/tasks/{task['id']}/context")
+    assert context.status_code == 200, context.text
+    body = context.json()
+    assert body["task"]["id"] == task["id"] and (body["task"]["frame_in"], body["task"]["frame_out"]) == (50, 50)
+    assert body["project"] == {"id": str(world.project.id), "name": "Campaign film"}
+    assert body["asset"]["name"] == "hero-cut"
+    assert body["version"]["version_number"] == 1 and body["version"]["fps"] == 25.0
+    assert (body["version"]["resolve_project"], body["version"]["resolve_timeline"]) == (
+        "2026-11-20_GARLO_Campaign", "hero-cut v1")
+    assert body["source_comment"]["body"] == world.c_client.body and body["source_comment"]["author_name"] == "Rita Client"
+    assert [n["body"] for n in body["notes"]] == ["use take 3"]
+    assert body["assignee"]["email"] == world.editor.email and body["created_by"]["email"] == world.owner.email
+    # The team may read it; a client is told there is no such task.
+    assert http(world.editor).get(f"/ext/tasks/{task['id']}/context").status_code == 200
+    assert http(world.reviewer).get(f"/ext/tasks/{task['id']}/context").status_code == 404

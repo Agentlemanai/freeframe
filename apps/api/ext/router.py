@@ -12,13 +12,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models.asset import Asset, AssetVersion, FileType, MediaFile, ProcessingStatus, AssetType
 from ..models.comment import Comment
-from ..models.project import ProjectMember
+from ..models.project import Project, ProjectMember
 from ..models.user import User
 from ..services import event_service, s3_service
 from ..services.permissions import require_asset_access, require_live_project
@@ -32,8 +32,8 @@ from .models import (
 from .schemas import (
     CommentVisibilityChange, EventsPage, GatewayTokenCreate, GatewayTokenCreated,
     GatewayTokenResponse, GatewayVersionCreate, GatewayVersionCreated, NoteCreate, NoteResponse,
-    ReviewContext, TaskCreate, TaskDecision, TaskResponse, TaskStatusChange, TaskUpdate,
-    VersionFinalized, VersionMeta, VersionMetaResponse,
+    PersonResponse, ReviewContext, TaskContext, TaskCreate, TaskDecision, TaskResponse,
+    TaskStatusChange, TaskUpdate, VersionFinalized, VersionMeta, VersionMetaResponse,
 )
 
 router = APIRouter(prefix="/ext", tags=["ext: review tasks"])
@@ -168,6 +168,55 @@ def list_tasks(
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
 def get_task(task_id: uuid.UUID, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
     return _task(db, task_id, actor)
+
+
+@router.get("/tasks/{task_id}/context", response_model=TaskContext)
+def get_task_context(task_id: uuid.UUID, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
+    """The task with what surrounds it: the video, the version it was made on,
+    the comment it came from and its notes. What the gateway hands a machine."""
+    task = _task(db, task_id, actor)
+    asset = db.query(Asset).filter(Asset.id == task.asset_id).first()
+    project = db.query(Project).filter(Project.id == task.project_id).first()
+    version = None
+    if task.created_on_version_id is not None:
+        row = db.query(AssetVersion).filter(AssetVersion.id == task.created_on_version_id).first()
+        if row is not None:
+            media = db.query(MediaFile).filter(MediaFile.version_id == row.id).first()
+            ext = db.get(VersionExt, row.id)
+            version = {
+                "id": row.id, "version_number": row.version_number, "visibility": row.visibility,
+                "fps": media.fps if media is not None else None,
+                "duration_seconds": media.duration_seconds if media is not None else None,
+                "resolve_project": ext.resolve_project if ext is not None else None,
+                "resolve_timeline": ext.resolve_timeline if ext is not None else None,
+                "start_timecode": ext.start_timecode if ext is not None else None,
+            }
+    source = None
+    if task.source_comment_id is not None:
+        comment = db.query(Comment).filter(Comment.id == task.source_comment_id).first()
+        if comment is not None:
+            author = db.query(User).filter(User.id == comment.author_id).first() if comment.author_id else None
+            source = {
+                "id": comment.id, "body": comment.body, "visibility": comment.visibility,
+                "timecode_start": comment.timecode_start, "timecode_end": comment.timecode_end,
+                "author_name": author.name if author is not None else "Guest",
+            }
+
+    def person(user_id):
+        return db.query(User).filter(User.id == user_id).first() if user_id is not None else None
+
+    return TaskContext(
+        task=task,
+        project={"id": task.project_id, "name": project.name if project is not None else None},
+        asset={"id": task.asset_id, "name": asset.name if asset is not None else None,
+               "asset_type": asset.asset_type.value if asset is not None else None},
+        version=version,
+        source_comment=source,
+        notes=db.query(ReviewTaskNote).filter(ReviewTaskNote.task_id == task.id).order_by(
+            ReviewTaskNote.created_at, ReviewTaskNote.id).all(),
+        assignee=person(task.assignee_person_id),
+        created_by=person(task.created_by),
+    )
 
 
 @router.patch("/tasks/{task_id}", response_model=TaskResponse)
@@ -413,6 +462,39 @@ def set_comment_visibility(
         "asset_id": str(asset.id), "comment_id": str(comment.id),
     })
     return {"comment_id": str(comment.id), "visibility": body.visibility, "changed": [str(c) for c in changed]}
+
+
+# ── People: FreeFrame's accounts, for the gateway to match with its own ────────
+
+@router.get("/people", response_model=list[PersonResponse])
+def list_people(
+    ids: Optional[str] = Query(default=None, description="Comma-separated user ids"),
+    emails: Optional[str] = Query(default=None, description="Comma-separated email addresses"),
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(get_actor),
+):
+    """Look accounts up by id or by email. The gateway knows people by email;
+    tasks and versions here name them by id. Nothing is listed without a key."""
+    if actor.is_gateway:
+        auth.require_scope(actor, auth.SCOPE_READ)
+    elif not visibility.is_admin(actor.user):
+        raise HTTPException(status_code=403, detail="People are looked up by the gateway")
+    wanted_ids = []
+    for raw in (ids or "").split(","):
+        if raw.strip():
+            try:
+                wanted_ids.append(uuid.UUID(raw.strip()))
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"{raw.strip()} is not an id") from None
+    wanted_emails = [e.strip().lower() for e in (emails or "").split(",") if e.strip()]
+    if not wanted_ids and not wanted_emails:
+        raise HTTPException(status_code=422, detail="Give ids or emails")
+    if len(wanted_ids) + len(wanted_emails) > 200:
+        raise HTTPException(status_code=422, detail="At most 200 at a time")
+    return db.query(User).filter(
+        User.deleted_at.is_(None),
+        or_(User.id.in_(wanted_ids), func.lower(User.email).in_(wanted_emails)),
+    ).order_by(User.email).all()
 
 
 # ── Events: catch-up ───────────────────────────────────────────────────────────
