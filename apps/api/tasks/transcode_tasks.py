@@ -9,6 +9,7 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from celery.exceptions import Retry
+from sqlalchemy.exc import OperationalError
 
 from .celery_app import celery_app
 from ..database import SessionLocal
@@ -28,10 +29,26 @@ def _run_async(coro):
         loop.close()
 
 
+def _mark_failed_best_effort(version_id: str) -> None:
+    """Record `failed` on a fresh session once retries are spent; the database may still be down."""
+    db = SessionLocal()
+    try:
+        version = db.query(AssetVersion).filter(AssetVersion.id == uuid.UUID(version_id)).first()
+        if version:
+            version.processing_status = ProcessingStatus.failed
+            db.commit()
+    except Exception:
+        log.exception("Could not mark version %s failed", version_id)
+    finally:
+        db.close()
+
+
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def process_asset(self, asset_id: str, version_id: str):
     """Main processing task dispatched after upload completes."""
     db = SessionLocal()
+    # Past this point the handler around the transcode owns retries and `failed`.
+    setup_done = False
     try:
         version = db.query(AssetVersion).filter(AssetVersion.id == uuid.UUID(version_id)).first()
         if not version:
@@ -53,6 +70,7 @@ def process_asset(self, asset_id: str, version_id: str):
         # Reset to processing status before each attempt
         version.processing_status = ProcessingStatus.processing
         db.commit()
+        setup_done = True
 
         output_prefix = f"processed/{asset.project_id}/{asset_id}/{version_id}"
         s3 = get_s3_client()
@@ -124,6 +142,17 @@ def process_asset(self, asset_id: str, version_id: str):
                 _record_failure()
                 raise
 
+    except OperationalError as exc:
+        # The database was unreachable before the transcode started. /upload/complete
+        # has already set `processing`, so letting this escape strands the version
+        # there with no retry and no event.
+        if setup_done:
+            raise
+        db.rollback()
+        if self.request.retries >= self.max_retries:
+            _mark_failed_best_effort(version_id)
+            raise
+        raise self.retry(exc=exc)
     finally:
         db.close()
 
