@@ -26,6 +26,7 @@ import { useDrawing } from "@/hooks/use-drawing";
 import { api } from "@/lib/api";
 import { resolveSubmitTimecode } from "@/lib/resolve-submit-timecode";
 import type { User } from "@/types";
+import { useReviewExt } from "@/components/ext/review-ext"; // fork: who may pick a comment's visibility
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -247,6 +248,23 @@ export function CommentInput({
     "public" | "internal"
   >("public");
   const [visDropdownOpen, setVisDropdownOpen] = React.useState(false);
+  // Fork: on the review screen the server says what a new comment defaults to
+  // (internal for the team, public for a client) and whether this person may
+  // choose. Only a manager may; an editor's comments are always internal.
+  // Elsewhere (share pages, compare) there is no context and nothing changes.
+  const ext = useReviewExt();
+  const extDefault = ext?.info.default_comment_visibility;
+  // Adopted once, when it arrives (it is fetched), not on every render: after
+  // that the choice is the person's.
+  const [adoptedDefault, setAdoptedDefault] = React.useState<string | undefined>(undefined);
+  if (extDefault && extDefault !== adoptedDefault) {
+    setAdoptedDefault(extDefault);
+    setCommentVisibility(extDefault);
+  }
+  const canChooseVisibility =
+    allowInternal && (ext ? ext.info.can_choose_comment_visibility : true);
+  const alwaysInternal =
+    allowInternal && !!ext && ext.info.sees_internal && !ext.info.can_choose_comment_visibility;
   const [timecodeAttached, setTimecodeAttached] = React.useState(true);
   const visRef = React.useRef<HTMLDivElement>(null);
 
@@ -640,8 +658,17 @@ export function CommentInput({
             </div>
 
             <div className="flex items-center gap-2">
+              {alwaysInternal && (
+                <span
+                  className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md text-[12px] border text-amber-400 border-amber-400/30 bg-amber-400/10"
+                  title="Your comments stay with the team. A project owner can show one to the client."
+                >
+                  <Lock className="h-3 w-3" />
+                  Internal
+                </span>
+              )}
               {/* Visibility dropdown */}
-              {allowInternal && (
+              {canChooseVisibility && (
                 <div className="relative" ref={visRef}>
                   <button
                     onClick={() => setVisDropdownOpen((p) => !p)}

@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
-import { AlertCircle, Loader2, CheckCircle2, ChevronDown } from 'lucide-react'
+import { AlertCircle, Loader2, CheckCircle2, ChevronDown, Lock } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useReviewStore } from '@/stores/review-store'
 import type { AssetVersion, AssetVersionStatus } from '@/types'
@@ -104,7 +104,13 @@ export function VersionSwitcher({ versions, className }: VersionSwitcherProps) {
                       isDisabled && 'opacity-50 cursor-not-allowed',
                     )}
                   >
-                    <span>v{version.version_number}</span>
+                    <span className="inline-flex items-center gap-1.5">
+                      v{version.version_number}
+                      {/* Fork: not yet published to the client. */}
+                      {version.visibility === 'internal' && (
+                        <Lock className="h-3 w-3 text-amber-400" aria-label="Internal" />
+                      )}
+                    </span>
                     <span
                       className={cn('inline-flex items-center gap-1 text-[11px]', statusCfg.className)}
                       title={statusCfg.label}

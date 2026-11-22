@@ -285,6 +285,8 @@ export interface AssetVersion {
   asset_id: string;
   version_number: number;
   processing_status: AssetVersionStatus;
+  /** Fork: "internal" = only the team sees it until it is published to the client. */
+  visibility?: 'public' | 'internal';
   created_by: string;
   created_at: string;
   deleted_at: string | null;

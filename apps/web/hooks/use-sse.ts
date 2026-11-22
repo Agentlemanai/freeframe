@@ -69,8 +69,14 @@ export interface UseSSEOptions {
   onNewComment?: (data: NewCommentEvent) => void
   onCommentResolved?: (data: CommentResolvedEvent) => void
   onApprovalUpdated?: (data: ApprovalUpdatedEvent) => void
+  /** Fork: the review-task extension's events (`EXT_EVENT_TYPES`). */
+  onExtEvent?: (type: string, data: Record<string, unknown>) => void
   enabled?: boolean
 }
+
+/** Fork: events the server sends for review tasks and client / internal
+ *  visibility. A client's stream only ever carries the last two. */
+export const EXT_EVENT_TYPES = ['review_tasks_changed', 'version_published', 'comment_visibility_changed'] as const
 
 export interface UseSSEReturn {
   isConnected: boolean
@@ -114,6 +120,7 @@ export function useSSE(projectId: string | null | undefined, options: UseSSEOpti
     onNewComment,
     onCommentResolved,
     onApprovalUpdated,
+    onExtEvent,
     enabled = true,
   } = options
 
@@ -128,6 +135,7 @@ export function useSSE(projectId: string | null | undefined, options: UseSSEOpti
     onNewComment,
     onCommentResolved,
     onApprovalUpdated,
+    onExtEvent,
   })
 
   React.useEffect(() => {
@@ -138,6 +146,7 @@ export function useSSE(projectId: string | null | undefined, options: UseSSEOpti
       onNewComment,
       onCommentResolved,
       onApprovalUpdated,
+      onExtEvent,
     }
   })
 
@@ -297,6 +306,18 @@ export function useSSE(projectId: string | null | undefined, options: UseSSEOpti
           // ignore malformed events
         }
       })
+
+      // ── fork: review tasks and visibility ──
+      for (const type of EXT_EVENT_TYPES) {
+        es.addEventListener(type, (e: MessageEvent) => {
+          if (destroyed) return
+          try {
+            callbackRefs.current.onExtEvent?.(type, JSON.parse(e.data) as Record<string, unknown>)
+          } catch {
+            // ignore malformed events
+          }
+        })
+      }
     }
 
     void connect()
