@@ -285,8 +285,15 @@ def test_a_member_reply_still_notifies_a_parent_author_with_asset_access(real_db
     from apps.api.services.permissions import can_access_asset
     import apps.api.routers.comments as comments_module
 
+    from apps.api.models.project import ProjectMember, ProjectRole
+
     owner, _, assets = _seed(real_db, monkeypatch)
     asset, versions = assets[0]
+    # Fork: an editor's reply is internal (ext/visibility.py), so the parent's
+    # author has to be on the project's internal tier to be told about it. The
+    # seed makes them the project's creator only; make them its owner too.
+    real_db.add(ProjectMember(project_id=asset.project_id, user_id=owner.id, role=ProjectRole.owner))
+    real_db.flush()
     member, _ = _project_member(real_db, asset.project_id)
     parent = _comment(real_db, asset, versions[0], owner)
     assert can_access_asset(real_db, asset, owner)

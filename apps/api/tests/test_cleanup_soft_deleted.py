@@ -427,6 +427,13 @@ def test_gc_covers_all_inbound_fks_to_purged_tables():
     }
     # (referencing_table, referencing_column) confirmed handled by a _purge_* helper.
     KNOWN_HANDLED = {
+        # Fork (apps/api/ext): handled by ON DELETE CASCADE / SET NULL on the
+        # foreign keys themselves, not by a _purge_* helper. Covered by
+        # tests/test_ext_purge.py against a real database.
+        ("review_tasks", "project_id"), ("review_tasks", "asset_id"),
+        ("review_tasks", "created_on_version_id"), ("review_tasks", "result_version_id"),
+        ("review_tasks", "source_comment_id"), ("version_ext", "version_id"),
+        ("version_resolved_tasks", "version_id"),
         # -> projects.id
         ("assets", "project_id"), ("folders", "project_id"), ("share_links", "project_id"),
         ("project_brandings", "project_id"), ("watermark_settings", "project_id"),

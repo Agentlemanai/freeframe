@@ -108,6 +108,7 @@ async def event_stream(
     recheck_seconds: float,
     expires_at: Optional[float] = None,
     checked_at: Optional[float] = None,
+    channels: Optional[list[str]] = None,
 ) -> AsyncGenerator[str, None]:
     """Subscribe to a project's channel and yield SSE messages for as long as
     the subscriber stays authorized.
@@ -136,7 +137,10 @@ async def event_stream(
     keepalive_seconds = min(recheck_seconds, KEEPALIVE_MAX_SECONDS)
     r = _get_redis()
     pubsub = r.pubsub()
-    await pubsub.subscribe(_channel(project_id))
+    # Fork: `channels` is the Redis channels to listen on. Default: the project's
+    # own. The internal tier is also given the internal channel (ext/live.py).
+    channels = channels or [_channel(project_id)]
+    await pubsub.subscribe(*channels)
     loop = asyncio.get_running_loop()
     if checked_at is None:
         checked_at = loop.time()
@@ -177,5 +181,5 @@ async def event_stream(
                 yield ": keepalive\n\n"
                 sent_at = loop.time()
     finally:
-        await pubsub.unsubscribe(_channel(project_id))
+        await pubsub.unsubscribe(*channels)
         await pubsub.aclose()

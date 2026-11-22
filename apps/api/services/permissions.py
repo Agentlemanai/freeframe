@@ -581,6 +581,10 @@ def validate_share_link(db: Session, token: str) -> ShareLink:
     so restoring the content brings the link back.
     """
     from datetime import datetime, timezone
+    # Fork (ext/visibility.py): a share link is the client's view, whoever opens
+    # it. From here on this request reads only client-visible comments and versions.
+    from ..ext.visibility import bind_public
+    bind_public(db)
     row = (
         db.query(ShareLink, func.coalesce(ShareLink.folder_id, Asset.folder_id))
         .outerjoin(Asset, Asset.id == ShareLink.asset_id)

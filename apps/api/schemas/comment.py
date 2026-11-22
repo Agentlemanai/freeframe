@@ -16,7 +16,9 @@ class CommentCreate(BaseModel):
     timecode_start: Optional[float] = None
     timecode_end: Optional[float] = None
     body: str
-    visibility: Optional[str] = "public"  # "public" or "internal"
+    # "public" or "internal". Fork: left out, the server picks by the author's
+    # project role (ext/visibility.py: comment_visibility_for).
+    visibility: Optional[str] = None
     annotation: Optional[AnnotationData] = None
     mention_user_ids: list[uuid.UUID] = []  # Explicit mention IDs from frontend
 

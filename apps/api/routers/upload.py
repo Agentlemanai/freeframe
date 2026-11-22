@@ -37,6 +37,7 @@ from ..schemas.upload import (
 )
 from ..services.storage import choose_part_size, upload_guard_error
 from ..services.versions import next_version_number
+from ..ext import visibility as ext_visibility, events as ext_events  # fork
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,7 @@ def initiate_upload(
         version_number=next_version,
         processing_status=ProcessingStatus.uploading,
         created_by=current_user.id,
+        visibility=ext_visibility.version_visibility_for(db, body.project_id, current_user),  # fork
     )
     db.add(version)
     db.flush()
@@ -835,9 +837,12 @@ def complete_upload(
                 synchronize_session=False,
             )
         )
+        if claimed:
+            ext_events.emit_version_created(db, version)  # fork: in the claim's transaction
         db.commit()
 
         if claimed:
+            ext_events.dispatch()  # fork
             # The bulk UPDATE does not touch the instance already loaded in this
             # session, so without this the row says `processing` while the object
             # in hand still says `uploading`.

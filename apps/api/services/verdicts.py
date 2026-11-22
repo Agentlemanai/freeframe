@@ -149,7 +149,11 @@ def _creator_facing_name(db: Session, project_id: uuid.UUID, actor: Actor) -> st
 
 
 def _publish(project_id: uuid.UUID, payload: dict) -> None:
-    event_service.publish_sync(project_id, "approval_updated", payload)
+    # Fork: a verdict on an internal version is the team's business only.
+    from ..ext import live as ext_live
+    event_service.publish_sync(
+        ext_live.transcode_channel_key(project_id, payload.get("version_id")), "approval_updated", payload,
+    )
 
 
 def set_verdict(

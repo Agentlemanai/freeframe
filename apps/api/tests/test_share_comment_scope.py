@@ -231,20 +231,25 @@ def _listed_to_a_signed_out_caller(real_db, link):
     return [c.body for c in listed]
 
 
-def _member(real_db, project):
+def _member(real_db, project, role=None):
     from apps.api.models.project import ProjectMember, ProjectRole
     member = _user(real_db, "member")
     real_db.add(ProjectMember(project_id=project.id, user_id=member.id,
-                              role=ProjectRole.reviewer))
+                              role=role or ProjectRole.reviewer))
     real_db.flush()
     return member
 
 
 def test_an_internal_comment_from_a_project_member_stays_internal(real_db, seed):
-    member = _member(real_db, seed["project_a"])
+    # Fork: "member" means the internal tier, owner or editor. A reviewer is a
+    # client and is refused; see tests/test_ext_visibility.py.
+    from apps.api.models.project import ProjectRole
+    from apps.api.ext.visibility import unbind
+    member = _member(real_db, seed["project_a"], role=ProjectRole.editor)
 
     _post_as(real_db, seed["link"], member, body="team only", visibility="internal")
 
+    unbind(real_db)  # the share route left this shared session reading as a client
     [saved] = _comments_with_body(real_db, "team only")
     assert saved.visibility == "internal"
     assert saved.author_id == member.id

@@ -42,7 +42,10 @@ def next_version_number(db: Session, asset_id: uuid.UUID) -> int:
     deletes a soft-deleted version after `SOFT_DELETE_RETENTION_DAYS`, and the
     number becomes free again then.
     """
+    # Fork: every version, including internal ones this caller cannot read
+    # (ext/visibility.py). A client's upload must not be handed a number an
+    # internal version already holds.
     last_version = db.query(AssetVersion).filter(
         AssetVersion.asset_id == asset_id,
-    ).order_by(AssetVersion.version_number.desc()).first()
+    ).order_by(AssetVersion.version_number.desc()).execution_options(ext_unfiltered=True).first()
     return (last_version.version_number + 1) if last_version else 1

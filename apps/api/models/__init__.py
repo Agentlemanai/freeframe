@@ -10,3 +10,12 @@ from .branding import ProjectBranding, WatermarkSettings
 from .instance_settings import InstanceSettings
 from .instance_branding import InstanceBranding
 from .activity import Mention, ActivityLog, Notification
+# Fork: the review-task extension's own tables (apps/api/ext).
+try:
+    from ..ext.models import (
+        ReviewTask, ReviewTaskNote, VersionExt, VersionResolvedTask, ExtEvent, GatewayToken,
+    )
+except ImportError:  # alembic imports this package as top-level `models`
+    from ext.models import (
+        ReviewTask, ReviewTaskNote, VersionExt, VersionResolvedTask, ExtEvent, GatewayToken,
+    )
