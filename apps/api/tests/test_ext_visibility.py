@@ -281,6 +281,21 @@ def test_an_internal_reply_does_not_notify_the_client_it_answers(http, world, li
     ).count() == 0
 
 
+def test_an_old_notification_about_an_internal_comment_is_not_listed_to_a_client(http, world, live_db):
+    """Rows written before this rule existed, or before a comment was made internal."""
+    from apps.api.models.activity import Notification, NotificationType
+
+    for comment in (world.c_internal, world.c_client):
+        for user in (world.reviewer, world.editor):
+            live_db.add(Notification(user_id=user.id, type=NotificationType.comment,
+                                     asset_id=world.asset.id, comment_id=comment.id))
+    live_db.flush()
+    seen_by_client = http(world.reviewer).get("/me/notifications").json()
+    assert [n["comment_id"] for n in seen_by_client] == [str(world.c_client.id)]
+    seen_by_editor = {n["comment_id"] for n in http(world.editor).get("/me/notifications").json()}
+    assert seen_by_editor == {str(world.c_client.id), str(world.c_internal.id)}
+
+
 def test_live_events_about_internal_comments_stay_off_the_clients_channel(http, world):
     http(world.owner).post(f"/assets/{world.asset.id}/comments",
                            json={"version_id": str(world.v1.id), "body": "internal"})

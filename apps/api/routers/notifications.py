@@ -53,6 +53,11 @@ def list_notifications(
 
         if n.comment_id:
             comment = db.query(Comment).filter(Comment.id == n.comment_id).first()
+            if comment is None:
+                # Fork: the comment is not this user's to read (it is internal and
+                # they are a client; ext/visibility.py), or it is gone. Either way
+                # there is nothing to tell them about.
+                continue
             if comment:
                 comment_preview = comment.body[:100] if comment.body else None
                 # Get actor from comment author
