@@ -124,27 +124,32 @@ def test_https_file_redirects_plain_http():
 
 
 def test_https_file_only_adds_to_the_base_file():
+    # Garlomedia fork: docker-compose.prod.yml is the Coolify variant (see its
+    # header). Coolify's own proxy terminates TLS, so the HTTPS override is not
+    # layered on it. What is still checked: the override stays additive, and
+    # the fork's base file gives it nothing to collide with.
     base = _services(PROD_COMPOSE)
     over = _services(HTTPS_COMPOSE)
     assert set(over) <= {"traefik", "api", "web"}
     for service in ("api", "web"):
         assert set(over[service]) == {"labels"}
-    # The only base label the override may re-set is the plain-http router's
-    # middlewares attachment; everything else is new.
-    for service in ("api", "web"):
-        base_labels = _labels(PROD_COMPOSE, service)
-        for key, value in _labels(HTTPS_COMPOSE, service).items():
-            if key in base_labels:
-                assert key == f"traefik.http.routers.{service}.middlewares", key
+        assert "labels" not in base[service], service
     assert "command" not in over["traefik"]
-    assert base["traefik"]["image"] == "traefik:v2.11"
+    assert "traefik" not in base
 
 
 def test_base_prod_file_unchanged():
-    """Opt-in means opt-in: the base file's behaviour is frozen here."""
+    """The fork's base file is frozen here in its Coolify form.
+
+    Upstream freezes its own base file (bundled traefik, PathPrefix router
+    labels) in this test. The fork deploys through Coolify, whose proxy already
+    owns ports 80/443 and writes its own router labels from the domain fields,
+    so the fork's file has no traefik service, no traefik labels, and reads
+    `.env` (the file Coolify writes) instead of `.env.prod`. An upstream merge
+    that brings any of those back fails here instead of in production.
+    """
     services = _services(PROD_COMPOSE)
     assert set(services) == {
-        "traefik",
         "postgres",
         "redis",
         "api",
@@ -156,32 +161,10 @@ def test_base_prod_file_unchanged():
     }
     for name in APP_SERVICES:
         assert "image" not in services[name], name
-
-    assert services["api"]["labels"] == [
-        "traefik.enable=true",
-        "traefik.http.routers.api.rule=PathPrefix(`/api`)",
-        "traefik.http.routers.api.entrypoints=web",
-        "traefik.http.routers.api.middlewares=strip-api-prefix",
-        "traefik.http.routers.api-secure.rule=PathPrefix(`/api`)",
-        "traefik.http.routers.api-secure.entrypoints=websecure",
-        "traefik.http.routers.api-secure.tls.certresolver=letsencrypt",
-        "traefik.http.routers.api-secure.middlewares=strip-api-prefix",
-        "traefik.http.routers.api-secure.service=api",
-        "traefik.http.middlewares.strip-api-prefix.stripprefix.prefixes=/api",
-        "traefik.http.services.api.loadbalancer.server.port=8000",
-    ]
-    assert services["web"]["labels"] == [
-        "traefik.enable=true",
-        "traefik.http.routers.web.rule=PathPrefix(`/`)",
-        "traefik.http.routers.web.entrypoints=web",
-        "traefik.http.routers.web.priority=1",
-        "traefik.http.routers.web-secure.rule=PathPrefix(`/`)",
-        "traefik.http.routers.web-secure.entrypoints=websecure",
-        "traefik.http.routers.web-secure.tls.certresolver=letsencrypt",
-        "traefik.http.routers.web-secure.priority=1",
-        "traefik.http.routers.web-secure.service=web",
-        "traefik.http.services.web.loadbalancer.server.port=3000",
-    ]
+        assert "labels" not in services[name], name
+    for name in (*APP_SERVICES, "postgres", "redis"):
+        assert services[name]["env_file"] == [".env"], name
+    assert "letsencrypt" not in yaml.safe_load(PROD_COMPOSE.read_text())["volumes"]
 
     for name in ("api", "worker", "email_worker", "maintenance_worker", "beat"):
         assert services[name]["build"] == {
