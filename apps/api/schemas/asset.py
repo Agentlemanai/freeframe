@@ -28,6 +28,8 @@ class AssetVersionResponse(BaseModel):
     asset_id: uuid.UUID
     version_number: int
     processing_status: ProcessingStatus
+    # Fork: "public" (the client may see it) or "internal" (the team only).
+    visibility: str = "public"
     created_by: uuid.UUID
     created_at: datetime
     # When the upload last moved. Lets a client that only has history to go on

@@ -342,9 +342,15 @@ def _publish_event(project_id: str, event_type: str, payload: dict):
 
     Delegates to event_service so there is a single emit path; it is pooled and
     already best-effort, which is what this needs.
+
+    Fork: an internal version's progress goes on the project's internal channel
+    (ext/live.py), so the client tier is not told it exists.
     """
     from ..services import event_service
-    return event_service.publish_sync(project_id, event_type, payload)
+    from ..ext import live as ext_live
+    return event_service.publish_sync(
+        ext_live.transcode_channel_key(project_id, payload.get("version_id")), event_type, payload,
+    )
 
 
 def _eligible_media_rows(db):

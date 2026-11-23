@@ -38,6 +38,9 @@ class Base(DeclarativeBase):
 
 def get_db():
     db = SessionLocal()
+    # Fork (ext/visibility.py): a request session returns only client-visible
+    # comments and versions until the request authenticates.
+    _bind_public_viewer(db)
     try:
         yield db
     finally:
@@ -60,3 +63,9 @@ def _persist_admin_access_audit(db) -> None:
         persist_admin_access_audit(db)
     except Exception:
         log.warning("could not persist the admin access audit", exc_info=True)
+
+
+def _bind_public_viewer(db) -> None:
+    # Imported here: ext.visibility imports the models, which import this module.
+    from .ext.visibility import bind_public
+    bind_public(db)

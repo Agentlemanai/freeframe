@@ -22,6 +22,7 @@ from ..services.permissions import (
     persist_admin_access_audit,
     project_events_denial,
 )
+from ..ext import live as ext_live  # fork: the internal tier's event channel
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -69,6 +70,16 @@ def _denial(
         db.close()
 
 
+def _sees_internal(project_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    """Fork: whether this subscriber is on the project's internal tier, on its
+    own short-lived session like `_denial`."""
+    db = SessionLocal()
+    try:
+        return ext_live.sees_internal_events(db, project_id, user_id)
+    finally:
+        db.close()
+
+
 @router.get("/{project_id}")
 async def stream_events(
     project_id: uuid.UUID,
@@ -82,9 +93,18 @@ async def stream_events(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authenticated")
     user_id, token_version, expires_at = claims
 
+    # Fork: decided once per stream. A stream that was opened with the internal
+    # channel is revoked when its subscriber leaves the internal tier, and the
+    # client's reconnect opens one without it.
+    internal = await asyncio.to_thread(_sees_internal, project_id, user_id)
+
     async def authorize(*, audit: bool = False) -> Optional[str]:
         # The query is synchronous; keep it off the event loop.
-        return await asyncio.to_thread(_denial, project_id, user_id, token_version, audit)
+        denial = await asyncio.to_thread(_denial, project_id, user_id, token_version, audit)
+        if denial is None and internal and not audit:
+            if not await asyncio.to_thread(_sees_internal, project_id, user_id):
+                return EVENTS_ACCESS_REVOKED
+        return denial
 
     # Refuse here rather than open the stream and revoke it: a client resets its
     # reconnect backoff when a stream opens, so open-then-revoke would invite a
@@ -103,6 +123,7 @@ async def stream_events(
             recheck_seconds=settings.sse_auth_recheck_seconds,
             expires_at=expires_at,
             checked_at=checked_at,
+            channels=ext_live.stream_channels(project_id, internal=internal),
         ),
         media_type="text/event-stream",
         headers={

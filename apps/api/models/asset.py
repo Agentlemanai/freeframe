@@ -78,6 +78,9 @@ class AssetVersion(Base):
     # ranges. NULL means the row predates this being recorded; callers derive the
     # size from the parts already held rather than assuming today's constant.
     chunk_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Fork (ext/visibility.py): "public" = the client may see it, "internal" =
+    # the team only, until a manager publishes it.
+    visibility: Mapped[str] = mapped_column(String(20), default="public", server_default="public", nullable=False)
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

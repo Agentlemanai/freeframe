@@ -32,6 +32,7 @@ from ..services.storage import choose_part_size, upload_guard_error
 from ..services.versions import UNVIEWABLE_STATUSES, next_version_number
 from ..services.s3_service import create_multipart_upload
 from .upload import commit_initiated_upload, storage_initiate_error
+from ..ext import visibility as ext_visibility  # fork: client / internal versions
 
 router = APIRouter(tags=["assets"])
 
@@ -483,6 +484,7 @@ def initiate_new_version(
         version_number=next_version,
         processing_status=ProcessingStatus.uploading,
         created_by=current_user.id,
+        visibility=ext_visibility.version_visibility_for(db, asset.project_id, current_user),  # fork
     )
     db.add(version)
     db.flush()

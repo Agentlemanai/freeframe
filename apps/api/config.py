@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     # clients from creating projects. Admins can always create projects.
     oidc_project_creator_groups: str = ""
 
+    # Fork (apps/api/ext): review-task events are delivered to the Garlomedia
+    # gateway as webhooks, signed with HMAC-SHA256 of the body using the shared
+    # secret. Both unset: nothing is sent, and the gateway reads
+    # GET /ext/events?since= instead.
+    ext_gateway_webhook_url: str = ""
+    ext_gateway_webhook_secret: str = ""
+
     transcoder_engine: str = "ffmpeg"
     # Which rungs of the quality ladder to build, comma-separated. Valid names
     # are the keys of packages.transcoder.ffmpeg_transcoder.QUALITY_MAP; the

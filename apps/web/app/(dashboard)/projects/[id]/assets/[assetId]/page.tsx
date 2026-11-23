@@ -32,6 +32,9 @@ import { useViewStore } from '@/stores/view-store'
 import { sortAssets } from '@/lib/sort-assets'
 import { canCompare } from '@/lib/compare-time'
 import { verdictsKey } from '@/lib/verdicts'
+// Fork: review tasks and client / internal visibility (components/ext).
+import { ReviewExtProvider, revalidateForExtEvent } from '@/components/ext/review-ext'
+import { MakeTaskDialog, ReviewTaskPanel, VersionVisibility } from '@/components/ext/review-tasks'
 import {
   ArrowLeft,
   ChevronLeft,
@@ -228,6 +231,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     onApprovalUpdated: (d) => {
       if (d.asset_id === asset?.id) void globalMutate(verdictsKey(d.asset_id, d.version_id))
     },
+    onExtEvent: (type) => revalidateForExtEvent(type, asset?.id, currentVersion?.id, refetchVersions),
   })
 
   // Transcode events are not the only thing that changes this list. Discarding
@@ -521,7 +525,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     </>
   )
 
-  const commentPanelNode = (
+  const commentListNode = (
     <CommentPanel
       comments={comments as any}
       currentUserId={user?.id}
@@ -533,6 +537,14 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
       onReply={() => {}}
       onSubmitReply={handleSubmitReply}
     />
+  )
+  // Fork: the video's tasks, for the team only, above its comments.
+  const commentPanelNode = (
+    <>
+      <ReviewTaskPanel versions={versions} />
+      <MakeTaskDialog />
+      {commentListNode}
+    </>
   )
 
   const commentInputNode = canComment ? (
@@ -690,6 +702,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             }}
           />
           <VersionSwitcher versions={versions} />
+          <VersionVisibility onPublished={refetchVersions} />
           {verdictsInTopBar && verdictControls}
           {asset && canCompare(asset.asset_type, versions) && (
             <button
@@ -858,7 +871,9 @@ export default function ReviewPage({
 
   return (
     <ReviewProvider assetId={assetId} initialVersionId={initialVersionId}>
-      <ReviewScreenInner projectId={projectId} />
+      <ReviewExtProvider assetId={assetId} projectId={projectId}>
+        <ReviewScreenInner projectId={projectId} />
+      </ReviewExtProvider>
     </ReviewProvider>
   )
 }

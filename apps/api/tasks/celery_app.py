@@ -19,6 +19,7 @@ celery_app = Celery(
         "apps.api.tasks.email_tasks",
         "apps.api.tasks.cleanup_tasks",
         "apps.api.tasks.storage_tasks",
+        "apps.api.ext.webhook",  # fork: review-task events to the gateway
     ],
 )
 
@@ -65,6 +66,9 @@ celery_app.conf.update(
         # is a full FFmpeg re-encode, so it belongs with the other transcoding
         # work rather than behind an hour-long bucket sweep.
         "apply_watermark": {"queue": "transcoding"},
+        # Fork: a short HTTP POST per event that the gateway is waiting on, so it
+        # shares the low-latency worker rather than queueing behind a bucket sweep.
+        "deliver_ext_events": {"queue": "email_high"},
         "apps.api.tasks.email_tasks.send_magic_code_email": {"queue": "email_high"},
         "apps.api.tasks.email_tasks.send_invite_email": {"queue": "email_high"},
         "apps.api.tasks.email_tasks.send_mention_email": {"queue": "email_low"},
@@ -96,6 +100,12 @@ celery_app.conf.beat_schedule = {
     "cleanup-soft-deleted": {
         "task": "cleanup_soft_deleted",
         "schedule": crontab(minute=0, hour=3),  # daily at 03:00 UTC
+    },
+    # Fork: the safety net for review-task webhooks. A change dispatches its own
+    # delivery; this picks up whatever that missed and whatever is being retried.
+    "deliver-ext-events": {
+        "task": "deliver_ext_events",
+        "schedule": crontab(),  # every minute
     },
     "sweep-orphan-s3": {
         "task": "sweep_orphan_s3",

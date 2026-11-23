@@ -163,6 +163,9 @@ app.include_router(folders.router)
 app.include_router(hls_proxy.router)
 app.include_router(instance_settings.router)
 app.include_router(instance_branding.router)
+# Fork: review tasks, client / internal visibility, events, the gateway account.
+from .ext.router import router as ext_router  # noqa: E402
+app.include_router(ext_router)
 
 @app.get("/health")
 def health():

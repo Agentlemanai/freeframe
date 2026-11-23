@@ -39,6 +39,7 @@ import {
 } from "@/lib/export-comments";
 import { FpsPromptDialog } from "@/components/review/fps-prompt-dialog";
 import { Avatar } from "@/components/shared/avatar";
+import { CommentExtActions } from "@/components/ext/review-tasks"; // fork: Make task, show / hide
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -545,6 +546,7 @@ function CommentItem({
                   #{commentNumber}
                 </span>
               )}
+              <CommentExtActions comment={comment} depth={depth} />
               {comment.visibility === "internal" ? (
                 <Lock className="h-3.5 w-3.5 text-amber-400" />
               ) : (

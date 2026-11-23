@@ -316,6 +316,10 @@ def test_a_share_link_comment_logs_what_the_admin_role_alone_allowed(
     )
     assert posted.status_code == 201
     seed.db.flush()
+    # Fork: the share route left this shared test session reading as a client
+    # (ext/visibility.py), which would hide the internal comment being checked.
+    from apps.api.ext.visibility import unbind
+    unbind(seed.db)
     filed = seed.db.query(Comment).filter(Comment.asset_id == asset.id).one()
     assert filed.visibility == visibility
     assert filed.author_id == admin.id

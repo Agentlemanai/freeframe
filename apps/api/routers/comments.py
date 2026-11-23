@@ -47,6 +47,8 @@ from ..schemas.comment import (
 )
 from ..services import s3_service
 from ..services import comment_export
+# Fork: client / internal visibility and the review-task event outbox.
+from ..ext import visibility as ext_visibility, events as ext_events, live as ext_live
 from ..services.guests import resolve_guest
 from ..services.permissions import (
     require_asset_access, can_access_asset, can_access_asset_audited,
@@ -393,6 +395,8 @@ def _notify_parent_author_about_reply(
     parent_author = db.query(User).filter(User.id == parent.author_id).first()
     if not parent_author or not can_access_asset(db, asset, parent_author):
         return
+    if not ext_visibility.may_see_comment(db, asset.project_id, reply, parent_author):
+        return  # fork: an internal reply is not announced to the client tier
 
     db.add(Notification(
         user_id=parent.author_id,
@@ -428,6 +432,11 @@ def _create_mentions(db: Session, comment: Comment, asset: Asset, body: str, aut
     # (or a guest via a share link) could @mention an arbitrary user id/email and have their
     # name, the asset name, and a comment preview emailed to someone with no access to either.
     mentioned_users = [u for u in mentioned_users if can_access_asset(db, asset, u)]
+    # Fork: nor may a mention in an internal comment reach the client tier.
+    mentioned_users = [
+        u for u in mentioned_users
+        if ext_visibility.may_see_comment(db, asset.project_id, comment, u)
+    ]
 
     for user in mentioned_users:
         mention = Mention(comment_id=comment.id, mentioned_user_id=user.id)
@@ -499,6 +508,7 @@ def create_comment(
     # inside a thread on an asset the author cannot open. The weaker failure is
     # the same bug pointed at a deleted parent: a 201 for a reply no read path
     # will ever return.
+    parent = None
     if body.parent_id is not None:
         parent = db.query(Comment).filter(
             Comment.id == body.parent_id,
@@ -516,7 +526,9 @@ def create_comment(
         timecode_start=body.timecode_start,
         timecode_end=body.timecode_end,
         body=body.body,
-        visibility=body.visibility or "public",
+        visibility=ext_visibility.comment_visibility_for(
+            db, asset.project_id, current_user, body.visibility, parent,
+        ),
     )
     db.add(comment)
     db.flush()
@@ -533,7 +545,9 @@ def create_comment(
     _create_mentions(db, comment, asset, body.body, current_user.name, body.mention_user_ids)
 
     # Notify asset creator about the comment (unless they're the commenter)
-    if asset.created_by and asset.created_by != current_user.id:
+    if asset.created_by and asset.created_by != current_user.id and ext_visibility.may_see_comment(
+        db, asset.project_id, comment, asset.created_by,
+    ):
         db.add(Notification(
             user_id=asset.created_by,
             type=NotificationType.comment,
@@ -545,10 +559,12 @@ def create_comment(
     activity = ActivityLog(user_id=current_user.id, asset_id=asset_id, action=ActivityAction.commented)
     db.add(activity)
 
+    ext_events.emit(db, ext_events.COMMENT_CREATED, asset.project_id, ext_events.comment_payload(comment, asset))
     db.commit()
     db.refresh(comment)
+    ext_events.dispatch()
 
-    event_service.publish_sync(asset.project_id, "new_comment", {
+    event_service.publish_sync(ext_live.comment_channel_key(asset.project_id, comment), "new_comment", {
         "asset_id": str(asset_id),
         "comment_id": str(comment.id),
         "author": current_user.name,
@@ -587,7 +603,9 @@ def reply_to_comment(
         body=body.body,
         timecode_start=body.timecode_start,
         timecode_end=body.timecode_end,
-        visibility=body.visibility or "public",
+        visibility=ext_visibility.comment_visibility_for(
+            db, asset.project_id, current_user, body.visibility, parent,
+        ),
     )
     db.add(reply)
     db.flush()
@@ -608,10 +626,12 @@ def reply_to_comment(
 
     _notify_parent_author_about_reply(db, parent, reply, asset, current_user.id)
 
+    ext_events.emit(db, ext_events.COMMENT_CREATED, asset.project_id, ext_events.comment_payload(reply, asset))
     db.commit()
     db.refresh(reply)
+    ext_events.dispatch()
 
-    event_service.publish_sync(asset.project_id, "new_comment", {
+    event_service.publish_sync(ext_live.comment_channel_key(asset.project_id, reply), "new_comment", {
         "asset_id": str(asset_id),
         "comment_id": str(reply.id),
         "author": current_user.name,
@@ -701,7 +721,7 @@ def resolve_comment(
 
     # This endpoint toggles, so send the resulting state rather than implying
     # "resolved" — a client that assumed that would get it backwards on unresolve.
-    event_service.publish_sync(asset.project_id, "comment_resolved", {
+    event_service.publish_sync(ext_live.comment_channel_key(asset.project_id, comment), "comment_resolved", {
         "comment_id": str(comment.id),
         "resolved": comment.resolved,
     })
@@ -1217,6 +1237,9 @@ def guest_comment(
     # `POST /assets/{id}/comments` leaves a row, so this one has to as well.
     if body.visibility == CommentVisibility.internal and not (
         current_user is not None and can_access_asset_audited(db, asset, current_user)
+        # Fork: and only the project's internal tier; a client who is a member
+        # (reviewer, viewer) could not read the comment back.
+        and ext_visibility.sees_internal(db, asset.project_id, current_user)
     ):
         raise HTTPException(status_code=403, detail="Internal comments require access to the asset")
 
@@ -1241,7 +1264,9 @@ def guest_comment(
         timecode_start=body.timecode_start,
         timecode_end=body.timecode_end,
         body=body.body,
-        visibility=body.visibility.value,
+        visibility=ext_visibility.share_comment_visibility(
+            db, asset.project_id, current_user, body.visibility.value,
+        ),
     )
     db.add(comment)
     db.flush()
@@ -1252,7 +1277,9 @@ def guest_comment(
         from ..services.auth_service import get_user_by_email
         user = get_user_by_email(db, email)
         # Same rule as _create_mentions: only someone who can see the asset is told about it.
-        if user and can_access_asset(db, asset, user):
+        if user and can_access_asset(db, asset, user) and ext_visibility.may_see_comment(
+            db, asset.project_id, comment, user,
+        ):
             mention = Mention(comment_id=comment.id, mentioned_user_id=user.id)
             db.add(mention)
             notif = Notification(
@@ -1274,8 +1301,10 @@ def guest_comment(
         )
         db.add(annotation)
 
+    ext_events.emit(db, ext_events.COMMENT_CREATED, asset.project_id, ext_events.comment_payload(comment, asset))
     db.commit()
     db.refresh(comment)
+    ext_events.dispatch()
 
     # Log share link activity
     actor_email = current_user.email if current_user else guest.email
@@ -1293,7 +1322,7 @@ def guest_comment(
 
     # Guests comment through a share link, but the live update belongs to the
     # project team watching the asset, so it goes on the same project channel.
-    event_service.publish_sync(asset.project_id, "new_comment", {
+    event_service.publish_sync(ext_live.comment_channel_key(asset.project_id, comment), "new_comment", {
         "asset_id": str(asset.id),
         "comment_id": str(comment.id),
         "author": actor_name or "Guest",
