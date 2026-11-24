@@ -211,3 +211,19 @@ class ReviewContext(BaseModel):
     is_manager: bool
     default_comment_visibility: str
     can_choose_comment_visibility: bool
+
+
+class MemberPut(BaseModel):
+    """HQ puts someone on a project: by email, because FreeFrame accounts are made at
+    their first sign-in (OIDC) and HQ may get there first."""
+    email: str = Field(min_length=3, max_length=255)
+    name: Optional[str] = Field(default=None, max_length=255)
+    role: str = Field(pattern="^(editor|reviewer|viewer)$")
+
+
+class MemberResult(BaseModel):
+    user_id: uuid.UUID
+    email: str
+    role: str
+    account_created: bool
+    changed: bool

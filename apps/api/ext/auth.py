@@ -5,6 +5,8 @@ the token's SHA-256 is stored. A gateway token reads internal data on every
 project, which is its job, and is limited in what it may *change* by its
 scopes. No scope lets it approve, reject, cancel, publish, change a comment's
 visibility or manage users: those routes do not accept a gateway actor at all.
+`members:write` puts people on projects (HQ's project team is the source); it
+cannot make or remove an owner, or change an admin.
 """
 import hashlib
 import secrets
@@ -28,7 +30,8 @@ SCOPE_READ = "read"                    # tasks, notes, events, version metadata,
 SCOPE_VERSIONS = "versions:write"      # upload a version and write its metadata
 SCOPE_NOTES = "notes:write"            # post task notes
 SCOPE_TASK_STATUS = "tasks:status"     # claimed, in_progress, proposed, needs_info, back to open
-ALL_SCOPES = (SCOPE_READ, SCOPE_VERSIONS, SCOPE_NOTES, SCOPE_TASK_STATUS)
+SCOPE_MEMBERS = "members:write"        # put people on a project (editor, reviewer, viewer) and take them off; never owners
+ALL_SCOPES = (SCOPE_READ, SCOPE_VERSIONS, SCOPE_NOTES, SCOPE_TASK_STATUS, SCOPE_MEMBERS)
 
 
 def hash_token(token: str) -> str:
