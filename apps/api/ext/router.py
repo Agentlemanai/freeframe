@@ -31,7 +31,7 @@ from .models import (
 )
 from .schemas import (
     CommentVisibilityChange, EventsPage, GatewayTokenCreate, GatewayTokenCreated,
-    GatewayTokenResponse, GatewayVersionCreate, GatewayVersionCreated, NoteCreate, NoteResponse,
+    GatewayTokenResponse, GatewayVersionCreate, GatewayVersionCreated, MemberPut, MemberResult, NoteCreate, NoteResponse,
     PersonResponse, ReviewContext, TaskContext, TaskCreate, TaskDecision, TaskResponse,
     TaskStatusChange, TaskUpdate, VersionFinalized, VersionMeta, VersionMetaResponse,
 )
@@ -614,6 +614,92 @@ def gateway_finalize_version(version_id: uuid.UUID, db: Session = Depends(get_db
         events.dispatch()
         _trigger_processing(asset_id, claimed_version_id)
     return VersionFinalized(asset_id=asset_id, version_id=claimed_version_id, status=ProcessingStatus.processing.value)
+
+
+# ── Project members from HQ ────────────────────────────────────────────────────
+# HQ's project team is the source: the gateway puts a person on the FreeFrame project
+# and takes them off again. By email, because the account may not exist yet: it is
+# made here, waiting, and the person's first sign-in through Authentik (OIDC, matched
+# by email) opens it. FreeFrame sends no email of its own; HQ's invitation did that.
+# Owners are never made, changed or removed here, and nor is an admin's account.
+
+def _require_members_gateway(actor: Actor) -> None:
+    if not actor.is_gateway:
+        raise HTTPException(status_code=403, detail="Only the gateway uses this; people use the project's member list")
+    auth.require_scope(actor, auth.SCOPE_MEMBERS)
+
+
+def _clean_email(raw: str) -> str:
+    email = raw.strip()
+    if "@" not in email or " " in email or len(email) > 255:
+        raise HTTPException(status_code=422, detail="email: not an email address")
+    return email
+
+
+@router.put("/projects/{project_id}/members", response_model=MemberResult)
+def put_project_member(project_id: uuid.UUID, body: MemberPut, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
+    from ..models.project import ProjectRole
+    from ..models.user import UserStatus
+    from ..services.auth_service import get_email_owner, get_user_by_email
+
+    _require_members_gateway(actor)
+    require_live_project(db, project_id)
+    email = _clean_email(body.email)
+    role = ProjectRole(body.role)
+
+    created = False
+    user = get_user_by_email(db, email)
+    if user is None:
+        if get_email_owner(db, email) is not None:
+            raise HTTPException(status_code=409, detail=f"{email} belonged to a deleted FreeFrame account; restore or remove it there first")
+        user = User(email=email.lower(), name=(body.name or "").strip() or email.split("@")[0],
+                    status=UserStatus.pending_invite, email_verified=False, can_create_projects=False)
+        db.add(user)
+        db.flush()
+        created = True
+    elif user.status == UserStatus.deactivated:
+        raise HTTPException(status_code=409, detail=f"{email} is deactivated in FreeFrame")
+
+    member = db.query(ProjectMember).filter(ProjectMember.project_id == project_id, ProjectMember.user_id == user.id).first()
+    changed = True
+    if member is None:
+        member = ProjectMember(project_id=project_id, user_id=user.id, role=role, invited_by=None)
+        db.add(member)
+    elif member.deleted_at is not None:
+        member.deleted_at = None
+        member.role = role
+        member.invited_by = None
+        member.invited_at = func.now()
+    elif member.role == ProjectRole.owner or member.role == role:
+        changed = False      # an owner stays an owner; the same role is nothing to do
+    else:
+        member.role = role
+    db.commit()
+    db.refresh(member)
+    return MemberResult(user_id=user.id, email=user.email, role=member.role.value, account_created=created, changed=changed)
+
+
+@router.delete("/projects/{project_id}/members", response_model=MemberResult)
+def remove_project_member_by_email(project_id: uuid.UUID, email: str = Query(..., min_length=3), db: Session = Depends(get_db),
+                                   actor: Actor = Depends(get_actor)):
+    from ..models.project import ProjectRole
+    from ..services.auth_service import get_user_by_email
+
+    _require_members_gateway(actor)
+    require_live_project(db, project_id)
+    user = get_user_by_email(db, _clean_email(email))
+    if user is None:
+        raise HTTPException(status_code=404, detail="No such FreeFrame account")
+    member = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id, ProjectMember.user_id == user.id, ProjectMember.deleted_at.is_(None),
+    ).first()
+    if member is None:
+        return MemberResult(user_id=user.id, email=user.email, role="none", account_created=False, changed=False)
+    if member.role == ProjectRole.owner:
+        raise HTTPException(status_code=409, detail="An owner is not removed from HQ; do that in FreeFrame")
+    member.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    return MemberResult(user_id=user.id, email=user.email, role="none", account_created=False, changed=True)
 
 
 # ── Gateway tokens: an instance admin's to hand out ────────────────────────────
