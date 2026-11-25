@@ -34,6 +34,7 @@ export const TASK_KINDS = [
   ['colour', 'Colour'],
   ['question', 'Question'],
   ['global', 'Whole video'],
+  ['comment', 'From a comment'],
 ] as const
 
 export const TASK_STAGES = [
@@ -186,6 +187,8 @@ export function revalidateForExtEvent(
   refetchVersions: () => unknown,
 ): void {
   if (!assetId) return
+  // a new top-level comment came with its task (apps/api/ext/comment_tasks.py)
+  if (type === 'new_comment') void globalMutate(tasksKey(assetId))
   if (type === 'review_tasks_changed') {
     void globalMutate(tasksKey(assetId))
     // the fix check (fix-check.tsx) rides on the same signal

@@ -157,6 +157,21 @@ in order, with `last_seq` to pass next time.
 Delivery runs on the `email_high` Celery queue, so no new worker is needed, and
 from the beat schedule every minute as the safety net.
 
+## Every comment is a task
+
+A new top-level comment, the client's or the team's, becomes an open task in the
+same transaction: kind `comment`, stage `review`, the project's editors' pool
+(`role_pool` / `editor`), the comment's text as the instruction, its timecode in
+frames. Replies never do; nor does a comment on a version a manager approved.
+Comments from before this change keep the "Make task" button.
+
+- Editing the comment edits the task while its instruction is still the old text.
+- Deleting the comment cancels the task if nobody has started on it.
+- **Not a task** (`POST /ext/tasks/{id}/dismiss`, team): cancels an open task made
+  from a comment, with that note; the comment stays.
+- Publishing a version approves the tasks whose comments the fix check found fixed
+  (result: the published version) and cancels the won't-fix ones.
+
 ## Fix check
 
 Before a new version goes to the client, the team goes through the comments
@@ -218,6 +233,8 @@ the source.
 | `apps/web/components/review/comment-panel.tsx` | mounts the comment actions |
 | `apps/web/components/review/version-switcher.tsx` | lock on an internal version |
 | `apps/web/app/(dashboard)/projects/[id]/assets/[assetId]/page.tsx` | mounts the provider, the task panel, the dialog and Publish to client; closing compare also drops `check` |
+| `apps/api/routers/comments.py` (create, reply, share comment, edit, delete) | a comment's event and its task come from `ext/comment_tasks.py`; edits and deletes reach the task |
+| `apps/web/hooks/use-sse.ts` | a new comment also reaches the extension (its task) |
 | `apps/api/routers/comments.py` | the comment export is split into the route (access) and `build_comment_export` (the file), which the gateway's read path reuses |
 | `apps/web/components/review/compare/compare-overlay.tsx` | with `?check=1` the left column holds the fix check, and starts open |
 

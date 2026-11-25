@@ -276,6 +276,8 @@ export function useSSE(projectId: string | null | undefined, options: UseSSEOpti
           const event: SSEEvent = { type: 'new_comment', data }
           setLastEvent(event)
           callbackRefs.current.onNewComment?.(data)
+          // Fork: a top-level comment is a review task by itself (apps/api/ext/comment_tasks.py)
+          callbackRefs.current.onExtEvent?.('new_comment', data as unknown as Record<string, unknown>)
         } catch {
           // ignore malformed events
         }

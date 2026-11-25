@@ -32,6 +32,8 @@ class TaskKind(str, PyEnum):
     colour = "colour"
     question = "question"
     global_ = "global"
+    #: made by itself from a comment; the team sorts it when it looks at it
+    comment = "comment"
 
 
 class TaskStage(str, PyEnum):

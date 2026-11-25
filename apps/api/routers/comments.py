@@ -49,6 +49,7 @@ from ..services import s3_service
 from ..services import comment_export
 # Fork: client / internal visibility and the review-task event outbox.
 from ..ext import visibility as ext_visibility, events as ext_events, live as ext_live
+from ..ext import comment_tasks as ext_comment_tasks
 from ..services.guests import resolve_guest
 from ..services.permissions import (
     require_asset_access, can_access_asset, can_access_asset_audited,
@@ -559,7 +560,7 @@ def create_comment(
     activity = ActivityLog(user_id=current_user.id, asset_id=asset_id, action=ActivityAction.commented)
     db.add(activity)
 
-    ext_events.emit(db, ext_events.COMMENT_CREATED, asset.project_id, ext_events.comment_payload(comment, asset))
+    ext_comment_tasks.on_comment_created(db, comment, asset)  # Fork: the event, and a top-level comment's task
     db.commit()
     db.refresh(comment)
     ext_events.dispatch()
@@ -626,7 +627,7 @@ def reply_to_comment(
 
     _notify_parent_author_about_reply(db, parent, reply, asset, current_user.id)
 
-    ext_events.emit(db, ext_events.COMMENT_CREATED, asset.project_id, ext_events.comment_payload(reply, asset))
+    ext_comment_tasks.on_comment_created(db, reply, asset)  # Fork: the event (a reply is never a task)
     db.commit()
     db.refresh(reply)
     ext_events.dispatch()
@@ -678,9 +679,12 @@ def update_comment(
     if comment.author_id != current_user.id:
         asset = _get_asset(db, comment.asset_id)
         _require_comment_moderator(db, asset, current_user, "Can only edit your own comments")
+    old_body = comment.body
     comment.body = body.body
     comment.updated_at = datetime.now(timezone.utc)
+    ext_comment_tasks.on_comment_edited(db, comment, old_body)  # Fork: its task follows the edit
     db.commit()
+    ext_events.dispatch()
     db.refresh(comment)
     return _build_comment_response(comment, db, current_user_id=current_user.id)
 
@@ -701,7 +705,9 @@ def delete_comment(
         asset = _get_asset(db, comment.asset_id)
         _require_comment_moderator(db, asset, current_user, "Can only delete your own comments")
     comment.deleted_at = datetime.now(timezone.utc)
+    ext_comment_tasks.on_comment_deleted(db, comment)  # Fork: an open task goes with its comment
     db.commit()
+    ext_events.dispatch()
 
 
 @router.post("/comments/{comment_id}/resolve", response_model=CommentResponse)
@@ -1321,7 +1327,7 @@ def guest_comment(
         )
         db.add(annotation)
 
-    ext_events.emit(db, ext_events.COMMENT_CREATED, asset.project_id, ext_events.comment_payload(comment, asset))
+    ext_comment_tasks.on_comment_created(db, comment, asset)  # Fork: the event, and a top-level comment's task
     db.commit()
     db.refresh(comment)
     ext_events.dispatch()
