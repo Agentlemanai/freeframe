@@ -86,6 +86,7 @@ under "ext: review tasks". "Team" means owner, editor or admin on the project.
 | `GET /ext/tasks/{id}` | team, gateway | |
 | `GET /ext/tasks/{id}/context` | team, gateway | the task with its project, video, version (fps, Resolve timeline), source comment and notes |
 | `GET /ext/people?ids=&emails=` | gateway, admin | match FreeFrame accounts with the gateway's people; nothing is listed without a key |
+| `GET /ext/posters?asset_ids=` | gateway, admin | one presigned link (good for an hour) to the poster image of each asset's newest version that has one, internal versions included; at most 100 ids; an asset without a poster is left out |
 | `PUT /ext/projects/{id}/members` | gateway (`members:write`) | `{email, name?, role: editor\|reviewer\|viewer}`: put a person on the project; makes a waiting account if there is none (their first sign-in opens it); never changes an owner; sends no email |
 | `DELETE /ext/projects/{id}/members?email=` | gateway (`members:write`) | take a person off the project; an owner is refused (409) |
 | `PATCH /ext/tasks/{id}` | team | instruction, kind, stage, frames, assignee |

@@ -191,6 +191,15 @@ class PersonResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PosterResponse(BaseModel):
+    """The poster image of an asset's newest version that has one."""
+    asset_id: uuid.UUID
+    version_id: uuid.UUID
+    version_number: int
+    url: str
+    expires_in: int
+
+
 class TaskContext(BaseModel):
     """Everything a machine needs to start on a task, in one read."""
     task: TaskResponse
