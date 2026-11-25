@@ -4,7 +4,7 @@ these tables exist. Their foreign keys carry the delete rule instead."""
 import pytest
 from sqlalchemy import text
 
-from apps.api.ext.models import ReviewTask, ReviewTaskNote, VersionExt, VersionResolvedTask
+from apps.api.ext.models import FixCheck, ReviewTask, ReviewTaskNote, VersionExt, VersionResolvedTask
 
 
 @pytest.fixture
@@ -27,6 +27,8 @@ def rows(real_db):
         source_comment_id=comment.id, result_version_id=v2.id,
     )
     real_db.add(task)
+    real_db.flush()
+    real_db.add(FixCheck(version_id=v2.id, comment_id=comment.id, status="not_fixed"))
     real_db.flush()
     real_db.add_all([
         ReviewTaskNote(task_id=task.id, kind="agent_note", body="n"),
@@ -75,6 +77,17 @@ def test_purging_an_asset_takes_its_tasks_and_their_notes(rows):
     _hard_delete(db, "assets", asset)
     assert db.get(ReviewTask, task_id) is None
     assert db.query(ReviewTaskNote).filter(ReviewTaskNote.task_id == task_id).count() == 0
+
+
+def test_purging_a_comment_or_a_version_takes_its_fix_checks(rows):
+    db, _, _, v1, v2, comment, _ = rows
+    assert db.query(FixCheck).count() == 1
+    _hard_delete(db, "asset_versions", v2)
+    assert db.query(FixCheck).count() == 0
+    db.add(FixCheck(version_id=v1, comment_id=comment, status="fixed"))
+    db.flush()
+    _hard_delete(db, "comments", comment)
+    assert db.query(FixCheck).count() == 0
 
 
 def test_replies_under_internal_comments_are_marked_internal_by_the_migration(real_db):

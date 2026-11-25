@@ -186,7 +186,11 @@ export function revalidateForExtEvent(
   refetchVersions: () => unknown,
 ): void {
   if (!assetId) return
-  if (type === 'review_tasks_changed') void globalMutate(tasksKey(assetId))
+  if (type === 'review_tasks_changed') {
+    void globalMutate(tasksKey(assetId))
+    // the fix check (fix-check.tsx) rides on the same signal
+    void globalMutate((key) => typeof key === 'string' && key.startsWith('/ext/versions/') && key.endsWith('/fix-checks'))
+  }
   if (type === 'version_published') void refetchVersions()
   if (type === 'comment_visibility_changed' && versionId) void globalMutate(commentsKey(assetId, versionId))
 }

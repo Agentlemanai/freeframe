@@ -4,7 +4,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from .models import AssigneeType, AuthorType, NoteKind, TaskKind, TaskStage, TaskStatus
+from .models import AssigneeType, AuthorType, FixCheckStatus, NoteKind, TaskKind, TaskStage, TaskStatus
 
 
 class TaskCreate(BaseModel):
@@ -227,3 +227,39 @@ class MemberResult(BaseModel):
     role: str
     account_created: bool
     changed: bool
+
+
+# ── Fix check ──────────────────────────────────────────────────────────────────
+
+class FixCheckPut(BaseModel):
+    """status None clears the check (back to "not checked")."""
+    status: Optional[FixCheckStatus] = None
+    note: Optional[str] = Field(default=None, max_length=10000)
+
+
+class FixCheckItem(BaseModel):
+    comment_id: uuid.UUID
+    version_id: uuid.UUID
+    version_number: Optional[int] = None
+    timecode_start: Optional[float] = None
+    timecode_end: Optional[float] = None
+    body: str
+    author_name: Optional[str] = None
+    visibility: str
+    drawing: Optional[dict] = None
+    task_id: Optional[uuid.UUID] = None
+    task_status: Optional[str] = None
+    not_fixed_in: Optional[int] = None
+    status: Optional[str] = None
+    note: Optional[str] = None
+    checked_by_name: Optional[str] = None
+    checked_at: Optional[datetime] = None
+
+
+class FixChecklist(BaseModel):
+    version_id: uuid.UUID
+    version_number: int
+    previous_version_id: Optional[uuid.UUID] = None
+    total: int
+    checked: int
+    items: list[FixCheckItem]

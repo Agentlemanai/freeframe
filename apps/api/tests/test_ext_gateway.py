@@ -233,6 +233,10 @@ def test_publish_to_client_is_the_only_way_a_version_becomes_visible(http, world
     for user in (world.editor, world.reviewer):
         refused = http(user).post(f"/ext/versions/{world.v2.id}/publish")
         assert refused.status_code in (403, 404)
+    # the team has checked v1's comments on v2 (apps/api/ext/fixcheck.py)
+    for comment in (world.c_client, world.c_internal):
+        checked = http(world.editor).put(f"/ext/versions/{world.v2.id}/fix-checks/{comment.id}", json={"status": "fixed"})
+        assert checked.status_code == 200, checked.text
     http.published.clear()
     seq = live_db.query(ExtEvent).count()
     published = http(world.owner).post(f"/ext/versions/{world.v2.id}/publish")
@@ -252,7 +256,7 @@ def test_publish_to_client_is_the_only_way_a_version_becomes_visible(http, world
 def test_publishing_a_version_sends_the_client_none_of_the_teams_notes(http, world):
     """Not even as a summary: the internal comments on the published version
     stay internal, and nothing is written for the client on the team's behalf."""
-    http(world.owner).post(f"/ext/versions/{world.v2.id}/publish")
+    assert http(world.owner).post(f"/ext/versions/{world.v2.id}/publish?force=true").status_code == 200
     for user in (world.reviewer, world.viewer):
         on_v2 = http(user).get(f"/assets/{world.asset.id}/comments?version_id={world.v2.id}")
         assert on_v2.status_code == 200 and on_v2.json() == []

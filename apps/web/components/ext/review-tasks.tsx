@@ -37,6 +37,7 @@ import {
   type ReviewTaskNote,
   type TaskStatus,
 } from './review-ext'
+import { FixCheckSummary, revalidateFixChecks, useFixCheckGate } from './fix-check'
 
 function errorText(error: unknown, fallback: string): string {
   const detail = (error as { detail?: unknown; message?: unknown } | null)?.detail
@@ -514,14 +515,16 @@ function InternalVersion({
   const toast = useToast()
   const [confirming, setConfirming] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
+  const gate = useFixCheckGate(version)
 
   const ready = version.processing_status === 'ready'
 
   async function publish() {
     setBusy(true)
     try {
-      await api.post(`/ext/versions/${version.id}/publish`)
+      await api.post(`/ext/versions/${version.id}/publish${gate.unchecked > 0 ? '?force=true' : ''}`)
       await onPublished()
+      revalidateFixChecks()
       setConfirming(false)
       toast.success(`v${version.version_number} is now visible to the client`)
     } catch (error) {
@@ -540,6 +543,7 @@ function InternalVersion({
         <Lock className="h-3 w-3" />
         Internal
       </span>
+      {ready && <FixCheckSummary version={version} />}
       {isManager && ready && (
         <Button size="sm" onClick={() => setConfirming(true)}>
           Publish to client
@@ -554,14 +558,25 @@ function InternalVersion({
             </Dialog.Title>
             <Dialog.Description className="mt-1 text-xs text-text-tertiary">
               The client and anyone with a share link will see this version. Internal comments,
-              tasks and notes stay with the team.
+              tasks and notes stay with the team. Comments checked as fixed are resolved.
             </Dialog.Description>
+            {gate.unchecked > 0 && (
+              <p className="mt-3 rounded-md border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-400">
+                {gate.unchecked} of {gate.total} earlier comment{gate.total === 1 ? '' : 's'} not checked on this
+                version yet. They stay open for the client.
+              </p>
+            )}
             <div className="mt-4 flex justify-end gap-2">
               <Button type="button" variant="secondary" size="sm" onClick={() => setConfirming(false)}>
                 Cancel
               </Button>
+              {gate.unchecked > 0 && gate.openCheck && (
+                <Button type="button" variant="secondary" size="sm" onClick={() => { setConfirming(false); gate.openCheck?.() }}>
+                  Check fixes
+                </Button>
+              )}
               <Button type="button" size="sm" disabled={busy} onClick={publish}>
-                {busy ? 'Publishing…' : 'Publish to client'}
+                {busy ? 'Publishing…' : gate.unchecked > 0 ? 'Publish anyway' : 'Publish to client'}
               </Button>
             </div>
           </Dialog.Content>

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Fork (ext): fix check. Before a new version goes to the client, the team marks each comment from earlier versions fixed, not fixed or won't fix, in the compare view (`GET`/`PUT /ext/versions/{id}/fix-checks`). Publish to client waits until all are checked, unless the owner publishes anyway; on publish the fixed ones are resolved. Internal only; new table `ext_fix_checks`.
 - Fork (ext): the gateway can put people on a project and take them off by email (`PUT`/`DELETE /ext/projects/{id}/members`, new `members:write` scope, given to live gateway tokens by migration). A person without an account gets a waiting one that their first SSO sign-in opens. Owners are never changed or removed this way.
 
 ### Upgrade notes

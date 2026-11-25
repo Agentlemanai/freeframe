@@ -434,6 +434,7 @@ def test_gc_covers_all_inbound_fks_to_purged_tables():
         ("review_tasks", "created_on_version_id"), ("review_tasks", "result_version_id"),
         ("review_tasks", "source_comment_id"), ("version_ext", "version_id"),
         ("version_resolved_tasks", "version_id"),
+        ("ext_fix_checks", "version_id"), ("ext_fix_checks", "comment_id"),
         # -> projects.id
         ("assets", "project_id"), ("folders", "project_id"), ("share_links", "project_id"),
         ("project_brandings", "project_id"), ("watermark_settings", "project_id"),
