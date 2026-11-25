@@ -96,7 +96,9 @@ under "ext: review tasks". "Team" means owner, editor or admin on the project.
 | `GET` / `POST /ext/tasks/{id}/notes` | team, gateway | the internal thread |
 | `GET /ext/versions/{id}/meta` | team, gateway | |
 | `PUT /ext/versions/{id}/meta` | gateway | Resolve project and timeline, start timecode, fps, author, tasks resolved |
-| `POST /ext/versions/{id}/publish` | manager | publish to client |
+| `POST /ext/versions/{id}/publish` | manager | publish to client; `409 fix_check_incomplete` while earlier comments are unchecked, unless `?force=true` |
+| `GET /ext/versions/{id}/fix-checks` | team, gateway | the earlier comments to check on this version, with what was found |
+| `PUT /ext/versions/{id}/fix-checks/{comment_id}` | team | `{status: fixed\|not_fixed\|wont_fix\|null, note?}`; closed once the version is published |
 | `PATCH /ext/comments/{id}/visibility` | manager | `public` or `internal`; hiding a comment hides its replies |
 | `GET /ext/events?since=&limit=` | gateway, admin | catch-up |
 | `POST /ext/assets/{id}/versions` | gateway | start an internal version, returns one presigned PUT URL |
@@ -134,7 +136,8 @@ order.
 | `task_note.created` | |
 | `comment.created`, `comment.visibility_changed` | |
 | `version.created` | an upload was completed, by a person or the gateway |
-| `version.published` | |
+| `version.published` | carries `resolved_comment_ids` and `unchecked_comments` |
+| `fix_check.updated` | an earlier comment checked (or cleared) on a version |
 
 **Webhook.** Set `EXT_GATEWAY_WEBHOOK_URL` and `EXT_GATEWAY_WEBHOOK_SECRET`.
 Each event is one `POST` with the JSON body
@@ -151,6 +154,32 @@ in order, with `last_seq` to pass next time.
 
 Delivery runs on the `email_high` Celery queue, so no new worker is needed, and
 from the beat schedule every minute as the safety net.
+
+## Fix check
+
+Before a new version goes to the client, the team goes through the comments
+made on earlier versions and marks each **fixed**, **not fixed** or **won't
+fix**, comparing the two versions side by side. Internal only.
+
+- **On the list:** top-level comments (client and internal) on earlier versions
+  of the asset, not deleted, not resolved, and not already found fixed or won't
+  fix on an earlier version. A comment found not fixed comes back on the next
+  version, marked "not fixed in vN".
+- **On screen:** beside the version switcher, "Fixes 3/7" opens the compare
+  view (`?compare=<previous>&right=<this>&check=1`) with the checklist in its
+  left column. A row jumps both players to the comment and shows its drawing;
+  "Comments" switches back to the normal comment list.
+- **Publishing waits for it.** With unchecked comments the dialog says how many
+  and offers "Check fixes" or "Publish anyway" (`?force=true`).
+- **On publish,** comments found fixed on this version or an earlier unpublished
+  one are resolved, so the client sees them done together with the new version.
+  An internal comment marked won't fix is resolved too; a client's comment
+  marked won't fix stays open, for a reply.
+- **Who:** the team (owner, editor, admin) checks; the gateway can read the list
+  but not decide; a client gets 404.
+
+Table `ext_fix_checks` (one row per version and comment; no row = not checked),
+migration `e3f9c1d5a7b2_ext_fix_checks.py`.
 
 ## Walk-through
 
@@ -186,7 +215,8 @@ the source.
 | `apps/web/components/review/comment-input.tsx` | default visibility by role; an editor has no toggle |
 | `apps/web/components/review/comment-panel.tsx` | mounts the comment actions |
 | `apps/web/components/review/version-switcher.tsx` | lock on an internal version |
-| `apps/web/app/(dashboard)/projects/[id]/assets/[assetId]/page.tsx` | mounts the provider, the task panel, the dialog and Publish to client |
+| `apps/web/app/(dashboard)/projects/[id]/assets/[assetId]/page.tsx` | mounts the provider, the task panel, the dialog and Publish to client; closing compare also drops `check` |
+| `apps/web/components/review/compare/compare-overlay.tsx` | with `?check=1` the left column holds the fix check, and starts open |
 
 Migration: `apps/api/alembic/versions/e1x7a2b3c4d5_ext_review_tasks_phase1.py`.
 Existing versions become `public`. Existing comments keep their visibility,

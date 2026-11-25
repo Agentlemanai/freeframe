@@ -182,3 +182,28 @@ class GatewayToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FixCheckStatus(str, PyEnum):
+    """What the team found when it looked at an earlier comment on a new version.
+    No row means it has not been checked yet."""
+    fixed = "fixed"
+    not_fixed = "not_fixed"
+    wont_fix = "wont_fix"
+
+
+class FixCheck(Base):
+    """Internal, never shown to a client: one earlier comment, checked on one new
+    version. Made by the team while comparing the new version with the previous
+    one, before it is published to the client."""
+    __tablename__ = "ext_fix_checks"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("asset_versions.id", ondelete="CASCADE"), nullable=False)
+    comment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("comments.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    checked_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (
+        Index("ux_ext_fix_checks_version_comment", "version_id", "comment_id", unique=True),
+    )

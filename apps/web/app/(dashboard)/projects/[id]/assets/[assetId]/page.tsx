@@ -301,6 +301,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const closeCompare = useCallback(() => {
     const p = new URLSearchParams(searchParams.toString())
     p.delete('compare'); p.delete('right'); p.delete('mode'); p.delete('offA'); p.delete('offB'); p.delete('offFor')
+    p.delete('check') // Garlomedia fork: the fix check rides on the compare view (components/ext/fix-check.tsx)
     router.replace(`${pathname}?${p.toString()}`, { scroll: false })
   }, [router, pathname, searchParams])
 

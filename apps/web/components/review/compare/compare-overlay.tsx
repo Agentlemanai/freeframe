@@ -21,6 +21,7 @@ import { ImageFrameConstraint } from '@/components/review/image-frame-constraint
 import { CommentPanel } from '@/components/review/comment-panel'
 import { CommentInput } from '@/components/review/comment-input'
 import type { AssetResponse, AssetVersion } from '@/types'
+import { FixCheckPanel, useFixCheckMode } from '@/components/ext/fix-check'
 
 interface CompareOverlayProps {
   asset: AssetResponse
@@ -136,6 +137,7 @@ export function CompareOverlay({ asset, versions, rightVersion, onClose, canComm
   const urlRight = ready.find((v) => v.id === rightParam) ?? null
 
   const isVideo = asset.asset_type === 'video'
+  const fixCheck = useFixCheckMode()
   const mode = (searchParams.get('mode') === 'sbs' ? 'sbs' : 'wipe') as 'wipe' | 'sbs'
   // Offsets only apply to the pair they were calibrated for (`offFor`). The right
   // version lives in the store and changes before the URL write that clears its
@@ -246,7 +248,8 @@ export function CompareOverlay({ asset, versions, rightVersion, onClose, canComm
   // Per-side comments
   const sideA = useComments(asset.id, left?.id ?? null)
   const sideB = useComments(asset.id, right.id)
-  const [panelAOpen, setPanelAOpen] = React.useState(false)
+  // Garlomedia fork: the fix check lives in the left column, so it opens with it
+  const [panelAOpen, setPanelAOpen] = React.useState(fixCheck)
   const [panelBOpen, setPanelBOpen] = React.useState(true)
 
   // Annotation AUTHORING: at most one pane draws at a time (the Fabric canvas is
@@ -473,7 +476,18 @@ export function CompareOverlay({ asset, versions, rightVersion, onClose, canComm
       <div className="flex min-h-0 flex-1">
         {/* Left comment panel */}
         <aside className={cn('shrink-0 border-r border-border transition-all', panelAOpen ? 'w-80' : 'w-0 overflow-hidden')}>
-          {panelAOpen && (
+          {panelAOpen && fixCheck && (
+            // Garlomedia fork: earlier comments checked on the right version (components/ext/fix-check.tsx)
+            <FixCheckPanel
+              rightVersionId={right.id}
+              leftVersionId={left.id}
+              offset={timingA.offset}
+              seekTo={transport.seekTo}
+              pause={transport.pause}
+              showAnnotation={(drawing) => showAnnotationFor('a', drawing)}
+            />
+          )}
+          {panelAOpen && !fixCheck && (
             <div className="flex h-full flex-col">
               <CompareCommentPanel
                 assetId={asset.id}

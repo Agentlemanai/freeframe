@@ -36,6 +36,12 @@ vi.mock('@/lib/api', () => ({
     }),
   },
 }))
+// Publishing can open the fix check, which lives on the compare view's URL.
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  usePathname: () => '/projects/p1/assets/a1',
+  useSearchParams: () => new URLSearchParams(''),
+}))
 vi.mock('@/components/shared/toast', () => ({
   useToast: () => ({ success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() }),
 }))

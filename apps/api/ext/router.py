@@ -24,13 +24,13 @@ from ..services import event_service, s3_service
 from ..services.permissions import require_asset_access, require_live_project
 from ..services.storage import upload_guard_error
 from ..services.versions import next_version_number
-from . import auth, events, live, tasks, visibility
+from . import auth, events, fixcheck, live, tasks, visibility
 from .auth import Actor, get_actor
 from .models import (
     ExtEvent, GatewayToken, ReviewTask, ReviewTaskNote, TaskStatus, VersionExt, VersionResolvedTask,
 )
 from .schemas import (
-    CommentVisibilityChange, EventsPage, GatewayTokenCreate, GatewayTokenCreated,
+    CommentVisibilityChange, EventsPage, FixCheckItem, FixChecklist, FixCheckPut, GatewayTokenCreate, GatewayTokenCreated,
     GatewayTokenResponse, GatewayVersionCreate, GatewayVersionCreated, MemberPut, MemberResult, NoteCreate, NoteResponse,
     PersonResponse, PosterResponse, ReviewContext, TaskContext, TaskCreate, TaskDecision, TaskResponse,
     TaskStatusChange, TaskUpdate, VersionFinalized, VersionMeta, VersionMetaResponse,
@@ -385,9 +385,17 @@ def put_version_meta(
 
 
 @router.post("/versions/{version_id}/publish", response_model=VersionMetaResponse)
-def publish_version(version_id: uuid.UUID, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
+def publish_version(
+    version_id: uuid.UUID,
+    force: bool = Query(False, description="Publish although earlier comments are still unchecked"),
+    db: Session = Depends(get_db), actor: Actor = Depends(get_actor),
+):
     """Publish to client: the only way an internal version becomes visible to
-    the client tier. Nothing is sent with it; the team's notes stay where they are."""
+    the client tier. Nothing is sent with it; the team's notes stay where they are.
+
+    Waits for the fix check: while comments from earlier versions are unchecked on
+    this one, it answers 409 (code `fix_check_incomplete`) unless `force`. On
+    publish, the comments the team found fixed are resolved."""
     version, asset = _version(db, version_id)
     user = _require_manager(db, asset.project_id, actor)
     ext = db.get(VersionExt, version.id)
@@ -395,6 +403,13 @@ def publish_version(version_id: uuid.UUID, db: Session = Depends(get_db), actor:
         return _meta_response(db, version, ext)
     if version.processing_status != ProcessingStatus.ready:
         raise HTTPException(status_code=409, detail="This version is not ready to be shown yet")
+    left = fixcheck.unchecked_count(db, version)
+    if left and not force:
+        raise HTTPException(status_code=409, detail={
+            "code": "fix_check_incomplete", "unchecked": left,
+            "message": f"{left} earlier comment{'s' if left != 1 else ''} not checked on this version yet",
+        })
+    resolved = fixcheck.resolve_on_publish(db, version)
     version.visibility = visibility.PUBLIC
     if ext is None:
         ext = VersionExt(version_id=version.id)
@@ -403,6 +418,7 @@ def publish_version(version_id: uuid.UUID, db: Session = Depends(get_db), actor:
     ext.published_at = datetime.now(timezone.utc)
     events.emit(db, events.VERSION_PUBLISHED, asset.project_id, {
         **events.version_payload(version, asset), "published_by": user.id,
+        "resolved_comment_ids": resolved, "unchecked_comments": left,
     })
     _done(db, asset.project_id)
     live.forget_version(version.id)
@@ -411,6 +427,45 @@ def publish_version(version_id: uuid.UUID, db: Session = Depends(get_db), actor:
         "asset_id": str(asset.id), "version_id": str(version.id),
     })
     return _meta_response(db, version, ext)
+
+
+# ── Fix check: earlier comments, checked on a new version ──────────────────────
+
+@router.get("/versions/{version_id}/fix-checks", response_model=FixChecklist)
+def get_fix_checks(version_id: uuid.UUID, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
+    """The comments from earlier versions to check on this one, with what the team
+    found so far. Internal: a client gets 404."""
+    version, asset = _version(db, version_id)
+    _require_internal(db, asset.project_id, actor)
+    return fixcheck.checklist(db, version)
+
+
+@router.put("/versions/{version_id}/fix-checks/{comment_id}", response_model=FixCheckItem)
+def put_fix_check(
+    version_id: uuid.UUID, comment_id: uuid.UUID, body: FixCheckPut,
+    db: Session = Depends(get_db), actor: Actor = Depends(get_actor),
+):
+    """Mark one earlier comment fixed / not fixed / won't fix on this version, or
+    clear it. The team does this, not the gateway; and only before the version
+    is published, after that the record stays as it was."""
+    if actor.is_gateway:
+        raise HTTPException(status_code=403, detail="The team checks fixes; the gateway can read them")
+    version, asset = _version(db, version_id)
+    _require_internal(db, asset.project_id, actor)
+    user = auth.require_user(actor)
+    if version.visibility == visibility.PUBLIC:
+        raise HTTPException(status_code=409, detail="This version is already with the client; its check is closed")
+    try:
+        row = fixcheck.set_check(db, version, comment_id, body.status.value if body.status else None, body.note, user.id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    events.emit(db, events.FIX_CHECK_UPDATED, asset.project_id, {
+        "version_id": version.id, "asset_id": asset.id, "comment_id": comment_id,
+        "status": row.status if row else None, "checked_by": user.id,
+    })
+    _done(db, asset.project_id)
+    item = next(i for i in fixcheck.checklist(db, version)["items"] if i["comment_id"] == comment_id)
+    return item
 
 
 # ── Comment visibility ─────────────────────────────────────────────────────────

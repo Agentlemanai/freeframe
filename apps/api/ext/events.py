@@ -27,6 +27,7 @@ COMMENT_CREATED = "comment.created"
 COMMENT_VISIBILITY_CHANGED = "comment.visibility_changed"
 VERSION_CREATED = "version.created"
 VERSION_PUBLISHED = "version.published"
+FIX_CHECK_UPDATED = "fix_check.updated"
 
 # Arbitrary, fixed: the advisory lock that orders event writers.
 _SEQ_LOCK_KEY = 0x4646_4558_54  # "FFEXT"
@@ -34,6 +35,7 @@ _SEQ_LOCK_KEY = 0x4646_4558_54  # "FFEXT"
 EVENT_TYPES = (
     TASK_CREATED, TASK_UPDATED, TASK_STATUS_CHANGED, TASK_NOTE_CREATED,
     COMMENT_CREATED, COMMENT_VISIBILITY_CHANGED, VERSION_CREATED, VERSION_PUBLISHED,
+    FIX_CHECK_UPDATED,
 )
 
 

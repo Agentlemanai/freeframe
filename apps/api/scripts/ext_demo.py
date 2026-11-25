@@ -151,6 +151,12 @@ def main() -> int:
     print(f"   → {task['status']}; {len(notes)} internal note(s) on the task")
     client_view("approved, still unpublished")
 
+    say("The team checks the earlier comments on the new version")
+    checklist = ok(owner.get(f"/ext/versions/{created['version_id']}/fix-checks"))
+    for item in checklist["items"]:
+        ok(owner.put(f"/ext/versions/{created['version_id']}/fix-checks/{item['comment_id']}", json={"status": "fixed"}))
+    print(f"   → {checklist['total']} earlier comment(s) marked fixed")
+
     say("The owner publishes the version to the client")
     published = ok(owner.post(f"/ext/versions/{created['version_id']}/publish"))
     print(f"   v{created['version_number']} is now {published['visibility']}")
