@@ -950,6 +950,26 @@ def export_comments(
 
     asset = _get_asset(db, asset_id)
     require_asset_access(db, asset, current_user)
+    return build_comment_export(db, asset, format, version_id, fps, start_tc, include_resolved)
+
+
+def build_comment_export(
+    db: Session,
+    asset: Asset,
+    format: str,
+    version_id: Optional[uuid.UUID] = None,
+    fps: Optional[float] = None,
+    start_tc: Optional[str] = None,
+    include_resolved: bool = True,
+) -> Response:
+    """The export itself, after the caller's access check. Fork: split out of
+    export_comments so the gateway's read path (apps/api/ext) makes the same files."""
+    asset_id = asset.id
+    if format not in EXPORT_FORMATS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported format '{format}'. Use one of: {', '.join(EXPORT_FORMATS)}",
+        )
 
     if version_id is not None:
         version = db.query(AssetVersion).filter(

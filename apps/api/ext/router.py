@@ -24,7 +24,7 @@ from ..services import event_service, s3_service
 from ..services.permissions import require_asset_access, require_live_project
 from ..services.storage import upload_guard_error
 from ..services.versions import next_version_number
-from . import auth, events, fixcheck, live, tasks, visibility
+from . import auth, events, feed, fixcheck, live, tasks, visibility
 from .auth import Actor, get_actor
 from .models import (
     ExtEvent, GatewayToken, ReviewTask, ReviewTaskNote, TaskStatus, VersionExt, VersionResolvedTask,
@@ -427,6 +427,45 @@ def publish_version(
         "asset_id": str(asset.id), "version_id": str(version.id),
     })
     return _meta_response(db, version, ext)
+
+
+# ── Comment feed: a video's comments with frames, and as marker files ─────────
+
+@router.get("/assets/{asset_id}/comments")
+def get_comment_feed(
+    asset_id: uuid.UUID,
+    version_id: Optional[uuid.UUID] = Query(None, description="Left out: the newest ready version"),
+    include_resolved: bool = Query(False),
+    db: Session = Depends(get_db), actor: Actor = Depends(get_actor),
+):
+    """A version's comments with their frames, and where the version came from in
+    Resolve, for the team's tools: Garlo Worker puts them on the timeline, an agent
+    reads them. Internal: a client gets 404."""
+    asset = _live_asset(db, asset_id)
+    _require_internal(db, asset.project_id, actor)
+    return feed.feed(db, asset, version_id, include_resolved)
+
+
+@router.get("/assets/{asset_id}/comments/export")
+def export_comment_feed(
+    asset_id: uuid.UUID,
+    format: str = Query(..., description="edl (Resolve markers), premiere_xml, fcpxml or csv"),
+    version_id: Optional[uuid.UUID] = Query(None),
+    fps: Optional[float] = Query(None, gt=0),
+    start_tc: Optional[str] = Query(None),
+    include_resolved: bool = Query(False),
+    db: Session = Depends(get_db), actor: Actor = Depends(get_actor),
+):
+    """The same files as the review screen's export, for the gateway and the team.
+    The EDL starts at the version's Resolve start timecode when the gateway recorded one."""
+    from ..routers.comments import build_comment_export  # upstream's export, split out for this
+    asset = _live_asset(db, asset_id)
+    _require_internal(db, asset.project_id, actor)
+    version = feed.pick_version(db, asset, version_id)
+    timing = feed.version_timing(db, version)
+    if start_tc is None and format == "edl" and timing["start_timecode"]:
+        start_tc = timing["start_timecode"]
+    return build_comment_export(db, asset, format, version.id, fps or timing["fps"], start_tc, include_resolved)
 
 
 # ── Fix check: earlier comments, checked on a new version ──────────────────────

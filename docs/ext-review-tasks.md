@@ -96,6 +96,8 @@ under "ext: review tasks". "Team" means owner, editor or admin on the project.
 | `GET /ext/versions/{id}/meta` | team, gateway | |
 | `PUT /ext/versions/{id}/meta` | gateway | Resolve project and timeline, start timecode, fps, author, tasks resolved |
 | `POST /ext/versions/{id}/publish` | manager | publish to client; `409 fix_check_incomplete` while earlier comments are unchecked, unless `?force=true` |
+| `GET /ext/assets/{id}/comments?version_id=&include_resolved=` | team, gateway | a version's comments with frames (`frame_in`/`frame_out` at the version's fps), replies, drawing flag, and the version's Resolve project, timeline, start timecode and fps; newest ready version when left out; resolved left out unless asked |
+| `GET /ext/assets/{id}/comments/export?format=` | team, gateway | upstream's marker files (`edl` for Resolve, `premiere_xml`, `fcpxml`, `csv`), with the version's Resolve start timecode in the EDL |
 | `GET /ext/versions/{id}/fix-checks` | team, gateway | the earlier comments to check on this version, with what was found |
 | `PUT /ext/versions/{id}/fix-checks/{comment_id}` | team | `{status: fixed\|not_fixed\|wont_fix\|null, note?}`; closed once the version is published |
 | `PATCH /ext/comments/{id}/visibility` | manager | `public` or `internal`; hiding a comment hides its replies |
@@ -215,6 +217,7 @@ the source.
 | `apps/web/components/review/comment-panel.tsx` | mounts the comment actions |
 | `apps/web/components/review/version-switcher.tsx` | lock on an internal version |
 | `apps/web/app/(dashboard)/projects/[id]/assets/[assetId]/page.tsx` | mounts the provider, the task panel, the dialog and Publish to client; closing compare also drops `check` |
+| `apps/api/routers/comments.py` | the comment export is split into the route (access) and `build_comment_export` (the file), which the gateway's read path reuses |
 | `apps/web/components/review/compare/compare-overlay.tsx` | with `?check=1` the left column holds the fix check, and starts open |
 
 Migration: `apps/api/alembic/versions/e1x7a2b3c4d5_ext_review_tasks_phase1.py`.
