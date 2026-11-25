@@ -32,7 +32,7 @@ from .models import (
 from .schemas import (
     CommentVisibilityChange, EventsPage, GatewayTokenCreate, GatewayTokenCreated,
     GatewayTokenResponse, GatewayVersionCreate, GatewayVersionCreated, MemberPut, MemberResult, NoteCreate, NoteResponse,
-    PersonResponse, ReviewContext, TaskContext, TaskCreate, TaskDecision, TaskResponse,
+    PersonResponse, PosterResponse, ReviewContext, TaskContext, TaskCreate, TaskDecision, TaskResponse,
     TaskStatusChange, TaskUpdate, VersionFinalized, VersionMeta, VersionMetaResponse,
 )
 
@@ -495,6 +495,58 @@ def list_people(
         User.deleted_at.is_(None),
         or_(User.id.in_(wanted_ids), func.lower(User.email).in_(wanted_emails)),
     ).order_by(User.email).all()
+
+
+# ── Posters: one still per asset, for the gateway's own lists ──────────────────
+
+POSTER_URL_SECONDS = 3600
+
+
+@router.get("/posters", response_model=list[PosterResponse])
+def list_posters(
+    asset_ids: str = Query(description="Comma-separated asset ids, at most 100"),
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(get_actor),
+):
+    """A link to the poster image of each asset's newest version that has one.
+
+    The gateway shows it beside its own record of the video. The link is a
+    presigned GET, good for an hour, to the same image the asset grid shows.
+    An asset with no poster yet (still uploading, audio, deleted) is left out
+    rather than answered with an error, so one call serves a whole list.
+    """
+    if actor.is_gateway:
+        auth.require_scope(actor, auth.SCOPE_READ)
+    elif not visibility.is_admin(actor.user):
+        raise HTTPException(status_code=403, detail="Posters are read by the gateway")
+    wanted = []
+    for raw in asset_ids.split(","):
+        if raw.strip():
+            try:
+                wanted.append(uuid.UUID(raw.strip()))
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"{raw.strip()} is not an id") from None
+    if not wanted:
+        raise HTTPException(status_code=422, detail="Give asset_ids")
+    if len(wanted) > 100:
+        raise HTTPException(status_code=422, detail="At most 100 at a time")
+    rows = db.query(AssetVersion.asset_id, AssetVersion.id, AssetVersion.version_number, MediaFile.s3_key_thumbnail).join(
+        MediaFile, MediaFile.version_id == AssetVersion.id,
+    ).join(Asset, Asset.id == AssetVersion.asset_id).filter(
+        AssetVersion.asset_id.in_(wanted), AssetVersion.deleted_at.is_(None), Asset.deleted_at.is_(None),
+        # audio keeps its waveform (JSON) in the thumbnail key: not an image
+        Asset.asset_type != AssetType.audio, MediaFile.s3_key_thumbnail.isnot(None),
+    ).order_by(AssetVersion.asset_id, AssetVersion.version_number.desc(), MediaFile.sequence_order.nullsfirst(), MediaFile.created_at).all()
+    out, seen = [], set()
+    for asset_id, version_id, number, key in rows:
+        if asset_id in seen:
+            continue
+        seen.add(asset_id)
+        out.append(PosterResponse(
+            asset_id=asset_id, version_id=version_id, version_number=number,
+            url=s3_service.generate_presigned_get_url(key, expires_in=POSTER_URL_SECONDS), expires_in=POSTER_URL_SECONDS,
+        ))
+    return out
 
 
 # ── Events: catch-up ───────────────────────────────────────────────────────────

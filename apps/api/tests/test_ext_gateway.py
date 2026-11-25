@@ -314,6 +314,51 @@ def test_the_gateway_matches_people_by_email_or_id(gateway, http, world):
     assert http(world.admin).get(f"/ext/people?emails={world.editor.email}").status_code == 200
 
 
+def test_the_gateway_reads_one_poster_per_asset(gateway, http, world, live_db, seed, monkeypatch):
+    from apps.api.models.asset import AssetType, MediaFile
+    from apps.api.services import s3_service
+
+    monkeypatch.setattr(s3_service, "generate_presigned_get_url",
+                        lambda key, expires_in=3600, download_filename=None: f"https://storage.test/{key}?expires={expires_in}")
+    files = {v.id: live_db.query(MediaFile).filter(MediaFile.version_id == v.id).one() for v in (world.v1, world.v2)}
+    files[world.v1.id].s3_key_thumbnail, files[world.v2.id].s3_key_thumbnail = "thumbs/v1.jpg", None
+    bare = seed.asset(world.project, world.owner, name="no upload yet")
+    sound = seed.asset(world.project, world.owner, name="voice-over")
+    sound.asset_type = AssetType.audio
+    sound_v, _ = seed.version(sound, world.owner, number=1, s3_keys=True)
+    live_db.query(MediaFile).filter(MediaFile.version_id == sound_v.id).one().s3_key_thumbnail = "waveforms/vo.json"
+    live_db.flush()
+    ask = f"/ext/posters?asset_ids={world.asset.id},{bare.id},{sound.id},{uuid.uuid4()}"
+
+    # the newest version has no poster yet (still transcoding): the one before it serves
+    got = gateway.get(ask)
+    assert got.status_code == 200, got.text
+    assert got.json() == [{"asset_id": str(world.asset.id), "version_id": str(world.v1.id), "version_number": 1,
+                           "url": "https://storage.test/thumbs/v1.jpg?expires=3600", "expires_in": 3600}]
+    # once the newest has one, it is the newest's, internal or not: the gateway's list is the team's
+    files[world.v2.id].s3_key_thumbnail = "thumbs/v2.jpg"
+    live_db.flush()
+    assert [(p["version_number"], p["url"]) for p in gateway.get(ask).json()] == [(2, "https://storage.test/thumbs/v2.jpg?expires=3600")]
+    # a deleted version or asset has none
+    world.v2.deleted_at = world.v1.created_at
+    live_db.flush()
+    assert [p["version_number"] for p in gateway.get(ask).json()] == [1]
+    world.asset.deleted_at = world.v1.created_at
+    live_db.flush()
+    assert gateway.get(ask).json() == []
+    world.asset.deleted_at = None
+    live_db.flush()
+
+    assert gateway.get("/ext/posters").status_code == 422
+    assert gateway.get("/ext/posters?asset_ids=,").status_code == 422
+    assert gateway.get("/ext/posters?asset_ids=not-an-id").status_code == 422
+    assert gateway.get("/ext/posters?asset_ids=" + ",".join(str(uuid.uuid4()) for _ in range(101))).status_code == 422
+    # people get posters through the app; only the gateway (and an admin) may ask here
+    for user in (world.owner, world.editor, world.reviewer, world.outsider):
+        assert http(user).get(ask).status_code == 403
+    assert http(world.admin).get(ask).status_code == 200
+
+
 def test_a_tasks_context_is_one_read(gateway, http, world, live_db):
     from apps.api.models.asset import MediaFile
 
