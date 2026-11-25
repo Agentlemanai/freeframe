@@ -318,6 +318,7 @@ def test_each_change_writes_exactly_one_event(http, world, gateway, live_db):
     got = _events(live_db, seq)
     assert [t for t, _ in got] == [
         "task.created", "task.updated", "task.status_changed", "task_note.created", "comment.created",
+        "task.created",   # a top-level comment is a task by itself (ext/comment_tasks.py)
     ]
     assert got[1][1]["changed"] == ["instruction"]
     assert (got[2][1]["from"], got[2][1]["to"], got[2][1]["by"]) == ("open", "claimed", "gateway")

@@ -103,6 +103,24 @@ describe('on a comment', () => {
     expect(screen.queryByRole('button')).toBeNull()
   })
 
+  it('shows the task a comment already is, and lets the team say it is not a task', async () => {
+    server.context = EDITOR
+    server.tasks = [task({ id: 't9', source_comment_id: 'c1', kind: 'comment', instruction: 'Too long at the start' })]
+    screenFor(<CommentExtActions comment={comment} />)
+    expect(await screen.findByText('Open')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Make task' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Not a task' }))
+    await waitFor(() => expect(server.posts).toEqual([['/ext/tasks/t9/dismiss', {}]]))
+  })
+
+  it('offers no Not a task once someone is on it', async () => {
+    server.context = EDITOR
+    server.tasks = [task({ id: 't9', source_comment_id: 'c1', status: 'claimed' })]
+    screenFor(<CommentExtActions comment={comment} />)
+    expect(await screen.findByText('Claimed')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Not a task' })).toBeNull()
+  })
+
   it('offers an editor Make task but not who-sees-it', async () => {
     server.context = EDITOR
     screenFor(<CommentExtActions comment={comment} />)

@@ -24,7 +24,7 @@ from ..services import event_service, s3_service
 from ..services.permissions import require_asset_access, require_live_project
 from ..services.storage import upload_guard_error
 from ..services.versions import next_version_number
-from . import auth, events, feed, fixcheck, live, tasks, visibility
+from . import auth, comment_tasks, events, feed, fixcheck, live, tasks, visibility
 from .auth import Actor, get_actor
 from .models import (
     ExtEvent, GatewayToken, ReviewTask, ReviewTaskNote, TaskStatus, VersionExt, VersionResolvedTask,
@@ -282,6 +282,19 @@ def reject_task(task_id: uuid.UUID, body: TaskDecision, db: Session = Depends(ge
 
 # ── Notes: internal, always. There is no route that shows one to a client. ─────
 
+@router.post("/tasks/{task_id}/dismiss", response_model=TaskResponse)
+def dismiss_task(task_id: uuid.UUID, body: TaskDecision, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
+    """"Not a task": a comment that asks for nothing (praise, chat). The team cancels
+    the open task made from it; the comment stays."""
+    if actor.is_gateway:
+        raise HTTPException(status_code=403, detail="The team decides what is not a task")
+    task = _task(db, task_id, actor)
+    user = auth.require_user(actor)
+    comment_tasks.dismiss(db, task, user, body.note)
+    _done(db, task.project_id)
+    return task
+
+
 @router.get("/tasks/{task_id}/notes", response_model=list[NoteResponse])
 def list_notes(task_id: uuid.UUID, db: Session = Depends(get_db), actor: Actor = Depends(get_actor)):
     task = _task(db, task_id, actor)
@@ -410,6 +423,7 @@ def publish_version(
             "message": f"{left} earlier comment{'s' if left != 1 else ''} not checked on this version yet",
         })
     resolved = fixcheck.resolve_on_publish(db, version)
+    closed = comment_tasks.close_on_publish(db, version, resolved, user)
     version.visibility = visibility.PUBLIC
     if ext is None:
         ext = VersionExt(version_id=version.id)
@@ -419,6 +433,7 @@ def publish_version(
     events.emit(db, events.VERSION_PUBLISHED, asset.project_id, {
         **events.version_payload(version, asset), "published_by": user.id,
         "resolved_comment_ids": resolved, "unchecked_comments": left,
+        "approved_task_ids": closed["approved"], "cancelled_task_ids": closed["cancelled"],
     })
     _done(db, asset.project_id)
     live.forget_version(version.id)

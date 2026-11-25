@@ -16,7 +16,7 @@
 import * as React from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import useSWR, { mutate as globalMutate } from 'swr'
-import { Check, ChevronDown, ChevronRight, Eye, EyeOff, ListPlus, Lock, Send } from 'lucide-react'
+import { Check, ChevronDown, ChevronRight, Eye, EyeOff, ListPlus, Lock, Send, X } from 'lucide-react'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -99,6 +99,21 @@ function TeamCommentActions({ comment, depth }: { comment: CommentLike; depth: n
   const task = ext.tasks.find((t) => t.source_comment_id === comment.id)
   const isInternal = comment.visibility === 'internal'
 
+  // Every comment is a task by itself; one that asks for nothing (praise, chat) is dismissed here.
+  async function notATask() {
+    if (!ext || !task) return
+    setBusy(true)
+    try {
+      await api.post(`/ext/tasks/${task.id}/dismiss`, {})
+      await ext.refreshTasks()
+      toast.success('Not a task: dismissed. The comment stays.')
+    } catch (error) {
+      toast.error(errorText(error, 'Could not dismiss this task'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function setVisibility(next: 'public' | 'internal') {
     if (!ext) return
     setBusy(true)
@@ -116,7 +131,21 @@ function TeamCommentActions({ comment, depth }: { comment: CommentLike; depth: n
   return (
     <>
       {task ? (
-        <TaskStatusPill status={task.status} />
+        <>
+          <TaskStatusPill status={task.status} />
+          {task.status === 'open' && (
+            <button
+              type="button"
+              disabled={busy}
+              title="Not a task"
+              aria-label="Not a task"
+              onClick={notATask}
+              className="inline-flex h-5 w-5 items-center justify-center rounded text-text-tertiary hover:bg-bg-hover hover:text-text-primary transition-colors disabled:opacity-50"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </>
       ) : (
         depth === 0 && (
           <button
